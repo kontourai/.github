@@ -30,7 +30,7 @@ We're actively looking for design partners on two specific tracks:
 - **Build with Surface.** If you have a product that needs to expose claims, evidence, or trust state, we'll write the adapter with you in a paired session. Surface is the first foundation looking for non-Kontour producers — being early matters.
 - **Run Veritas on your repo.** If you're already letting AI agents author code, we want to see Veritas catch the missed-test, broken-contract, boundary-crossing mistakes that show up in real repos. Tell us about your stack and we'll help configure.
 
-Email **hello@kontour.ai** with what you're working on. We respond fast.
+Email **hello@kontourai.io** with what you're working on. We respond fast.
 
 ## Stay in the loop
 
@@ -40,7 +40,7 @@ Email **hello@kontour.ai** with what you're working on. We respond fast.
 
 ## Contact
 
-- Email: **hello@kontour.ai**
+- Email: **hello@kontourai.io**
 - Website: [kontourai.io](https://kontourai.io)
 
 ---
