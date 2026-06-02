@@ -12,14 +12,16 @@
 |---|---|---|
 | [`surface`](https://github.com/kontourai/surface) | The shared transparency foundation — claims, evidence, freshness, gaps | v0.4 on npm |
 | [`flow`](https://github.com/kontourai/flow) | Process transparency — gate-by-gate evidence of why work was allowed to advance | v0.1 on npm |
+| [`survey`](https://github.com/kontourai/survey) | Producer-side fact-review records — sources, extractions, candidates, and reviews turned into Surface-ready claims | v0.4 on npm |
 | [`veritas`](https://github.com/kontourai/veritas) | Merge autonomy for AI-authored code | v0.4 on npm |
+| [`kontour-console`](https://github.com/kontourai/kontour-console) | Suite-level operating plane over the primitives — claim status, process, proof, queues, next actions | early preview |
 | [`flow-agents`](https://github.com/kontourai/flow-agents) | The agent-facing vertical of Flow — Claude Code, Codex, Kiro, GitHub Actions | private, coming soon |
 | [`kontourai.io`](https://github.com/kontourai/kontourai.io) | This org's website | source for [kontourai.io](https://kontourai.io) |
 
 ## Contribute
 
 - **File issues** in the specific product's repo. Cross-cutting issues can land in `kontourai.io`.
-- **PRs welcome** on `surface`, `flow`, and `veritas`. Read each repo's `CONTRIBUTING.md` and `CONTEXT.md` before touching the product language — we use precise vocabulary across the family.
+- **PRs welcome** on `surface`, `flow`, `survey`, and `veritas`. Read each repo's `CONTRIBUTING.md` and `CONTEXT.md` before touching the product language — we use precise vocabulary across the family.
 - **Discussions** are per-repo (where enabled). Don't have somewhere to ask? Email us.
 - All projects are Apache-2.0.
 
