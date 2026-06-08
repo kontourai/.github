@@ -15,7 +15,7 @@ Two layers, one job — **show the work behind AI.** Pull a product off the shel
 | Repo | What it does | Status |
 |---|---|---|
 | [`veritas`](https://github.com/kontourai/veritas) | Merge autonomy for AI-authored code — repo standards turned into evidence-backed readiness reports | v0.4 on npm |
-| [`flow-agents`](https://github.com/kontourai/flow-agents) | Workflow discipline inside the agent tools you already use — Claude Code, Codex, Kiro, GitHub Actions | private · early access |
+| [`flow-agents`](https://github.com/kontourai/flow-agents) | Workflow discipline inside the agent tools you already use — Claude Code, Codex, Kiro, GitHub Actions | Apache-2.0 · install.sh |
 
 **Foundational primitives**
 
