@@ -6,17 +6,35 @@
 
 ---
 
-## Pick a repo
+## The product line
+
+Two layers, one job — **show the work behind AI.** Pull a product off the shelf, or build on the open primitives underneath it.
+
+**Products you can use today**
 
 | Repo | What it does | Status |
 |---|---|---|
-| [`surface`](https://github.com/kontourai/surface) | The shared transparency foundation — claims, evidence, freshness, gaps | v0.4 on npm |
+| [`veritas`](https://github.com/kontourai/veritas) | Merge autonomy for AI-authored code — repo standards turned into evidence-backed readiness reports | v0.4 on npm |
+| [`flow-agents`](https://github.com/kontourai/flow-agents) | Workflow discipline inside the agent tools you already use — Claude Code, Codex, Kiro, GitHub Actions | private · early access |
+
+**Foundational primitives**
+
+| Repo | What it does | Status |
+|---|---|---|
+| [`surface`](https://github.com/kontourai/surface) | The shared transparency foundation — claims, evidence, freshness, gaps | v0.5 on npm |
 | [`flow`](https://github.com/kontourai/flow) | Process transparency — gate-by-gate evidence of why work was allowed to advance | v0.1 on npm |
-| [`survey`](https://github.com/kontourai/survey) | Producer-side fact-review records — sources, extractions, candidates, and reviews turned into Surface-ready claims | v0.4 on npm |
-| [`veritas`](https://github.com/kontourai/veritas) | Merge autonomy for AI-authored code | v0.4 on npm |
-| [`kontour-console`](https://github.com/kontourai/kontour-console) | Suite-level operating plane over the primitives — claim status, process, proof, queues, next actions | early preview |
-| [`flow-agents`](https://github.com/kontourai/flow-agents) | The agent-facing vertical of Flow — Claude Code, Codex, Kiro, GitHub Actions | private, coming soon |
-| [`kontourai.io`](https://github.com/kontourai/kontourai.io) | This org's website | source for [kontourai.io](https://kontourai.io) |
+| [`survey`](https://github.com/kontourai/survey) | Producer-side fact-review records turned into Surface-ready claims | v0.4 on npm |
+
+**Operating plane**
+
+| Repo | What it does | Status |
+|---|---|---|
+| [`kontour-console`](https://github.com/kontourai/kontour-console) | Suite-level plane over the primitives — claim status, process, proof, queues, decisions, next actions | private · early preview |
+
+**Also in the family**
+
+- [`console-kit`](https://github.com/kontourai/console-kit) — shared presentation layer (design tokens + React/web-component primitives) behind the consoles.
+- [`kontourai.io`](https://github.com/kontourai/kontourai.io) — source for [kontourai.io](https://kontourai.io).
 
 ## Contribute
 
