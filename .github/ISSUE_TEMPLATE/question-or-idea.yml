@@ -1,0 +1,16 @@
+name: Question or idea
+description: Usage question, integration question, or a feature idea
+labels: ["question"]
+body:
+  - type: textarea
+    id: ask
+    attributes:
+      label: What are you trying to do?
+      description: Real context beats abstract requests — what's the workflow, what's in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What have you tried or read?
+      placeholder: Docs pages, commands, errors…
