@@ -82,12 +82,15 @@ for repo in "${repos[@]}"; do
 
     mv "${candidate}" "${workflow_file}"
 
-    if git diff --quiet -- .github/workflows/add-to-project.yml; then
+    git add .github/workflows/add-to-project.yml
+
+    # Staged comparison: `git diff --quiet` (unstaged, vs index) is blind to
+    # untracked files, so the primary brand-new-file case read as "no changes".
+    if git diff --cached --quiet -- .github/workflows/add-to-project.yml; then
       echo "No changes for ${full_repo}; skipping."
       exit 0
     fi
 
-    git add .github/workflows/add-to-project.yml
     git commit -m "Add org project intake workflow"
     git push -u "${remote}" "${branch}"
 
