@@ -1,0 +1,122 @@
+name: Add issue to org project
+
+on:
+  workflow_call:
+    inputs:
+      project_url:
+        description: "Organization project URL."
+        required: false
+        type: string
+        default: "https://github.com/orgs/kontourai/projects/1"
+      project_id:
+        description: "Organization Project v2 node ID."
+        required: false
+        type: string
+        default: "PVT_kwDOEJYCKs4BYzgP"
+      status_field_name:
+        description: "Project single-select status field name."
+        required: false
+        type: string
+        default: "Status"
+      triage_option_name:
+        description: "Status option to set when an issue is opened or reopened."
+        required: false
+        type: string
+        default: "Triage"
+      done_option_name:
+        description: "Status option to set when an issue is closed."
+        required: false
+        type: string
+        default: "Done"
+    secrets:
+      ADD_TO_PROJECT_PAT:
+        description: "PAT or GitHub App token with permission to write org Project v2 items."
+        required: true
+
+permissions:
+  contents: read
+  issues: read
+
+jobs:
+  add-to-project:
+    name: Add issue to Project v2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add issue to project
+        id: add-to-project
+        uses: actions/add-to-project@v1.0.2
+        with:
+          project-url: ${{ inputs.project_url }}
+          github-token: ${{ secrets.ADD_TO_PROJECT_PAT }}
+
+      - name: Set project status
+        env:
+          GH_TOKEN: ${{ secrets.ADD_TO_PROJECT_PAT }}
+          ITEM_ID: ${{ steps.add-to-project.outputs.itemId }}
+          PROJECT_ID: ${{ inputs.project_id }}
+          STATUS_FIELD_NAME: ${{ inputs.status_field_name }}
+          TARGET_OPTION_NAME: ${{ github.event.action == 'closed' && inputs.done_option_name || inputs.triage_option_name }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ITEM_ID}" ]; then
+            echo "actions/add-to-project did not return an item ID" >&2
+            exit 1
+          fi
+
+          field_response="$(gh api graphql \
+            -F projectId="${PROJECT_ID}" \
+            -F fieldName="${STATUS_FIELD_NAME}" \
+            -F optionName="${TARGET_OPTION_NAME}" \
+            -f query='
+              query($projectId: ID!, $fieldName: String!, $optionName: String!) {
+                node(id: $projectId) {
+                  ... on ProjectV2 {
+                    field(name: $fieldName) {
+                      ... on ProjectV2SingleSelectField {
+                        id
+                        options {
+                          id
+                          name
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            ')"
+
+          field_id="$(printf '%s' "${field_response}" | jq -r '.data.node.field.id // empty')"
+          option_id="$(printf '%s' "${field_response}" | jq -r --arg name "${TARGET_OPTION_NAME}" '.data.node.field.options[]? | select(.name == $name) | .id')"
+
+          if [ -z "${field_id}" ]; then
+            echo "Project field '${STATUS_FIELD_NAME}' was not found or is not a single-select field" >&2
+            exit 1
+          fi
+
+          if [ -z "${option_id}" ]; then
+            echo "Project status option '${TARGET_OPTION_NAME}' was not found" >&2
+            exit 1
+          fi
+
+          gh api graphql \
+            -F projectId="${PROJECT_ID}" \
+            -F itemId="${ITEM_ID}" \
+            -F fieldId="${field_id}" \
+            -F optionId="${option_id}" \
+            -f query='
+              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
+                updateProjectV2ItemFieldValue(
+                  input: {
+                    projectId: $projectId
+                    itemId: $itemId
+                    fieldId: $fieldId
+                    value: { singleSelectOptionId: $optionId }
+                  }
+                ) {
+                  projectV2Item {
+                    id
+                  }
+                }
+              }
+            '
