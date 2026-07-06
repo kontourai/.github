@@ -67,9 +67,8 @@ jobs:
           field_response="$(gh api graphql \
             -F projectId="${PROJECT_ID}" \
             -F fieldName="${STATUS_FIELD_NAME}" \
-            -F optionName="${TARGET_OPTION_NAME}" \
             -f query='
-              query($projectId: ID!, $fieldName: String!, $optionName: String!) {
+              query($projectId: ID!, $fieldName: String!) {
                 node(id: $projectId) {
                   ... on ProjectV2 {
                     field(name: $fieldName) {
