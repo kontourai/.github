@@ -1,6 +1,16 @@
 # Kontourai GitHub Workflows
 
-This repository hosts organization-level GitHub workflow plumbing.
+This repository hosts the public organization profile, shared community health
+files, and organization-level GitHub workflow plumbing.
+
+- [`profile/README.md`](profile/README.md) is the public product map shown on the
+  Kontour AI organization page. Keep repository names and product boundaries in
+  that file aligned with the owning repositories and
+  [kontourai.io](https://kontourai.io).
+- [`.github/ISSUE_TEMPLATE/`](.github/ISSUE_TEMPLATE/) supplies default issue
+  intake for repositories that do not override it locally.
+- [`.github/workflows/`](.github/workflows/) contains reusable workflows called
+  by product repositories.
 
 ## Issue intake to Project v2
 
