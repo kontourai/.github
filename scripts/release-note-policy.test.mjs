@@ -7,16 +7,16 @@ import { parseConventionalCommits } from 'release-please/build/src/commit.js';
 import { assessSettings, enforceRepository, patchArguments, RELEASE_PLEASE_REPOSITORIES } from './release-note-policy.mjs';
 
 test('blank merge bodies satisfy the release-note policy', () => {
-  assert.equal(assessSettings({ allow_merge_commit: true, merge_commit_title: 'MERGE_MESSAGE', merge_commit_message: 'BLANK' }).compliant, true);
+  assert.equal(assessSettings({ allow_merge_commit: true, merge_commit_title: 'PR_TITLE', merge_commit_message: 'BLANK' }).compliant, true);
   assert.equal(assessSettings({ allow_merge_commit: false, merge_commit_message: 'PR_TITLE' }).compliant, true);
 });
 
-test('conventional PR titles in either merge field are rejected', () => {
+test('unsupported merge setting combinations are rejected', () => {
   assert.deepEqual(assessSettings({ allow_merge_commit: true, merge_commit_title: 'MERGE_MESSAGE', merge_commit_message: 'PR_TITLE' }), {
     compliant: false,
-    reason: 'merge title/body are MERGE_MESSAGE/PR_TITLE; expected MERGE_MESSAGE/BLANK',
+    reason: 'merge title/body are MERGE_MESSAGE/PR_TITLE; expected PR_TITLE/BLANK',
   });
-  assert.equal(assessSettings({ allow_merge_commit: true, merge_commit_title: 'PR_TITLE', merge_commit_message: 'BLANK' }).compliant, false);
+  assert.equal(assessSettings({ allow_merge_commit: true, merge_commit_title: 'PR_TITLE', merge_commit_message: 'PR_BODY' }).compliant, false);
 });
 
 test('apply patches only the merge body policy and verifies the result', () => {
@@ -24,7 +24,7 @@ test('apply patches only the merge body policy and verifies the result', () => {
   const responses = [
     JSON.stringify({ allow_merge_commit: true, merge_commit_title: 'MERGE_MESSAGE', merge_commit_message: 'PR_TITLE' }),
     '{}',
-    JSON.stringify({ allow_merge_commit: true, merge_commit_title: 'MERGE_MESSAGE', merge_commit_message: 'BLANK' }),
+    JSON.stringify({ allow_merge_commit: true, merge_commit_title: 'PR_TITLE', merge_commit_message: 'BLANK' }),
   ];
   const run = (command, args) => {
     calls.push([command, args]);
@@ -36,7 +36,7 @@ test('apply patches only the merge body policy and verifies the result', () => {
 
 test('Release Please emits one attributed fix after a normal merge with the suite policy', async () => {
   const commits = parseConventionalCommits([
-    { sha: 'merge', message: 'Merge pull request #42 from kontourai/fix/example' },
+    { sha: 'merge', message: 'Retain attribution' },
     { sha: 'child', message: 'fix: retain attribution (#42)' },
   ]);
   const notes = await new DefaultChangelogNotes().buildNotes(commits, {
@@ -46,6 +46,12 @@ test('Release Please emits one attributed fix after a normal merge with the suit
   assert.equal(commits.length, 1);
   assert.equal(notes.match(/retain attribution/g)?.length, 1);
   assert.match(notes, /\[#42\]\(https:\/\/github\.com\/kontourai\/example\/issues\/42\)/);
+});
+
+test('GitHub documents PR_TITLE/BLANK as an accepted merge setting pair', () => {
+  assert.deepEqual(patchArguments('kontourai/example').slice(-4), [
+    '-f', 'merge_commit_title=PR_TITLE', '-f', 'merge_commit_message=BLANK',
+  ]);
 });
 
 test('suite target names every public repository currently using Release Please', () => {

@@ -57,9 +57,10 @@ Issue close → `Done` is handled by the same reusable workflow (the caller's `c
 
 ## Release-note policy
 
-Repositories that use normal merge commits keep the merge commit body blank. The implementation
-commit remains the release-note source while the neutral merge subject preserves the PR boundary.
-This prevents a conventional PR title in the merge body from becoming a duplicate changelog entry.
+Repositories that use normal merge commits use GitHub's supported `PR_TITLE/BLANK` setting pair.
+Pull request titles are plain-language, non-conventional summaries; implementation commits remain
+the conventional release-note source. The merge therefore preserves the PR boundary without
+introducing a second conventional message for release automation to parse.
 
 Audit or apply the policy to an explicit public-repository set:
 
@@ -69,5 +70,7 @@ node scripts/release-note-policy.mjs apply --suite
 ```
 
 The versioned suite target lists every public Kontour repository currently using Release Please.
-The command changes only GitHub's merge title/body settings to `MERGE_MESSAGE`/`BLANK` and verifies the resulting state.
+The command changes only GitHub's merge title/body settings to the supported `PR_TITLE`/`BLANK`
+pair and verifies the resulting state. Contributors must keep PR titles free of Conventional Commit
+prefixes such as `fix:` and `feat:`; those prefixes belong on implementation commits.
 Repositories with merge commits disabled are already compliant.
