@@ -1,67 +1,66 @@
 # Kontour AI
 
-**Show the work behind AI.** We build inspectability products for AI-assisted work — claims, evidence, gates, and readiness made readable by humans and other agents.
+**Show the work behind AI.** Kontour makes AI-assisted work inspectable and
+accountable: sources stay traceable, claims keep their evidence, required paths
+advance through explicit gates, and people can recompute why work is ready.
 
-→ [kontourai.io](https://kontourai.io) for the longer story.
+→ [kontourai.io](https://kontourai.io) tells the product story. The repositories
+below are the public implementation and documentation surfaces.
 
----
+## Products and foundational primitives
 
-## The product line
+| Repository | Responsibility |
+| --- | --- |
+| [`flow-agents`](https://github.com/kontourai/flow-agents) | Portable workflow engine, runtime adapters, hooks, and first-party kits for evidence-gated agent work |
+| [`veritas`](https://github.com/kontourai/veritas) | Executable repository standards and evidence-backed merge readiness for AI-authored code |
+| [`surface`](https://github.com/kontourai/surface) | Kontour's integration surface for portable claims, evidence, trust status, validation, and product-facing Hachure compatibility |
+| [`flow`](https://github.com/kontourai/flow) | Process definitions, steps, gates, evidence expectations, transitions, and explicit exceptions |
+| [`survey`](https://github.com/kontourai/survey) | Producer-side source, extraction, candidate, review, decision, and publication records |
 
-Two layers, one job — **show the work behind AI.** Pull a product off the shelf, or build on the open primitives underneath it.
+The **Builder Kit** and **Knowledge Kit** are first-party solutions distributed
+through Flow Agents rather than separate products. The open trust format itself
+lives independently at [`hachure-org/spec`](https://github.com/hachure-org/spec);
+Surface is Kontour's product-facing integration layer for it.
 
-**Products you can use today**
+## Building-block tools
 
-| Repo | What it does | Status |
-|---|---|---|
-| [`veritas`](https://github.com/kontourai/veritas) | Merge autonomy for AI-authored code — repo standards turned into evidence-backed readiness reports | v0.4 on npm |
-| [`flow-agents`](https://github.com/kontourai/flow-agents) | Workflow discipline inside the agent tools you already use — Claude Code, Codex, Kiro, GitHub Actions | Apache-2.0 · install.sh |
+| Repository | Responsibility |
+| --- | --- |
+| [`forage`](https://github.com/kontourai/forage) | SSRF-pinned web acquisition, provenance-bearing snapshots, and deterministic replay |
+| [`traverse`](https://github.com/kontourai/traverse) | Schema-directed, provenance-bearing extraction proposals |
+| [`lookout`](https://github.com/kontourai/lookout) | Registered-source rechecks, source drift, and deterministic proposal diffs |
+| [`bearing`](https://github.com/kontourai/bearing) | Evidence-backed model capability observations, deterministic catalogs, and request-relative ranking |
+| [`datum`](https://github.com/kontourai/datum) | Provider, model, secret-reference, and role configuration resolution |
+| [`plumb`](https://github.com/kontourai/plumb) | Guardrailed operational checks and isolated escalation into repair work |
+| [`ui`](https://github.com/kontourai/ui) | Shared design tokens, React primitives, and web components for Kontour product interfaces |
 
-**Foundational primitives**
-
-| Repo | What it does | Status |
-|---|---|---|
-| [`surface`](https://github.com/kontourai/surface) | The shared transparency foundation — claims, evidence, freshness, gaps | v0.5 on npm |
-| [`flow`](https://github.com/kontourai/flow) | Process transparency — gate-by-gate evidence of why work was allowed to advance | v0.1 on npm |
-| [`survey`](https://github.com/kontourai/survey) | Producer-side fact-review records turned into Surface-ready claims | v0.4 on npm |
-
-**Operating plane**
-
-| Repo | What it does | Status |
-|---|---|---|
-| [`kontour-console`](https://github.com/kontourai/kontour-console) | Suite-level plane over the primitives — claim status, process, proof, queues, decisions, next actions | private · early preview |
-
-**Also in the family**
-
-- [`console-kit`](https://github.com/kontourai/console-kit) — shared presentation layer (design tokens + React/web-component primitives) behind the consoles.
-- [`kontourai.io`](https://github.com/kontourai/kontourai.io) — source for [kontourai.io](https://kontourai.io).
+[`ephemeris`](https://github.com/kontourai/ephemeris) preserves the frozen
+freshness-scheduler prototype, and
+[`kit-research`](https://github.com/kontourai/kit-research) is a third-party kit
+authoring experiment. Their READMEs state their current lifecycle and limits.
 
 ## Contribute
 
-- **File issues** in the specific product's repo. Cross-cutting issues can land in `kontourai.io`.
-- **PRs welcome** on `surface`, `flow`, `survey`, and `veritas`. Read each repo's `CONTRIBUTING.md` and `CONTEXT.md` before touching the product language — we use precise vocabulary across the family.
-- **Discussions** are per-repo (where enabled). Don't have somewhere to ask? Email us.
-- All projects are Apache-2.0.
+- File issues in the repository that owns the behavior or contract. Start at
+  [kontourai.io/developers](https://kontourai.io/developers) if you are unsure
+  which layer owns a concern.
+- Read the target repository's `AGENTS.md`, `CONTEXT.md`, contribution guide,
+  and architecture decisions before changing product language or contracts.
+- Check each repository for its license, supported runtime, release status, and
+  verification commands; those details intentionally live with the owning code.
 
-## Get involved as an early adopter
+## Work with us
 
-We're actively looking for design partners on two specific tracks:
+We are looking for teams that want to:
 
-- **Build with Surface.** If you have a product that needs to expose claims, evidence, or trust state, we'll write the adapter with you in a paired session. Surface is the first foundation looking for non-Kontour producers — being early matters.
-- **Run Veritas on your repo.** If you're already letting AI agents author code, we want to see Veritas catch the missed-test, broken-contract, boundary-crossing mistakes that show up in real repos. Tell us about your stack and we'll help configure.
+- run Flow Agents on real development work and measure whether the required path
+  improves delivery quality, cost, and continuity;
+- use Veritas to turn repository standards into evidence an agent and reviewer
+  can both inspect; or
+- build a product integration through Surface while keeping the underlying
+  Hachure records portable and independently recomputable.
 
-Email **hello@kontourai.io** with what you're working on. We respond fast.
-
-## Stay in the loop
-
-- **Watch** the repos you care about for releases.
-- **Star** the ones you find useful.
-- **Follow** the [website](https://kontourai.io) for the broader story as it unfolds.
-
-## Contact
-
-- Email: **hello@kontourai.io**
-- Website: [kontourai.io](https://kontourai.io)
+Email **hello@kontourai.io** with the workflow you want to make inspectable.
 
 ---
 
