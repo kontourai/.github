@@ -54,3 +54,20 @@ Issue close → `Done` is handled by the same reusable workflow (the caller's `c
 ### Rollout
 
 `scripts/open-add-to-project-rollout-prs.sh` opens the thin-caller PRs for the remaining consumer repositories after the central workflow and `flow-agents` pilot have merged. Do not run it before the pilot proves the secret and reusable workflow path.
+
+## Release-note policy
+
+Repositories that use normal merge commits keep the merge commit body blank. The implementation
+commit remains the release-note source while the neutral merge subject preserves the PR boundary.
+This prevents a conventional PR title in the merge body from becoming a duplicate changelog entry.
+
+Audit or apply the policy to an explicit public-repository set:
+
+```bash
+node scripts/release-note-policy.mjs check --suite
+node scripts/release-note-policy.mjs apply --suite
+```
+
+The versioned suite target lists every public Kontour repository currently using Release Please.
+The command changes only GitHub's merge title/body settings to `MERGE_MESSAGE`/`BLANK` and verifies the resulting state.
+Repositories with merge commits disabled are already compliant.

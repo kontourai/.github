@@ -1,0 +1,11 @@
+{
+  "name": "@kontourai/github-workflows",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test scripts/*.test.mjs"
+  },
+  "devDependencies": {
+    "release-please": "17.10.3"
+  }
+}
