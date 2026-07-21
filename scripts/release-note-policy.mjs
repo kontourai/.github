@@ -14,16 +14,16 @@ export function assessSettings(settings) {
   if (!settings.allow_merge_commit) return { compliant: true, reason: 'merge commits disabled' };
   const title = settings.merge_commit_title || 'unset';
   const message = settings.merge_commit_message || 'unset';
-  if (title === 'MERGE_MESSAGE' && message === 'BLANK') {
-    return { compliant: true, reason: 'merge subject is neutral and body is blank' };
+  if (title === 'PR_TITLE' && message === 'BLANK') {
+    return { compliant: true, reason: 'merge uses the neutral PR title and has a blank body' };
   }
-  return { compliant: false, reason: `merge title/body are ${title}/${message}; expected MERGE_MESSAGE/BLANK` };
+  return { compliant: false, reason: `merge title/body are ${title}/${message}; expected PR_TITLE/BLANK` };
 }
 
 export function patchArguments(repository) {
   return [
     'api', '--method', 'PATCH', `repos/${repository}`,
-    '-f', 'merge_commit_title=MERGE_MESSAGE', '-f', 'merge_commit_message=BLANK',
+    '-f', 'merge_commit_title=PR_TITLE', '-f', 'merge_commit_message=BLANK',
   ];
 }
 
