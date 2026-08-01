@@ -104,8 +104,9 @@ test('self-hosted scans fail closed unless they reserve shared host capacity', a
 
   assert.match(
     workflow,
-    /runner\.environment == 'self-hosted' && \(inputs\.capacity-coordination-root == '' \|\| inputs\.capacity-host-id == ''\)/,
+    /runner\.environment == 'self-hosted' && \(inputs\.capacity-coordination-root == '' \|\| inputs\.capacity-host-id == '' \|\| inputs\.capacity-timeout-seconds > 600\)/,
   );
+  assert.match(workflow, /timeout-minutes: 20/);
   assert.match(
     workflow,
     /uses: kontourai\/\.github\/actions\/physical-host-capacity@3a002e3b41693f62f44cd539495603e9157f7830/,
