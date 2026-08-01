@@ -77,9 +77,10 @@ including a fixture intentionally committed on that PR, remains a failing,
 redacted finding.
 
 The checkout depth is not caller-configurable: the workflow always checks out
-full history (`fetch-depth: 0`) and fails closed with a non-zero exit if
-`git rev-parse --is-shallow-repository` ever reports a shallow checkout,
-rather than silently scanning a partial history.
+full history (`fetch-depth: 0`) and fails closed with a non-zero exit unless
+`git rev-parse --is-shallow-repository` reports exactly `false`. A shallow
+checkout, an empty result, an unexpected value, or the command itself
+erroring all fail the run rather than silently scanning a partial history.
 
 ## Release-note policy
 

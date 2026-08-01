@@ -3,9 +3,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test scripts/*.test.mjs"
+    "test": "node --test scripts/*.test.mjs",
+    "validate:yaml": "node scripts/validate-yaml.mjs"
   },
   "devDependencies": {
-    "release-please": "17.10.3"
+    "release-please": "17.10.3",
+    "yaml": "2.9.0"
   }
 }

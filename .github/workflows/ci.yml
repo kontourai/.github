@@ -35,26 +35,5 @@ jobs:
       - name: Run tests
         run: npm test
 
-      - name: Validate YAML syntax
-        run: |
-          set -euo pipefail
-          python3 - <<'PYEOF'
-          import pathlib
-          import sys
-
-          import yaml
-
-          errors = []
-          for path in sorted(pathlib.Path(".").rglob("*.y*ml")):
-              if "node_modules" in path.parts or ".git" in path.parts:
-                  continue
-              try:
-                  with path.open() as handle:
-                      list(yaml.safe_load_all(handle))
-              except yaml.YAMLError as exc:
-                  errors.append(f"{path}: {exc}")
-
-          if errors:
-              print("\n".join(errors), file=sys.stderr)
-              sys.exit(1)
-          PYEOF
+      - name: Validate YAML syntax and workflow structure
+        run: npm run validate:yaml
