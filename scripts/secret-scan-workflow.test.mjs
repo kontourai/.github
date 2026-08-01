@@ -61,9 +61,9 @@ test('secret scan is limited to complete history reachable from checkout HEAD', 
   // replaces its default --all traversal while retaining all HEAD ancestors.
   assert.match(
     workflow,
-    /gitleaks git \. --log-opts=HEAD --redact --no-banner --verbose/,
+    /"\$GITLEAKS_BIN" git \. --log-opts=HEAD --redact --no-banner --verbose/,
   );
-  assert.doesNotMatch(workflow, /gitleaks git \. .*--all/);
+  assert.doesNotMatch(workflow, /GITLEAKS_BIN" git \. .*--all/);
   assert.doesNotMatch(workflow, /--exit-code(?:=|\s+)0/);
 });
 
@@ -76,6 +76,27 @@ test('checkout fetch-depth is hardcoded to full history and not caller-configura
   assert.doesNotMatch(workflow, /fetch-depth:\s*\n?\s*description/);
   assert.doesNotMatch(workflow, /inputs\.fetch-depth/);
   assert.match(workflow, /fetch-depth:\s*0\s*$/m);
+  assert.match(workflow, /persist-credentials:\s*false\s*$/m);
+});
+
+test('runner routing defaults to hosted and accepts an explicit JSON target', async () => {
+  const workflow = await readFile(workflowPath, 'utf8');
+
+  assert.match(workflow, /runner:\s*\n\s*description:/);
+  assert.match(workflow, /default: '\"ubuntu-latest\"'/);
+  assert.match(
+    workflow,
+    /runs-on: \$\{\{ fromJSON\(inputs\.runner \|\| '\"ubuntu-latest\"'\) \}\}/,
+  );
+  assert.match(
+    workflow,
+    /runner: '\["self-hosted","Linux","X64","kontour-linux"\]'/,
+  );
+  assert.match(workflow, /@<full-commit-sha>/);
+  assert.match(workflow, /gitleaks_\$\{GITLEAKS_VERSION\}_checksums\.txt/);
+  assert.match(workflow, /sha256sum "\$install_dir\/\$archive_name"/);
+  assert.match(workflow, /install_dir="\$RUNNER_TEMP\/gitleaks-/);
+  assert.doesNotMatch(workflow, /\/usr\/local\/bin/);
 });
 
 test('scan fails closed if the checkout is shallow', async () => {
@@ -85,7 +106,7 @@ test('scan fails closed if the checkout is shallow', async () => {
 
   const checkoutIndex = workflow.indexOf('uses: actions/checkout');
   const guardIndex = workflow.indexOf('git rev-parse --is-shallow-repository');
-  const scanIndex = workflow.indexOf('gitleaks git . --log-opts=HEAD');
+  const scanIndex = workflow.indexOf('GITLEAKS_BIN" git . --log-opts=HEAD');
 
   assert.ok(checkoutIndex !== -1, 'expected a checkout step');
   assert.ok(
