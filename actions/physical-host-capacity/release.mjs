@@ -3,7 +3,6 @@ import { parseConfig, releaseLease, stateName } from './coordinator.mjs';
 function postEnvironment() {
   const read = (name) => process.env[`STATE_${stateName(name)}`];
   return {
-    ...process.env,
     PHYSICAL_HOST_CAPACITY_ROOT: read('ROOT'),
     PHYSICAL_HOST_CAPACITY_HOST_ID: read('HOST_ID'),
     PHYSICAL_HOST_CAPACITY_UNITS: read('CAPACITY_UNITS'),

@@ -64,6 +64,33 @@ test('configuration rejects ambiguous capacity inputs and accepts environment co
       pollIntervalMs: 25,
     },
   );
+  assert.deepEqual(
+    parseConfig({
+      'INPUT_COORDINATION-ROOT': '/coordination',
+      'INPUT_HOST-ID': 'desktop-win-01',
+      'INPUT_CAPACITY-UNITS': '4',
+      'INPUT_LEASE-WEIGHT': '3',
+      'INPUT_TIMEOUT-SECONDS': '0',
+      'INPUT_POLL-INTERVAL-MS': '25',
+    }),
+    {
+      root: '/coordination',
+      hostId: 'desktop-win-01',
+      capacityUnits: 4,
+      leaseWeight: 3,
+      timeoutMs: 0,
+      pollIntervalMs: 25,
+    },
+  );
+  assert.throws(
+    () =>
+      parseConfig({
+        'INPUT_COORDINATION-ROOT': '/github',
+        INPUT_COORDINATION_ROOT: '/portable',
+        'INPUT_HOST-ID': 'desktop-win-01',
+      }),
+    /coordination-root has conflicting GitHub and portable input values/,
+  );
   assert.throws(
     () => parseConfig({ INPUT_COORDINATION_ROOT: '/coordination', INPUT_HOST_ID: 'desktop-win-01', INPUT_CAPACITY_UNITS: '1.5' }),
     /capacity-units must be a positive integer/,
@@ -385,7 +412,16 @@ test('action entrypoints persist state and release the acquired lease in the pos
       const [name, ...value] = line.split('=');
       return [`STATE_${name}`, value.join('=')];
     }));
-    await execFile(process.execPath, [releaseScript], { env: { ...actionEnv, ...postState } });
+    await execFile(process.execPath, [releaseScript], {
+      env: {
+        ...actionEnv,
+        ...postState,
+        'INPUT_COORDINATION-ROOT': '/poisoned-canonical-after-acquire',
+        INPUT_COORDINATION_ROOT: '/poisoned-portable-after-acquire',
+        'INPUT_HOST-ID': 'poisoned-canonical-after-acquire',
+        INPUT_HOST_ID: 'poisoned-portable-after-acquire',
+      },
+    });
     await assert.rejects(access(outputs['lease-path']), { code: 'ENOENT' });
   }, { provision: false });
 });

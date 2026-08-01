@@ -28,7 +28,21 @@ const realClock = {
 };
 
 function input(env, name) {
-  return env[`INPUT_${name.replaceAll('-', '_').toUpperCase()}`];
+  const githubKey = `INPUT_${name.toUpperCase()}`;
+  const portableKey = `INPUT_${name.replaceAll('-', '_').toUpperCase()}`;
+  const githubValue = env[githubKey];
+  const portableValue = env[portableKey];
+  if (
+    githubKey !== portableKey &&
+    githubValue !== undefined &&
+    portableValue !== undefined &&
+    githubValue !== portableValue
+  ) {
+    throw new CapacityCoordinationError(
+      `${name} has conflicting GitHub and portable input values.`,
+    );
+  }
+  return githubValue ?? portableValue;
 }
 
 function positiveInteger(value, name, { allowZero = false } = {}) {
