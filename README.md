@@ -55,6 +55,18 @@ Issue close → `Done` is handled by the same reusable workflow (the caller's `c
 
 `scripts/open-add-to-project-rollout-prs.sh` opens the thin-caller PRs for the remaining consumer repositories after the central workflow and `flow-agents` pilot have merged. Do not run it before the pilot proves the secret and reusable workflow path.
 
+## Veritas advisory governance
+
+Repositories using observe-only Veritas readiness should call the shared workflow instead of copying its setup and execution steps:
+
+```yaml
+jobs:
+  readiness:
+    uses: kontourai/.github/.github/workflows/veritas-advisory.yml@main
+```
+
+Set `with: { install-browser: true }` only when the repository's evidence check needs Chromium. The shared job pins the supported Veritas version, retains the evidence artifact, and has a 30-minute outer timeout as defense in depth. It reports governance findings without promoting them to a required merge gate.
+
 ## Release-note policy
 
 Repositories that use normal merge commits use GitHub's supported `PR_TITLE/BLANK` setting pair.
