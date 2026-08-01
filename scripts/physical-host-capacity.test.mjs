@@ -412,7 +412,16 @@ test('action entrypoints persist state and release the acquired lease in the pos
       const [name, ...value] = line.split('=');
       return [`STATE_${name}`, value.join('=')];
     }));
-    await execFile(process.execPath, [releaseScript], { env: { ...actionEnv, ...postState } });
+    await execFile(process.execPath, [releaseScript], {
+      env: {
+        ...actionEnv,
+        ...postState,
+        'INPUT_COORDINATION-ROOT': '/poisoned-canonical-after-acquire',
+        INPUT_COORDINATION_ROOT: '/poisoned-portable-after-acquire',
+        'INPUT_HOST-ID': 'poisoned-canonical-after-acquire',
+        INPUT_HOST_ID: 'poisoned-portable-after-acquire',
+      },
+    });
     await assert.rejects(access(outputs['lease-path']), { code: 'ENOENT' });
   }, { provision: false });
 });
