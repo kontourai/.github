@@ -76,6 +76,11 @@ branch and must not fail its gate. A secret in the caller's HEAD history,
 including a fixture intentionally committed on that PR, remains a failing,
 redacted finding.
 
+The checkout depth is not caller-configurable: the workflow always checks out
+full history (`fetch-depth: 0`) and fails closed with a non-zero exit if
+`git rev-parse --is-shallow-repository` ever reports a shallow checkout,
+rather than silently scanning a partial history.
+
 ## Release-note policy
 
 Repositories that use normal merge commits use GitHub's supported `PR_TITLE/BLANK` setting pair.

@@ -1,0 +1,60 @@
+name: CI
+
+# Minimal repo-local checks for this repository's own workflow plumbing and
+# scripts. This intentionally does not call the reusable secret-scan.yml
+# workflow hosted in this same repository — doing so here would be a
+# self-referential (recursive) invocation of the thing this repo defines for
+# its callers, not an independent check of it.
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test and validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Validate YAML syntax
+        run: |
+          set -euo pipefail
+          python3 - <<'PYEOF'
+          import pathlib
+          import sys
+
+          import yaml
+
+          errors = []
+          for path in sorted(pathlib.Path(".").rglob("*.y*ml")):
+              if "node_modules" in path.parts or ".git" in path.parts:
+                  continue
+              try:
+                  with path.open() as handle:
+                      list(yaml.safe_load_all(handle))
+              except yaml.YAMLError as exc:
+                  errors.append(f"{path}: {exc}")
+
+          if errors:
+              print("\n".join(errors), file=sys.stderr)
+              sys.exit(1)
+          PYEOF
