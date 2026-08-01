@@ -6,6 +6,7 @@ import { parse } from 'yaml';
 
 const smokeWorkflowUrl = new URL('../.github/workflows/self-hosted-runner-smoke.yml', import.meta.url);
 const preflightActionUrl = new URL('../actions/runner-preflight/action.yml', import.meta.url);
+const capacityActionUrl = new URL('../actions/physical-host-capacity/action.yml', import.meta.url);
 
 test('fleet smoke routes by stable capability labels instead of host name', async () => {
   const workflow = parse(await readFile(smokeWorkflowUrl, 'utf8'));
@@ -52,4 +53,21 @@ test('Windows preflight enforces the documented native build-tool contract', asy
   assert.match(windowsStep.run, /git --version/);
   assert.match(windowsStep.run, /node --version/);
   assert.match(windowsStep.run, /rustc --version/);
+});
+
+test('physical-host capacity action is a required, cancellation-safe weighted lease', async () => {
+  const action = parse(await readFile(capacityActionUrl, 'utf8'));
+
+  assert.equal(action.inputs['coordination-root'].required, true);
+  assert.equal(action.inputs['host-id'].required, true);
+  assert.equal(action.inputs['capacity-units'].default, '1');
+  assert.equal(action.inputs['lease-weight'].default, '1');
+  assert.equal(action.inputs['timeout-seconds'].default, '300');
+  assert.equal(action.inputs['stale-after-seconds'], undefined);
+  assert.equal(action.inputs['heartbeat-interval-seconds'], undefined);
+  assert.equal(action.inputs['clock-skew-allowance-seconds'], undefined);
+  assert.equal(action.runs.using, 'node20');
+  assert.equal(action.runs.main, 'acquire.mjs');
+  assert.equal(action.runs.post, 'release.mjs');
+  assert.equal(action.runs['post-if'], 'always()');
 });

@@ -1,0 +1,38 @@
+name: Kontour physical-host capacity
+description: Acquire a weighted lease before work that shares a physical Windows host with WSL or Linux runners.
+
+inputs:
+  coordination-root:
+    description: OS-local path to the shared NTFS-backed coordination root. It must identify the same directory on every participating runner.
+    required: true
+  host-id:
+    description: Stable shared identity of the physical host. It must be identical for every participant using this coordination root.
+    required: true
+  capacity-units:
+    description: Positive integer number of capacity units available on the physical host.
+    required: false
+    default: "1"
+  lease-weight:
+    description: Positive integer capacity units reserved by this job.
+    required: false
+    default: "1"
+  timeout-seconds:
+    description: Non-negative integer maximum time to wait for capacity.
+    required: false
+    default: "300"
+  poll-interval-ms:
+    description: Positive integer delay between capacity checks.
+    required: false
+    default: "1000"
+
+outputs:
+  owner-token:
+    description: Unique token for the lease held by this action invocation.
+  lease-path:
+    description: Path of the active lease record in the coordination root.
+
+runs:
+  using: node20
+  main: acquire.mjs
+  post: release.mjs
+  post-if: always()

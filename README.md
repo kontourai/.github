@@ -84,6 +84,121 @@ dependency caches to the owning workflow. Each runner accepts one job at a
 time; horizontal capacity comes from registering more runners with the same
 capability labels.
 
+### Shared physical-host capacity
+
+Windows-native and WSL/Linux runners can still compete for CPU, RAM, disk, or a
+single GPU when they are registered on the same physical Windows host. Use the
+`physical-host-capacity` action for that shared-host subset. It acquires a
+weighted lease rather than serializing every job, and its JavaScript action
+post-step releases the lease after normal failure or workflow cancellation.
+
+The `coordination-root` values below are different OS paths to the **same
+NTFS-backed directory**. `host-id` is a stable literal identity for that one
+physical host, not the Windows or WSL runner name. Give only trusted runner
+identities write access to that directory; a writer can reserve or remove
+capacity for every participant.
+
+```yaml
+jobs:
+  windows-native-build:
+    runs-on: [self-hosted, Windows, X64, kontour-windows, native]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: kontourai/.github/actions/physical-host-capacity@<full-commit-sha>
+        with:
+          coordination-root: 'D:\kontour-runner-capacity'
+          host-id: desktop-win-01
+          capacity-units: '8'
+          lease-weight: '5'
+          timeout-seconds: '240'
+      - shell: pwsh
+        run: npm test
+
+  wsl-linux-tests:
+    runs-on: [self-hosted, Linux, X64, kontour-linux, docker]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: kontourai/.github/actions/physical-host-capacity@<full-commit-sha>
+        with:
+          coordination-root: /mnt/d/kontour-runner-capacity
+          host-id: desktop-win-01
+          capacity-units: '8'
+          lease-weight: '3'
+          timeout-seconds: '240'
+      - run: npm test
+```
+
+Inputs are parsed as strict integers (`timeout-seconds` may be `0` for an
+immediate fail). The root must be an existing absolute path and must be
+provisioned before any workflow can use it; the action never creates a root,
+marker, manifest, or queue directories. Provision once from a trusted host
+administrator account, using either the Windows root or its WSL mount:
+
+```sh
+node scripts/provision-physical-host-capacity.mjs \
+  --root /mnt/d/kontour-runner-capacity \
+  --host-id desktop-win-01 \
+  --capacity-units 8
+```
+
+Provisioning writes an externally located `.kontour-physical-host-id` marker
+and a schema-versioned `host-manifest.json`. Its host ID, capacity,
+`explicit-quiesced-recovery-v1` strategy are authoritative:
+every participant must match them exactly before acquire or release
+can proceed. Update those values only after draining the root and deliberately
+re-provisioning it.
+
+The action never starts a detached process and never deletes a lease or queue
+ticket based on a timestamp. Its post step releases the lease on normal failure
+or cancellation. If the runner is lost before that step, the capacity remains
+blocked deliberately. There is no online stale-time policy and no automatic
+recovery authority.
+
+Waiting jobs create durable weighted FIFO tickets. Their order comes from a
+shared monotonic sequence assigned under the control protocol—not process
+clock time—so Windows/WSL wall-clock skew cannot reorder waiters. Only the
+oldest ticket may claim available capacity, so later small jobs cannot starve
+an older larger job. Timeout cleanup retries independently for up to five
+seconds even when the acquisition timeout is zero.
+Contention diagnostics are capped and include an omitted-entry count.
+
+Sequence values are append-only directory markers, so a crash can leave a gap
+but cannot truncate or reorder an assigned value. Lease and ticket JSON is
+written and fsynced in the private `staging/` directory before an atomic rename
+publishes the final record.
+
+Control ownership uses an atomically created `control-tickets/active` directory;
+there is no shared empty-lock publication window. It has no
+automatic stale stealing. A wedged control ticket fails closed with a typed
+diagnostic. After draining the runners and confirming no owner job is live, an
+operator must create the distinct regular
+`.kontour-physical-host-quiesced` file (never the permanent identity marker)
+containing exactly the host ID after draining the runners, then run the
+explicit recovery command for one record:
+
+```sh
+printf 'desktop-win-01\n' > /mnt/d/kontour-runner-capacity/.kontour-physical-host-quiesced
+node scripts/recover-physical-host-capacity.mjs \
+  --root /mnt/d/kontour-runner-capacity \
+  --host-id desktop-win-01 \
+  --capacity-units 8 \
+  --recover lease:<owner-uuid>
+```
+
+Use `--recover ticket:<owner-uuid>` for a confirmed-abandoned queue ticket,
+`--recover sequence:<20-digit-marker>` only for a malformed regular sequence
+entry, or `--recover control:active` for a wedged control directory. The command never
+accepts a broad clear operation. Never delete the external marker, manifest,
+queue-sequence directory, staging directory, or an unreviewed record. On success it removes the
+quiescence marker; on failure, inspect it before removing it when the root is
+safe to resume.
+
 ## Issue intake to Project v2
 
 Every kontourai repository with issues enabled should install a thin caller workflow at `.github/workflows/add-to-project.yml`. On `issues.opened`, `issues.reopened`, and `issues.closed`, the caller invokes the reusable workflow in this repository:
