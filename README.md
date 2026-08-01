@@ -84,6 +84,69 @@ dependency caches to the owning workflow. Each runner accepts one job at a
 time; horizontal capacity comes from registering more runners with the same
 capability labels.
 
+### Shared physical-host capacity
+
+Windows-native and WSL/Linux runners can still compete for CPU, RAM, disk, or a
+single GPU when they are registered on the same physical Windows host. Use the
+`physical-host-capacity` action for that shared-host subset. It acquires a
+weighted lease rather than serializing every job, and its JavaScript action
+post-step releases the lease after normal failure or workflow cancellation.
+
+The `coordination-root` values below are different OS paths to the **same
+NTFS-backed directory**. Give only trusted runner identities write access to
+that directory; a writer can reserve or remove capacity for every participant.
+
+```yaml
+jobs:
+  windows-native-build:
+    runs-on: [self-hosted, Windows, X64, kontour-windows, native]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: kontourai/.github/actions/physical-host-capacity@<full-commit-sha>
+        with:
+          coordination-root: 'D:\\kontour-runner-capacity'
+          capacity-units: '8'
+          lease-weight: '5'
+          timeout-seconds: '240'
+          stale-after-seconds: '2100'
+      - shell: pwsh
+        run: npm test
+
+  wsl-linux-tests:
+    runs-on: [self-hosted, Linux, X64, kontour-linux, docker]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: kontourai/.github/actions/physical-host-capacity@<full-commit-sha>
+        with:
+          coordination-root: /mnt/d/kontour-runner-capacity
+          capacity-units: '8'
+          lease-weight: '3'
+          timeout-seconds: '240'
+          stale-after-seconds: '2100'
+      - run: npm test
+```
+
+Inputs are parsed as strict positive integers (`timeout-seconds` may be `0` for
+an immediate fail) and the root is required: a missing or malformed setting
+fails the job rather than proceeding uncoordinated. The action creates only a
+`.kontour-physical-host-capacity/` directory below that root. On contention it
+waits no longer than `timeout-seconds` and reports the units in use plus short
+lease identifiers and ages.
+
+GitHub runs the action's post step for an acquired action during cleanup,
+including cancellation. Stale recovery is the fallback for a lost runner or a
+cleanup process that cannot run. Set `stale-after-seconds` longer than the
+largest job timeout plus cleanup margin; a lease is not heartbeated after the
+acquisition action exits, so setting it below a possible job duration can
+admit work that should still be reserved. Keep `capacity-units`, the shared
+root, and the stale duration identical for all jobs on the same host.
+
 ## Issue intake to Project v2
 
 Every kontourai repository with issues enabled should install a thin caller workflow at `.github/workflows/add-to-project.yml`. On `issues.opened`, `issues.reopened`, and `issues.closed`, the caller invokes the reusable workflow in this repository:
