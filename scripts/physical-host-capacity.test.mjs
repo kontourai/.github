@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +10,10 @@ import test from 'node:test';
 import {
   CapacityCoordinationError,
   acquireLease,
+  heartbeatLease,
   parseConfig,
+  provisionHost,
+  releaseOwnedControlLock,
   releaseLease,
 } from '../actions/physical-host-capacity/coordinator.mjs';
 
@@ -21,9 +24,10 @@ const execFile = promisify(execFileCallback);
 const acquireScript = fileURLToPath(new URL('../actions/physical-host-capacity/acquire.mjs', import.meta.url));
 const releaseScript = fileURLToPath(new URL('../actions/physical-host-capacity/release.mjs', import.meta.url));
 
-async function withRoot(fn) {
+async function withRoot(fn, { provision = true } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'physical-host-capacity-'));
   try {
+    if (provision) await provisionHost(config(root));
     await fn(root);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -40,6 +44,8 @@ function config(root, overrides = {}) {
     pollIntervalMs: 1,
     staleAfterMs: 60_000,
     staleAfterSeconds: 60,
+    heartbeatIntervalSeconds: 1,
+    heartbeatIntervalMs: 1_000,
     ...overrides,
   };
 }
@@ -64,6 +70,8 @@ test('configuration rejects ambiguous capacity inputs and accepts environment co
       pollIntervalMs: 25,
       staleAfterSeconds: 120,
       staleAfterMs: 120_000,
+      heartbeatIntervalSeconds: 30,
+      heartbeatIntervalMs: 30_000,
     },
   );
   assert.throws(
@@ -83,7 +91,7 @@ test('weighted capacity blocks a contender and reports active utilization', asyn
 
     await assert.rejects(
       acquireLease(config(root), { ownerToken: OWNER_B }),
-      (error) => error instanceof CapacityCoordinationError && /used=2\/3/.test(error.message) && /active=11111111 weight=2/.test(error.message),
+      (error) => error instanceof CapacityCoordinationError && /used=2\/3/.test(error.message) && /leases=11111111 weight=2/.test(error.message),
     );
 
     assert.equal(await releaseLease(config(root), OWNER_A), true);
@@ -109,9 +117,8 @@ test('concurrent acquisitions never exceed the weighted capacity', async () => {
 
 test('stale lease recovery restores capacity while fresh leases remain protected', async () => {
   await withRoot(async (root) => {
-    const recoveryConfig = config(root, { staleAfterMs: 1, staleAfterSeconds: 1 });
-    await acquireLease(recoveryConfig, { ownerToken: OWNER_C });
-    await releaseLease(recoveryConfig, OWNER_C);
+    const recoveryConfig = config(root, { staleAfterMs: 2_000, staleAfterSeconds: 2 });
+    await provisionHost(recoveryConfig);
     const leases = join(root, '.kontour-physical-host-capacity', 'leases');
     await mkdir(leases, { recursive: true });
     const stalePath = join(leases, `${OWNER_A}.json`);
@@ -127,7 +134,90 @@ test('stale lease recovery restores capacity while fresh leases remain protected
     await writeFile(freshPath, JSON.stringify({ ownerToken: OWNER_C, weight: 3, acquiredAt: new Date().toISOString() }));
     await assert.rejects(acquireLease(recoveryConfig, { ownerToken: OWNER_B }), /used=3\/3/);
     assert.equal(JSON.parse(await readFile(freshPath, 'utf8')).ownerToken, OWNER_C);
+  }, { provision: false });
+});
+
+test('a heartbeat keeps an active lease across its stale threshold, while hard loss is recovered', async () => {
+  await withRoot(async (root) => {
+    const heartbeatConfig = config(root, { capacityUnits: 1, leaseWeight: 1, staleAfterSeconds: 2, staleAfterMs: 2_000 });
+    await provisionHost(heartbeatConfig);
+    const held = await acquireLease(heartbeatConfig, { ownerToken: OWNER_A });
+    const old = new Date(Date.now() - 10_000);
+    await utimes(held.leasePath, old, old);
+
+    assert.equal(await heartbeatLease(heartbeatConfig, OWNER_A), true);
+    await assert.rejects(acquireLease(heartbeatConfig, { ownerToken: OWNER_B }), /used=1\/1/);
+
+    await utimes(held.leasePath, old, old);
+    const recovered = await acquireLease(heartbeatConfig, { ownerToken: OWNER_B });
+    assert.equal(recovered.recovered, 1);
+  }, { provision: false });
+});
+
+test('durable FIFO tickets admit an older weighted waiter before a later waiter', async () => {
+  await withRoot(async (root) => {
+    const fifoConfig = config(root, { capacityUnits: 1, leaseWeight: 1, timeoutMs: 500, pollIntervalMs: 2 });
+    await provisionHost(fifoConfig);
+    await acquireLease(fifoConfig, { ownerToken: OWNER_A });
+    const older = acquireLease(fifoConfig, { ownerToken: OWNER_B });
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, 15));
+    const later = acquireLease(fifoConfig, { ownerToken: OWNER_C });
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, 15));
+
+    await releaseLease(fifoConfig, OWNER_A);
+    const olderLease = await older;
+    await releaseLease(fifoConfig, olderLease.ownerToken);
+    const laterLease = await later;
+    assert.equal(laterLease.ownerToken, OWNER_C);
+  }, { provision: false });
+});
+
+test('a zero-timeout contender cleans up its durable ticket with an independent retry budget', async () => {
+  await withRoot(async (root) => {
+    await acquireLease(config(root), { ownerToken: OWNER_A });
+    await assert.rejects(acquireLease(config(root), { ownerToken: OWNER_B }), /Timed out after 0s/);
+    assert.deepEqual(await readdir(join(root, '.kontour-physical-host-capacity', 'tickets')), []);
   });
+});
+
+test('control-lock recovery does not steal an old lock or delete a replacement owner', async () => {
+  await withRoot(async (root) => {
+    const lock = join(root, '.kontour-physical-host-capacity', 'control.lock');
+    await mkdir(lock);
+    await writeFile(join(lock, `owner-${OWNER_A}.json`), '{}');
+    const old = new Date(Date.now() - 10_000);
+    await utimes(lock, old, old);
+
+    let now = Date.now();
+    await assert.rejects(
+      acquireLease(config(root), {
+        ownerToken: OWNER_B,
+        now: () => now,
+        sleep: async () => { now += 10_000; },
+      }),
+      /automatic lock stealing is disabled/,
+    );
+    await access(join(lock, `owner-${OWNER_A}.json`));
+
+    await rm(lock, { recursive: true, force: true }); // explicit operator recovery after confirming no owner is live
+    await mkdir(lock);
+    await writeFile(join(lock, `owner-${OWNER_B}.json`), '{}');
+    await releaseOwnedControlLock(root, OWNER_A);
+    await access(join(lock, `owner-${OWNER_B}.json`));
+  });
+});
+
+test('contention diagnostics are capped and report omitted records', async () => {
+  await withRoot(async (root) => {
+    const diagnosticConfig = config(root, { capacityUnits: 8, leaseWeight: 1 });
+    await provisionHost(diagnosticConfig);
+    const leases = join(root, '.kontour-physical-host-capacity', 'leases');
+    for (let index = 0; index < 8; index += 1) {
+      const token = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+      await writeFile(join(leases, `${token}.json`), JSON.stringify({ ownerToken: token, weight: 1, acquiredAt: new Date().toISOString() }));
+    }
+    await assert.rejects(acquireLease(diagnosticConfig, { ownerToken: OWNER_A }), /leases=.*omitted=2/);
+  }, { provision: false });
 });
 
 test('host manifest rejects participants with conflicting capacity or stale semantics', async () => {
@@ -144,7 +234,7 @@ test('host manifest rejects participants with conflicting capacity or stale sema
     );
     await assert.rejects(
       acquireLease(config(root, { hostId: 'desktop-win-02' }), { ownerToken: OWNER_B }),
-      /Host manifest mismatch.*hostId/,
+      /External host marker mismatch/,
     );
   });
 });
@@ -162,7 +252,7 @@ test('a malformed host manifest fails closed before capacity can be acquired', a
   });
 });
 
-test('an uninitialized root with existing leases cannot be silently adopted', async () => {
+test('an uninitialized root cannot be silently adopted', async () => {
   await withRoot(async (root) => {
     const leases = join(root, '.kontour-physical-host-capacity', 'leases');
     await mkdir(leases, { recursive: true });
@@ -170,9 +260,9 @@ test('an uninitialized root with existing leases cannot be silently adopted', as
 
     await assert.rejects(
       acquireLease(config(root), { ownerToken: OWNER_B }),
-      /existing leases require manual recovery/,
+      /External host marker is required/,
     );
-  });
+  }, { provision: false });
 });
 
 test('metadata cannot override a lease owner, weight, or acquisition time', async () => {
@@ -191,6 +281,7 @@ test('metadata cannot override a lease owner, weight, or acquisition time', asyn
 
 test('action entrypoints persist state and release the acquired lease in the post step', async () => {
   await withRoot(async (root) => {
+    await provisionHost(config(root, { capacityUnits: 1 }));
     const output = join(root, 'output');
     const environment = join(root, 'environment');
     const state = join(root, 'state');
@@ -222,5 +313,5 @@ test('action entrypoints persist state and release the acquired lease in the pos
     }));
     await execFile(process.execPath, [releaseScript], { env: { ...actionEnv, ...postState } });
     await assert.rejects(access(outputs['lease-path']), { code: 'ENOENT' });
-  });
+  }, { provision: false });
 });

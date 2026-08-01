@@ -115,6 +115,7 @@ jobs:
           lease-weight: '5'
           timeout-seconds: '240'
           stale-after-seconds: '2100'
+          heartbeat-interval-seconds: '60'
       - shell: pwsh
         run: npm test
 
@@ -133,34 +134,52 @@ jobs:
           lease-weight: '3'
           timeout-seconds: '240'
           stale-after-seconds: '2100'
+          heartbeat-interval-seconds: '60'
       - run: npm test
 ```
 
-Inputs are parsed as strict positive integers (`timeout-seconds` may be `0` for
-an immediate fail) and the root is required: a missing or malformed setting
-fails the job rather than proceeding uncoordinated. The action creates only a
-`.kontour-physical-host-capacity/` directory below that root. On contention it
-waits no longer than `timeout-seconds` and reports the units in use plus short
-lease identifiers and ages.
+Inputs are parsed as strict integers (`timeout-seconds` may be `0` for an
+immediate fail). The root must be an existing absolute path and must be
+provisioned before any workflow can use it; the action never creates a root,
+marker, manifest, or queue directories. Provision once from a trusted host
+administrator account, using either the Windows root or its WSL mount:
 
-GitHub runs the action's post step for an acquired action during cleanup,
-including cancellation. Stale recovery is the fallback for a lost runner or a
-cleanup process that cannot run. Set `stale-after-seconds` longer than the
-largest job timeout plus cleanup margin; a lease is not heartbeated after the
-acquisition action exits, so setting it below a possible job duration can
-admit work that should still be reserved.
+```sh
+node scripts/provision-physical-host-capacity.mjs \
+  --root /mnt/d/kontour-runner-capacity \
+  --host-id desktop-win-01 \
+  --capacity-units 8 \
+  --stale-after-seconds 2100 \
+  --heartbeat-interval-seconds 60
+```
 
-On its first use of an empty root, the action initializes (under an atomically
-acquired bootstrap lock)
-`.kontour-physical-host-capacity/host-manifest.json` with schema version,
-`host-id`, `capacity-units`, `stale-after-seconds`, and the stale-lease
-strategy. Every later participant must match it exactly before acquiring or
-releasing a lease; mismatches and malformed manifests fail closed. The root
-cannot be initialized if it already contains leases or an unknown coordination
-entry, which prevents accidentally adopting a divergent pre-existing root.
-Change host capacity or stale semantics only by draining the root and replacing
-its manifest in a deliberate maintenance operation—never by changing one job's
-action inputs.
+Provisioning writes an externally located `.kontour-physical-host-id` marker
+and a schema-versioned `host-manifest.json`. Its host ID, capacity,
+stale duration, and `heartbeat-mtime-v1` lease strategy are authoritative:
+every participant must match them exactly before acquire, heartbeat, or release
+can proceed. Update those values only after draining the root and deliberately
+re-provisioning it.
+
+An acquired action runs a detached Node heartbeat on both Windows and Linux;
+the heartbeat renews the lease under the control lock, and the always-running
+post step terminates it before release. An active heartbeat therefore survives
+the stale threshold; a lost runner or heartbeat is recovered only after it
+stops renewing for `stale-after-seconds`. Keep the heartbeat strictly shorter
+than the stale duration and leave sufficient margin for filesystem delays.
+
+Waiting jobs create durable weighted FIFO tickets. Only the oldest ticket may
+claim available capacity, so later small jobs cannot starve an older larger
+job. Timeout cleanup retries independently for up to five seconds even when
+the acquisition timeout is zero. Contention diagnostics are capped and include
+an omitted-entry count.
+
+Control locks intentionally have **no automatic stale stealing**. Portable
+Windows/WSL NTFS directory ownership has no safe compare-and-swap, and stealing
+could remove a replacement owner. A wedged control lock fails closed with a
+typed diagnostic. After confirming no owner process is live, an operator may
+remove only `<root>/.kontour-physical-host-capacity/control.lock`, then rerun
+the blocked job; never delete leases, tickets, the external marker, or the
+manifest as part of that recovery.
 
 ## Issue intake to Project v2
 
