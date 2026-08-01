@@ -2,7 +2,6 @@ name: Self-hosted runner smoke
 
 on:
   workflow_call:
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,8 +22,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm hello-world >/dev/null
-          echo "Linux Docker runner smoke passed"
+          image="kontour-runner-smoke:${GITHUB_RUN_ID}"
+          trap 'docker image rm --force "$image" >/dev/null 2>&1 || true' EXIT
+          printf 'FROM scratch\nLABEL kontour.runner.smoke=passed\n' | \
+            docker build --pull=false --tag "$image" -
+          test "$(docker image inspect --format '{{ index .Config.Labels "kontour.runner.smoke" }}' "$image")" = passed
+          echo "Linux Docker runner smoke passed without pulling executable code"
 
   windows-native:
     name: Native Windows

@@ -27,6 +27,9 @@ runs:
         "runner.os=$env:RUNNER_OS"
         "runner.arch=$env:RUNNER_ARCH"
         "powershell=$($PSVersionTable.PSVersion)"
+        git --version
+        node --version
+        rustc --version
 
     - name: Verify Docker on Linux
       if: runner.os == 'Linux' && inputs.require-docker == 'true'

@@ -42,3 +42,12 @@ test('runner preflight verifies Docker only when explicitly required', async () 
     assert.match(step.run, /docker version/);
   }
 });
+
+test('Windows preflight enforces the documented native build-tool contract', async () => {
+  const action = parse(await readFile(preflightActionUrl, 'utf8'));
+  const windowsStep = action.runs.steps.find((step) => step.name === 'Report Windows runner');
+
+  assert.match(windowsStep.run, /git --version/);
+  assert.match(windowsStep.run, /node --version/);
+  assert.match(windowsStep.run, /rustc --version/);
+});

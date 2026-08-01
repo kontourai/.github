@@ -24,7 +24,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: kontourai/.github/actions/runner-preflight@main
+      # Replace the placeholder with a reviewed full commit SHA.
+      - uses: kontourai/.github/actions/runner-preflight@<full-commit-sha>
         with:
           require-docker: "true"
       - run: npm test
@@ -34,7 +35,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-      - uses: kontourai/.github/actions/runner-preflight@main
+      # Replace the placeholder with a reviewed full commit SHA.
+      - uses: kontourai/.github/actions/runner-preflight@<full-commit-sha>
       - shell: pwsh
         run: npm test
 ```
@@ -54,8 +56,14 @@ workflow tests the shared fleet itself and can be called from another workflow:
 ```yaml
 jobs:
   build-fleet:
-    uses: kontourai/.github/.github/workflows/self-hosted-runner-smoke.yml@main
+    # Replace the placeholder with a reviewed full commit SHA.
+    uses: kontourai/.github/.github/workflows/self-hosted-runner-smoke.yml@<full-commit-sha>
 ```
+
+Always use an immutable full commit SHA for shared actions and workflows that
+run on persistent infrastructure. Dependabot or a deliberate fleet-contract PR
+should advance that pin; do not let a moving branch silently change executable
+CI in every consumer.
 
 The organization runner group is restricted to private repositories. Never run
 untrusted fork code through `pull_request_target` on a persistent runner. Keep
