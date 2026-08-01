@@ -24,6 +24,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
       # Replace the placeholder with a reviewed full commit SHA.
       - uses: kontourai/.github/actions/runner-preflight@<full-commit-sha>
         with:
@@ -35,6 +37,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
       # Replace the placeholder with a reviewed full commit SHA.
       - uses: kontourai/.github/actions/runner-preflight@<full-commit-sha>
       - shell: pwsh
@@ -65,9 +69,16 @@ run on persistent infrastructure. Dependabot or a deliberate fleet-contract PR
 should advance that pin; do not let a moving branch silently change executable
 CI in every consumer.
 
-The organization runner group is restricted to private repositories. Never run
-untrusted fork code through `pull_request_target` on a persistent runner. Keep
-job output bounded, set a timeout on every self-hosted job, use workflow
+Private does not automatically mean trusted. Persistent runners must execute
+only protected refs, reviewed manual dispatches, or branches whose authors are
+trusted with host-level code execution. Do not route untrusted forks or other
+untrusted `pull_request` code to them, including through `pull_request_target`.
+Use GitHub-hosted or one-job ephemeral runners for untrusted changes. Restrict
+the organization runner group to explicitly enrolled repositories (and selected
+workflows where the provider supports it), grant minimal permissions, and set
+`persist-credentials: false` on checkouts that do not push.
+
+Keep job output bounded, set a timeout on every self-hosted job, use workflow
 `concurrency` to cancel superseded branch runs, and leave repository-specific
 dependency caches to the owning workflow. Each runner accepts one job at a
 time; horizontal capacity comes from registering more runners with the same

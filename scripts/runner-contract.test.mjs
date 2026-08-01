@@ -28,6 +28,8 @@ test('fleet smoke routes by stable capability labels instead of host name', asyn
   for (const job of Object.values(workflow.jobs)) {
     assert.equal(job['runs-on'].includes('desktop-win'), false);
     assert.equal(job['timeout-minutes'], 10);
+    const preflight = job.steps.find((step) => step.name === 'Verify runner capabilities');
+    assert.match(preflight.uses, /^kontourai\/\.github\/actions\/runner-preflight@[0-9a-f]{40}$/);
   }
 });
 
