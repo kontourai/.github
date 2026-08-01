@@ -19,6 +19,11 @@ on:
         description: "URL of the completed Trust CI run."
         required: true
         type: string
+      details:
+        description: "Optional structured failure details for the advisory comment."
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: none
@@ -43,6 +48,14 @@ jobs:
             ${{ inputs.check-name }} completed with result: `${{ inputs.result }}`.
 
             [Open the workflow run](${{ inputs.run-url }})
+
+            <details>
+            <summary>Failure details</summary>
+
+            ```text
+            ${{ inputs.details || 'No structured failure details were reported; open the workflow run.' }}
+            ```
+            </details>
 
             This is advisory and non-blocking; it does not change the ${{ inputs.check-name }} verdict or merge requirements.
 
