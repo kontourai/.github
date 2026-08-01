@@ -99,6 +99,28 @@ test('runner routing defaults to hosted and accepts an explicit JSON target', as
   assert.doesNotMatch(workflow, /\/usr\/local\/bin/);
 });
 
+test('self-hosted scans fail closed unless they reserve shared host capacity', async () => {
+  const workflow = await readFile(workflowPath, 'utf8');
+
+  assert.match(
+    workflow,
+    /runner\.environment == 'self-hosted' && \(inputs\.capacity-coordination-root == '' \|\| inputs\.capacity-host-id == ''\)/,
+  );
+  assert.match(
+    workflow,
+    /uses: kontourai\/\.github\/actions\/physical-host-capacity@3a002e3b41693f62f44cd539495603e9157f7830/,
+  );
+  for (const input of [
+    'coordination-root: ${{ inputs.capacity-coordination-root }}',
+    'host-id: ${{ inputs.capacity-host-id }}',
+    'capacity-units: ${{ inputs.capacity-units }}',
+    'lease-weight: ${{ inputs.capacity-lease-weight }}',
+    'timeout-seconds: ${{ inputs.capacity-timeout-seconds }}',
+  ]) {
+    assert.ok(workflow.includes(input), `expected capacity input: ${input}`);
+  }
+});
+
 test('scan fails closed if the checkout is shallow', async () => {
   const workflow = await readFile(workflowPath, 'utf8');
 
