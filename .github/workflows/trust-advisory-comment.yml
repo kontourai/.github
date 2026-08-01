@@ -1,0 +1,51 @@
+name: Trust Verify advisory comment
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: "Pull request number to comment on."
+        required: true
+        type: number
+      result:
+        description: "Completed Trust Verify result."
+        required: true
+        type: string
+      run-url:
+        description: "URL of the completed Trust Verify run."
+        required: true
+        type: string
+
+permissions:
+  contents: none
+
+jobs:
+  publish:
+    name: Publish Trust Verify advisory
+    runs-on: ubuntu-latest
+    permissions:
+      contents: none
+      pull-requests: write
+    steps:
+      - name: Create or update advisory comment
+        if: inputs.result != 'success'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88
+        with:
+          number_force: ${{ inputs.pr-number }}
+          header: trust-verify-advisory
+          message: |
+            ## Trust Verify needs attention
+
+            Trust Verify completed with result: `${{ inputs.result }}`.
+
+            [Open the workflow run](${{ inputs.run-url }})
+
+            This is advisory and non-blocking; it does not change the Trust Verify verdict or merge requirements.
+
+      - name: Remove resolved advisory comment
+        if: inputs.result == 'success'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88
+        with:
+          number_force: ${{ inputs.pr-number }}
+          header: trust-verify-advisory
+          delete: true
