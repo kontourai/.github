@@ -12,6 +12,59 @@ files, and organization-level GitHub workflow plumbing.
 - [`.github/workflows/`](.github/workflows/) contains reusable workflows called
   by product repositories.
 
+## Self-hosted build fleet
+
+Kontour CI jobs select capabilities, not a physical host. Use the smallest label
+set that describes the work:
+
+```yaml
+jobs:
+  linux-container-tests:
+    runs-on: [self-hosted, Linux, X64, kontour-linux, docker]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: kontourai/.github/actions/runner-preflight@main
+        with:
+          require-docker: "true"
+      - run: npm test
+
+  windows-native-tests:
+    runs-on: [self-hosted, Windows, X64, kontour-windows, native]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: kontourai/.github/actions/runner-preflight@main
+      - shell: pwsh
+        run: npm test
+```
+
+`kontour-linux` and `kontour-windows` are the stable fleet contracts. Add a
+capability label such as `docker` or `native` only when the job needs it. Do not
+use the `desktop-win` diagnostic label in normal workflows: keeping the host
+out of the contract lets another machine satisfy the same job without a CI
+edit. Add an `android` label only after the complete Android toolchain has been
+installed and smoke-tested on that runner.
+
+The lightweight `runner-preflight` composite action fails early when a runner
+does not provide the capability its labels promise. The reusable
+[`self-hosted-runner-smoke.yml`](.github/workflows/self-hosted-runner-smoke.yml)
+workflow tests the shared fleet itself and can be called from another workflow:
+
+```yaml
+jobs:
+  build-fleet:
+    uses: kontourai/.github/.github/workflows/self-hosted-runner-smoke.yml@main
+```
+
+The organization runner group is restricted to private repositories. Never run
+untrusted fork code through `pull_request_target` on a persistent runner. Keep
+job output bounded, set a timeout on every self-hosted job, use workflow
+`concurrency` to cancel superseded branch runs, and leave repository-specific
+dependency caches to the owning workflow. Each runner accepts one job at a
+time; horizontal capacity comes from registering more runners with the same
+capability labels.
+
 ## Issue intake to Project v2
 
 Every kontourai repository with issues enabled should install a thin caller workflow at `.github/workflows/add-to-project.yml`. On `issues.opened`, `issues.reopened`, and `issues.closed`, the caller invokes the reusable workflow in this repository:

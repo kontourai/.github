@@ -1,0 +1,41 @@
+name: Self-hosted runner smoke
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-docker:
+    name: Linux and Docker
+    runs-on: [self-hosted, Linux, X64, kontour-linux, docker]
+    timeout-minutes: 10
+    steps:
+      - name: Verify runner capabilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner.os=${RUNNER_OS} runner.arch=${RUNNER_ARCH}"
+          docker version --format 'docker.client={{.Client.Version}} docker.server={{.Server.Version}}'
+      - name: Run disposable container
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm hello-world >/dev/null
+          echo "Linux Docker runner smoke passed"
+
+  windows-native:
+    name: Native Windows
+    runs-on: [self-hosted, Windows, X64, kontour-windows, native]
+    timeout-minutes: 10
+    steps:
+      - name: Verify runner capabilities
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          "runner.os=$env:RUNNER_OS runner.arch=$env:RUNNER_ARCH"
+          git --version
+          node --version
+          rustc --version
