@@ -93,8 +93,10 @@ weighted lease rather than serializing every job, and its JavaScript action
 post-step releases the lease after normal failure or workflow cancellation.
 
 The `coordination-root` values below are different OS paths to the **same
-NTFS-backed directory**. Give only trusted runner identities write access to
-that directory; a writer can reserve or remove capacity for every participant.
+NTFS-backed directory**. `host-id` is a stable literal identity for that one
+physical host, not the Windows or WSL runner name. Give only trusted runner
+identities write access to that directory; a writer can reserve or remove
+capacity for every participant.
 
 ```yaml
 jobs:
@@ -107,7 +109,8 @@ jobs:
           persist-credentials: false
       - uses: kontourai/.github/actions/physical-host-capacity@<full-commit-sha>
         with:
-          coordination-root: 'D:\\kontour-runner-capacity'
+          coordination-root: 'D:\kontour-runner-capacity'
+          host-id: desktop-win-01
           capacity-units: '8'
           lease-weight: '5'
           timeout-seconds: '240'
@@ -125,6 +128,7 @@ jobs:
       - uses: kontourai/.github/actions/physical-host-capacity@<full-commit-sha>
         with:
           coordination-root: /mnt/d/kontour-runner-capacity
+          host-id: desktop-win-01
           capacity-units: '8'
           lease-weight: '3'
           timeout-seconds: '240'
@@ -144,8 +148,19 @@ including cancellation. Stale recovery is the fallback for a lost runner or a
 cleanup process that cannot run. Set `stale-after-seconds` longer than the
 largest job timeout plus cleanup margin; a lease is not heartbeated after the
 acquisition action exits, so setting it below a possible job duration can
-admit work that should still be reserved. Keep `capacity-units`, the shared
-root, and the stale duration identical for all jobs on the same host.
+admit work that should still be reserved.
+
+On its first use of an empty root, the action initializes (under an atomically
+acquired bootstrap lock)
+`.kontour-physical-host-capacity/host-manifest.json` with schema version,
+`host-id`, `capacity-units`, `stale-after-seconds`, and the stale-lease
+strategy. Every later participant must match it exactly before acquiring or
+releasing a lease; mismatches and malformed manifests fail closed. The root
+cannot be initialized if it already contains leases or an unknown coordination
+entry, which prevents accidentally adopting a divergent pre-existing root.
+Change host capacity or stale semantics only by draining the root and replacing
+its manifest in a deliberate maintenance operation—never by changing one job's
+action inputs.
 
 ## Issue intake to Project v2
 

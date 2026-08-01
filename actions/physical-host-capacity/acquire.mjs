@@ -26,6 +26,7 @@ async function main() {
   // immediately after acquisition or output publication fails.
   await writeCommands(process.env.GITHUB_STATE, [
     [stateName('ROOT'), config.root],
+    [stateName('HOST_ID'), config.hostId],
     [stateName('OWNER_TOKEN'), ownerToken],
     [stateName('CAPACITY_UNITS'), String(config.capacityUnits)],
     [stateName('LEASE_WEIGHT'), String(config.leaseWeight)],

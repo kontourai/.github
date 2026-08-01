@@ -33,11 +33,13 @@ async function withRoot(fn) {
 function config(root, overrides = {}) {
   return {
     root,
+    hostId: 'desktop-win-01',
     capacityUnits: 3,
     leaseWeight: 2,
     timeoutMs: 0,
     pollIntervalMs: 1,
     staleAfterMs: 60_000,
+    staleAfterSeconds: 60,
     ...overrides,
   };
 }
@@ -46,6 +48,7 @@ test('configuration rejects ambiguous capacity inputs and accepts environment co
   assert.deepEqual(
     parseConfig({
       PHYSICAL_HOST_CAPACITY_ROOT: '/coordination',
+      PHYSICAL_HOST_CAPACITY_HOST_ID: 'desktop-win-01',
       PHYSICAL_HOST_CAPACITY_UNITS: '4',
       PHYSICAL_HOST_CAPACITY_WEIGHT: '3',
       PHYSICAL_HOST_CAPACITY_TIMEOUT_SECONDS: '0',
@@ -54,19 +57,21 @@ test('configuration rejects ambiguous capacity inputs and accepts environment co
     }),
     {
       root: '/coordination',
+      hostId: 'desktop-win-01',
       capacityUnits: 4,
       leaseWeight: 3,
       timeoutMs: 0,
       pollIntervalMs: 25,
+      staleAfterSeconds: 120,
       staleAfterMs: 120_000,
     },
   );
   assert.throws(
-    () => parseConfig({ INPUT_COORDINATION_ROOT: '/coordination', INPUT_CAPACITY_UNITS: '1.5' }),
+    () => parseConfig({ INPUT_COORDINATION_ROOT: '/coordination', INPUT_HOST_ID: 'desktop-win-01', INPUT_CAPACITY_UNITS: '1.5' }),
     /capacity-units must be a positive integer/,
   );
   assert.throws(
-    () => parseConfig({ INPUT_COORDINATION_ROOT: '/coordination', INPUT_CAPACITY_UNITS: '2', INPUT_LEASE_WEIGHT: '3' }),
+    () => parseConfig({ INPUT_COORDINATION_ROOT: '/coordination', INPUT_HOST_ID: 'desktop-win-01', INPUT_CAPACITY_UNITS: '2', INPUT_LEASE_WEIGHT: '3' }),
     /cannot exceed/,
   );
 });
@@ -104,6 +109,9 @@ test('concurrent acquisitions never exceed the weighted capacity', async () => {
 
 test('stale lease recovery restores capacity while fresh leases remain protected', async () => {
   await withRoot(async (root) => {
+    const recoveryConfig = config(root, { staleAfterMs: 1, staleAfterSeconds: 1 });
+    await acquireLease(recoveryConfig, { ownerToken: OWNER_C });
+    await releaseLease(recoveryConfig, OWNER_C);
     const leases = join(root, '.kontour-physical-host-capacity', 'leases');
     await mkdir(leases, { recursive: true });
     const stalePath = join(leases, `${OWNER_A}.json`);
@@ -111,14 +119,73 @@ test('stale lease recovery restores capacity while fresh leases remain protected
     const staleDate = new Date(Date.now() - 10_000);
     await utimes(stalePath, staleDate, staleDate);
 
-    const acquired = await acquireLease(config(root, { staleAfterMs: 1 }), { ownerToken: OWNER_B });
+    const acquired = await acquireLease(recoveryConfig, { ownerToken: OWNER_B });
     assert.equal(acquired.recovered, 1);
-    assert.equal(await releaseLease(config(root, { staleAfterMs: 1 }), OWNER_B), true);
+    assert.equal(await releaseLease(recoveryConfig, OWNER_B), true);
 
     const freshPath = join(leases, `${OWNER_C}.json`);
     await writeFile(freshPath, JSON.stringify({ ownerToken: OWNER_C, weight: 3, acquiredAt: new Date().toISOString() }));
-    await assert.rejects(acquireLease(config(root), { ownerToken: OWNER_B }), /used=3\/3/);
+    await assert.rejects(acquireLease(recoveryConfig, { ownerToken: OWNER_B }), /used=3\/3/);
     assert.equal(JSON.parse(await readFile(freshPath, 'utf8')).ownerToken, OWNER_C);
+  });
+});
+
+test('host manifest rejects participants with conflicting capacity or stale semantics', async () => {
+  await withRoot(async (root) => {
+    await acquireLease(config(root), { ownerToken: OWNER_A });
+
+    await assert.rejects(
+      acquireLease(config(root, { capacityUnits: 4 }), { ownerToken: OWNER_B }),
+      /Host manifest mismatch.*capacityUnits/,
+    );
+    await assert.rejects(
+      acquireLease(config(root, { staleAfterMs: 120_000, staleAfterSeconds: 120 }), { ownerToken: OWNER_B }),
+      /Host manifest mismatch.*staleAfterSeconds/,
+    );
+    await assert.rejects(
+      acquireLease(config(root, { hostId: 'desktop-win-02' }), { ownerToken: OWNER_B }),
+      /Host manifest mismatch.*hostId/,
+    );
+  });
+});
+
+test('a malformed host manifest fails closed before capacity can be acquired', async () => {
+  await withRoot(async (root) => {
+    const state = join(root, '.kontour-physical-host-capacity');
+    await mkdir(state, { recursive: true });
+    await writeFile(join(state, 'host-manifest.json'), '{not-json');
+
+    await assert.rejects(
+      acquireLease(config(root), { ownerToken: OWNER_A }),
+      /Invalid host manifest/,
+    );
+  });
+});
+
+test('an uninitialized root with existing leases cannot be silently adopted', async () => {
+  await withRoot(async (root) => {
+    const leases = join(root, '.kontour-physical-host-capacity', 'leases');
+    await mkdir(leases, { recursive: true });
+    await writeFile(join(leases, `${OWNER_A}.json`), JSON.stringify({ ownerToken: OWNER_A, weight: 1, acquiredAt: new Date().toISOString() }));
+
+    await assert.rejects(
+      acquireLease(config(root), { ownerToken: OWNER_B }),
+      /existing leases require manual recovery/,
+    );
+  });
+});
+
+test('metadata cannot override a lease owner, weight, or acquisition time', async () => {
+  await withRoot(async (root) => {
+    const acquired = await acquireLease(config(root), {
+      ownerToken: OWNER_A,
+      metadata: { ownerToken: OWNER_B, weight: 99, acquiredAt: '2020-01-01T00:00:00.000Z', repository: 'example' },
+    });
+    const lease = JSON.parse(await readFile(acquired.leasePath, 'utf8'));
+    assert.equal(lease.ownerToken, OWNER_A);
+    assert.equal(lease.weight, 2);
+    assert.notEqual(lease.acquiredAt, '2020-01-01T00:00:00.000Z');
+    assert.equal(lease.repository, 'example');
   });
 });
 
@@ -131,6 +198,7 @@ test('action entrypoints persist state and release the acquired lease in the pos
     const actionEnv = {
       ...process.env,
       INPUT_COORDINATION_ROOT: root,
+      INPUT_HOST_ID: 'desktop-win-01',
       INPUT_CAPACITY_UNITS: '1',
       INPUT_LEASE_WEIGHT: '1',
       INPUT_TIMEOUT_SECONDS: '0',

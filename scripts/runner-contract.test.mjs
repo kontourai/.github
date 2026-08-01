@@ -59,6 +59,7 @@ test('physical-host capacity action is a required, cancellation-safe weighted le
   const action = parse(await readFile(capacityActionUrl, 'utf8'));
 
   assert.equal(action.inputs['coordination-root'].required, true);
+  assert.equal(action.inputs['host-id'].required, true);
   assert.equal(action.inputs['capacity-units'].default, '1');
   assert.equal(action.inputs['lease-weight'].default, '1');
   assert.equal(action.inputs['timeout-seconds'].default, '300');

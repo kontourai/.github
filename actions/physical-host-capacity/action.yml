@@ -5,6 +5,9 @@ inputs:
   coordination-root:
     description: OS-local path to the shared NTFS-backed coordination root. It must identify the same directory on every participating runner.
     required: true
+  host-id:
+    description: Stable shared identity of the physical host. It must be identical for every participant using this coordination root.
+    required: true
   capacity-units:
     description: Positive integer number of capacity units available on the physical host.
     required: false

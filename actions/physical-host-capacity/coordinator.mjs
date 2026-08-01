@@ -14,6 +14,11 @@ import { basename, join, resolve } from 'node:path';
 const STATE_DIRECTORY = '.kontour-physical-host-capacity';
 const LEASE_DIRECTORY = 'leases';
 const CONTROL_LOCK_DIRECTORY = 'control.lock';
+const MANIFEST_LOCK_DIRECTORY = 'manifest.lock';
+const MANIFEST_FILE = 'host-manifest.json';
+const MANIFEST_SCHEMA_VERSION = 1;
+const MANIFEST_LOCK_STALE_MS = 60_000;
+const STALE_LEASE_STRATEGY = 'file-mtime-no-heartbeat';
 
 export class CapacityCoordinationError extends Error {
   constructor(message, cause) {
@@ -56,19 +61,31 @@ function requiredPath(value) {
   return resolve(value);
 }
 
+function requiredHostId(value) {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value ?? '')) {
+    throw new CapacityCoordinationError('host-id is required and must contain only letters, numbers, dots, underscores, or hyphens.');
+  }
+  return value;
+}
+
 export function parseConfig(env = process.env) {
   const root = requiredPath(input(env, 'coordination-root') ?? env.PHYSICAL_HOST_CAPACITY_ROOT);
+  const hostId = requiredHostId(input(env, 'host-id') ?? env.PHYSICAL_HOST_CAPACITY_HOST_ID);
   const capacityUnits = positiveInteger(input(env, 'capacity-units') ?? env.PHYSICAL_HOST_CAPACITY_UNITS ?? '1', 'capacity-units');
   const leaseWeight = positiveInteger(input(env, 'lease-weight') ?? env.PHYSICAL_HOST_CAPACITY_WEIGHT ?? '1', 'lease-weight');
   const timeoutMs = durationMilliseconds(input(env, 'timeout-seconds') ?? env.PHYSICAL_HOST_CAPACITY_TIMEOUT_SECONDS ?? '300', 'timeout-seconds', { allowZero: true });
   const pollIntervalMs = positiveInteger(input(env, 'poll-interval-ms') ?? env.PHYSICAL_HOST_CAPACITY_POLL_INTERVAL_MS ?? '1000', 'poll-interval-ms');
-  const staleAfterMs = durationMilliseconds(input(env, 'stale-after-seconds') ?? env.PHYSICAL_HOST_CAPACITY_STALE_AFTER_SECONDS ?? '1800', 'stale-after-seconds');
+  const staleAfterSeconds = positiveInteger(input(env, 'stale-after-seconds') ?? env.PHYSICAL_HOST_CAPACITY_STALE_AFTER_SECONDS ?? '1800', 'stale-after-seconds');
+  const staleAfterMs = staleAfterSeconds * 1000;
+  if (!Number.isSafeInteger(staleAfterMs)) {
+    throw new CapacityCoordinationError('stale-after-seconds is too large.');
+  }
 
   if (leaseWeight > capacityUnits) {
     throw new CapacityCoordinationError(`lease-weight (${leaseWeight}) cannot exceed capacity-units (${capacityUnits}).`);
   }
 
-  return { root, capacityUnits, leaseWeight, timeoutMs, pollIntervalMs, staleAfterMs };
+  return { root, hostId, capacityUnits, leaseWeight, timeoutMs, pollIntervalMs, staleAfterSeconds, staleAfterMs };
 }
 
 function paths(root) {
@@ -77,12 +94,77 @@ function paths(root) {
     state,
     leases: join(state, LEASE_DIRECTORY),
     controlLock: join(state, CONTROL_LOCK_DIRECTORY),
+    manifestLock: join(state, MANIFEST_LOCK_DIRECTORY),
+    manifest: join(state, MANIFEST_FILE),
   };
 }
 
 async function ensureLayout(root) {
   const { leases } = paths(root);
   await mkdir(leases, { recursive: true });
+}
+
+function manifestFor(config) {
+  return {
+    schemaVersion: MANIFEST_SCHEMA_VERSION,
+    hostId: config.hostId,
+    capacityUnits: config.capacityUnits,
+    staleAfterSeconds: config.staleAfterSeconds,
+    staleLeaseStrategy: STALE_LEASE_STRATEGY,
+  };
+}
+
+function validManifest(manifest, path) {
+  const expectedKeys = ['capacityUnits', 'hostId', 'schemaVersion', 'staleAfterSeconds', 'staleLeaseStrategy'];
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) || Object.keys(manifest).sort().join(',') !== expectedKeys.join(',')) {
+    throw new CapacityCoordinationError(`Invalid host manifest at ${path}; refusing to guess capacity configuration.`);
+  }
+  if (
+    manifest.schemaVersion !== MANIFEST_SCHEMA_VERSION ||
+    requiredHostId(manifest.hostId) !== manifest.hostId ||
+    !Number.isSafeInteger(manifest.capacityUnits) || manifest.capacityUnits < 1 ||
+    !Number.isSafeInteger(manifest.staleAfterSeconds) || manifest.staleAfterSeconds < 1 ||
+    manifest.staleLeaseStrategy !== STALE_LEASE_STRATEGY
+  ) {
+    throw new CapacityCoordinationError(`Invalid host manifest at ${path}; refusing to guess capacity configuration.`);
+  }
+  return manifest;
+}
+
+function assertManifestMatches(manifest, config, path) {
+  const expected = manifestFor(config);
+  for (const key of Object.keys(expected)) {
+    if (manifest[key] !== expected[key]) {
+      throw new CapacityCoordinationError(`Host manifest mismatch at ${path}: ${key} is ${JSON.stringify(manifest[key])}, but this job requires ${JSON.stringify(expected[key])}. Coordination cannot continue.`);
+    }
+  }
+}
+
+async function ensureManifest(config, { now = realClock.now, sleep = realClock.sleep } = {}) {
+  await ensureLayout(config.root);
+  return withManifestLock(config.root, { ...config, now, sleep }, async () => {
+    const { leases, manifest, state } = paths(config.root);
+    try {
+      const existing = validManifest(await readJson(manifest, 'host manifest'), manifest);
+      assertManifestMatches(existing, config, manifest);
+      return existing;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+
+    const entries = await readdir(state, { withFileTypes: true });
+    const unsupported = entries.filter((entry) => entry.name !== LEASE_DIRECTORY && entry.name !== MANIFEST_LOCK_DIRECTORY);
+    if (unsupported.length > 0) {
+      throw new CapacityCoordinationError(`Cannot initialize host manifest at ${manifest}: unrecognized existing coordination state (${unsupported.map((entry) => entry.name).join(', ')}).`);
+    }
+    if ((await readdir(leases)).length > 0) {
+      throw new CapacityCoordinationError(`Cannot initialize host manifest at ${manifest}: existing leases require manual recovery.`);
+    }
+
+    const initial = manifestFor(config);
+    await writeFile(manifest, JSON.stringify(initial), 'utf8');
+    return initial;
+  });
 }
 
 async function readJson(path, label) {
@@ -149,7 +231,7 @@ async function listLeases(root, staleAfterMs, now) {
   return { active, recovered };
 }
 
-async function releaseControlLock(lockPath, token) {
+async function releaseLock(lockPath, token) {
   try {
     const record = await readJson(join(lockPath, 'owner.json'), 'control-lock record');
     if (record.ownerToken === token) {
@@ -161,15 +243,14 @@ async function releaseControlLock(lockPath, token) {
   }
 }
 
-async function tryAcquireControlLock(root, token, staleAfterMs, now) {
-  const { controlLock } = paths(root);
+async function tryAcquireLock(lockPath, token, staleAfterMs, now) {
   try {
-    await mkdir(controlLock);
+    await mkdir(lockPath);
     try {
-      await writeFile(join(controlLock, 'owner.json'), JSON.stringify({ ownerToken: token, acquiredAt: new Date(now()).toISOString() }), 'utf8');
+      await writeFile(join(lockPath, 'owner.json'), JSON.stringify({ ownerToken: token, acquiredAt: new Date(now()).toISOString() }), 'utf8');
       return true;
     } catch (error) {
-      await rm(controlLock, { recursive: true, force: true });
+      await rm(lockPath, { recursive: true, force: true });
       throw error;
     }
   } catch (error) {
@@ -178,16 +259,16 @@ async function tryAcquireControlLock(root, token, staleAfterMs, now) {
 
   let info;
   try {
-    info = await stat(controlLock);
+    info = await stat(lockPath);
   } catch (error) {
     if (error.code === 'ENOENT') return false;
     throw error;
   }
   if (Math.max(0, now() - info.mtimeMs) < staleAfterMs) return false;
 
-  const staleLock = `${controlLock}.stale-${token}`;
+  const staleLock = `${lockPath}.stale-${token}`;
   try {
-    await rename(controlLock, staleLock);
+    await rename(lockPath, staleLock);
     await rm(staleLock, { recursive: true, force: true });
   } catch (error) {
     if (error.code !== 'ENOENT' && error.code !== 'EEXIST') throw error;
@@ -195,15 +276,15 @@ async function tryAcquireControlLock(root, token, staleAfterMs, now) {
   return false;
 }
 
-async function withControlLock(root, { staleAfterMs, timeoutMs, pollIntervalMs, now, sleep }, operation) {
+async function withLock(lockPath, { staleAfterMs, timeoutMs, pollIntervalMs, now, sleep }, operation) {
   const token = randomUUID();
   const deadline = now() + timeoutMs;
   while (true) {
-    if (await tryAcquireControlLock(root, token, staleAfterMs, now)) {
+    if (await tryAcquireLock(lockPath, token, staleAfterMs, now)) {
       try {
         return await operation();
       } finally {
-        await releaseControlLock(paths(root).controlLock, token);
+        await releaseLock(lockPath, token);
       }
     }
     if (now() >= deadline) {
@@ -211,6 +292,14 @@ async function withControlLock(root, { staleAfterMs, timeoutMs, pollIntervalMs, 
     }
     await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - now())));
   }
+}
+
+async function withControlLock(root, config, operation) {
+  return withLock(paths(root).controlLock, config, operation);
+}
+
+async function withManifestLock(root, config, operation) {
+  return withLock(paths(root).manifestLock, { ...config, staleAfterMs: MANIFEST_LOCK_STALE_MS }, operation);
 }
 
 function describe(active, capacityUnits) {
@@ -231,7 +320,7 @@ export async function acquireLease(config, { ownerToken = randomUUID(), now = re
   if (!/^[a-f0-9-]{36}$/i.test(ownerToken)) {
     throw new CapacityCoordinationError('ownerToken must be a UUID.');
   }
-  await ensureLayout(config.root);
+  await ensureManifest(config, { now, sleep });
   const deadline = now() + config.timeoutMs;
   let lastDescription = 'no capacity check completed';
   let totalRecovered = 0;
@@ -250,10 +339,10 @@ export async function acquireLease(config, { ownerToken = randomUUID(), now = re
 
         const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
         const record = {
+          ...metadata,
           ownerToken,
           weight: config.leaseWeight,
           acquiredAt: new Date(now()).toISOString(),
-          ...metadata,
         };
         await writeExclusive(leasePath, JSON.stringify(record));
         return { leasePath, recovered: totalRecovered };
@@ -272,7 +361,7 @@ export async function releaseLease(config, ownerToken, { now = realClock.now, sl
   if (!/^[a-f0-9-]{36}$/i.test(ownerToken)) {
     throw new CapacityCoordinationError('ownerToken must be a UUID.');
   }
-  await ensureLayout(config.root);
+  await ensureManifest(config, { now, sleep });
   const result = await withControlLock(config.root, { ...config, now, sleep }, async () => {
     const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
     try {
