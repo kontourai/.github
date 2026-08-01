@@ -1,0 +1,46 @@
+name: Kontour runner preflight
+description: Verify the bounded capabilities promised by a Kontour self-hosted runner job.
+
+inputs:
+  require-docker:
+    description: Fail unless the runner can reach a Docker Engine.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Report Linux runner
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        set -euo pipefail
+        echo "runner.os=${RUNNER_OS}"
+        echo "runner.arch=${RUNNER_ARCH}"
+        echo "kernel=$(uname -sr)"
+
+    - name: Report Windows runner
+      if: runner.os == 'Windows'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        "runner.os=$env:RUNNER_OS"
+        "runner.arch=$env:RUNNER_ARCH"
+        "powershell=$($PSVersionTable.PSVersion)"
+        git --version
+        node --version
+        rustc --version
+
+    - name: Verify Docker on Linux
+      if: runner.os == 'Linux' && inputs.require-docker == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker version --format 'docker.client={{.Client.Version}} docker.server={{.Server.Version}}'
+
+    - name: Verify Docker on Windows
+      if: runner.os == 'Windows' && inputs.require-docker == 'true'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+        docker version --format 'docker.client={{.Client.Version}} docker.server={{.Server.Version}}'

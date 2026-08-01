@@ -1,0 +1,36 @@
+name: Self-hosted runner smoke
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-docker:
+    name: Linux and Docker
+    runs-on: [self-hosted, Linux, X64, kontour-linux, docker]
+    timeout-minutes: 10
+    steps:
+      - name: Verify runner capabilities
+        uses: kontourai/.github/actions/runner-preflight@1d267a33147d1ce5925ffd1f9aa0ef2063d0d7ef
+        with:
+          require-docker: "true"
+      - name: Run disposable container
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="kontour-runner-smoke:${GITHUB_RUN_ID}"
+          trap 'docker image rm --force "$image" >/dev/null 2>&1 || true' EXIT
+          printf 'FROM scratch\nLABEL kontour.runner.smoke=passed\n' | \
+            docker build --pull=false --tag "$image" -
+          test "$(docker image inspect --format '{{ index .Config.Labels "kontour.runner.smoke" }}' "$image")" = passed
+          echo "Linux Docker runner smoke passed without pulling executable code"
+
+  windows-native:
+    name: Native Windows
+    runs-on: [self-hosted, Windows, X64, kontour-windows, native]
+    timeout-minutes: 10
+    steps:
+      - name: Verify runner capabilities
+        uses: kontourai/.github/actions/runner-preflight@1d267a33147d1ce5925ffd1f9aa0ef2063d0d7ef
