@@ -103,6 +103,21 @@ async function assertDirectory(path, label) {
   if (info.isSymbolicLink() || !info.isDirectory()) throw new CapacityCoordinationError(`${label} at ${path} must be a real directory, not a symlink or junction.`);
 }
 
+async function createRealDirectory(path, label) {
+  try {
+    await assertDirectory(path, label);
+    return;
+  } catch (error) {
+    if (error.cause?.code !== 'ENOENT') throw error;
+  }
+  try {
+    await mkdir(path);
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error;
+  }
+  await assertDirectory(path, label);
+}
+
 async function assertRegularFile(path, label) {
   let info;
   try {
@@ -216,9 +231,13 @@ export async function provisionHost(config) {
     if (error.code !== 'ENOENT') throw error;
     await writeExclusive(location.marker, `${config.hostId}\n`);
   }
-  await mkdir(location.leases, { recursive: true });
-  await mkdir(location.tickets, { recursive: true });
-  await mkdir(location.controlTickets, { recursive: true });
+  // Do not use recursive mkdir here: it follows a pre-existing symlink or
+  // junction in the state path. Each component is inspected before creating
+  // its direct child, so provisioning never writes through a redirect.
+  await createRealDirectory(location.state, 'coordination state directory');
+  await createRealDirectory(location.leases, 'lease directory');
+  await createRealDirectory(location.tickets, 'ticket directory');
+  await createRealDirectory(location.controlTickets, 'control-ticket directory');
   try {
     const sequence = await readJson(location.queueSequence, 'queue sequence');
     if (!Number.isSafeInteger(sequence.next) || sequence.next < 1 || Object.keys(sequence).length !== 1) throw new CapacityCoordinationError(`Invalid queue sequence at ${location.queueSequence}.`);

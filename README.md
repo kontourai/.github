@@ -172,25 +172,26 @@ Control ownership uses an atomically created `control-tickets/active` directory;
 there is no shared empty-lock publication window. It has no
 automatic stale stealing. A wedged control ticket fails closed with a typed
 diagnostic. After draining the runners and confirming no owner job is live, an
-operator must create a regular quiescence-marker file containing exactly the
-host ID after draining the runners, then run the explicit recovery command for
-one record:
+operator must create the distinct regular
+`.kontour-physical-host-quiesced` file (never the permanent identity marker)
+containing exactly the host ID after draining the runners, then run the
+explicit recovery command for one record:
 
 ```sh
-printf 'desktop-win-01\n' > /mnt/d/kontour-runner-capacity/quiesced-desktop-win-01
+printf 'desktop-win-01\n' > /mnt/d/kontour-runner-capacity/.kontour-physical-host-quiesced
 node scripts/recover-physical-host-capacity.mjs \
   --root /mnt/d/kontour-runner-capacity \
   --host-id desktop-win-01 \
   --capacity-units 8 \
-  --recover lease:<owner-uuid> \
-  --quiescence-marker /mnt/d/kontour-runner-capacity/quiesced-desktop-win-01
+  --recover lease:<owner-uuid>
 ```
 
 Use `--recover ticket:<owner-uuid>` for a confirmed-abandoned queue ticket or
 `--recover control:active` for a wedged control directory. The command never
 accepts a broad clear operation. Never delete the external marker, manifest,
-queue-sequence file, or an unreviewed record. Remove the quiescence marker only
-after recovery is complete and runners are ready to resume.
+queue-sequence file, or an unreviewed record. On success it removes the
+quiescence marker; on failure, inspect it before removing it when the root is
+safe to resume.
 
 ## Issue intake to Project v2
 

@@ -120,20 +120,28 @@ test('an abandoned lease fails closed until an operator removes the confirmed re
   }, { provision: false });
 });
 
-test('explicit recovery requires a matching quiescence marker and one targeted record', async () => {
+test('explicit recovery requires a distinct, regular quiescence marker and removes it after use', async () => {
   await withRoot(async (root) => {
     const recoveryConfig = config(root, { capacityUnits: 3, leaseWeight: 3 });
     await provisionHost(recoveryConfig);
     const leasePath = join(root, '.kontour-physical-host-capacity', 'leases', `${OWNER_A}.json`);
-    const markerPath = join(root, 'quiesced');
+    const markerPath = join(root, '.kontour-physical-host-quiesced');
+    const permanentMarker = join(root, '.kontour-physical-host-id');
     await writeFile(leasePath, JSON.stringify({ ownerToken: OWNER_A, weight: 3, acquiredAt: '2020-01-01T00:00:00.000Z' }));
+    const args = ['--root', root, '--host-id', 'desktop-win-01', '--capacity-units', '3', '--recover', `lease:${OWNER_A}`];
+    await assert.rejects(execFile(process.execPath, [recoverScript, ...args]), /ENOENT/);
+    await access(leasePath);
+    await access(permanentMarker); // identity is permanent, but is never recovery proof
+    await symlink(permanentMarker, markerPath);
+    await assert.rejects(execFile(process.execPath, [recoverScript, ...args]), /regular file, not a symlink or junction/);
+    await rm(markerPath);
     await writeFile(markerPath, 'wrong-host\n');
-    const args = ['--root', root, '--host-id', 'desktop-win-01', '--capacity-units', '3', '--recover', `lease:${OWNER_A}`, '--quiescence-marker', markerPath];
     await assert.rejects(execFile(process.execPath, [recoverScript, ...args]), /Quiescence marker/);
     await access(leasePath);
     await writeFile(markerPath, 'desktop-win-01\n');
     await execFile(process.execPath, [recoverScript, ...args]);
     await assert.rejects(access(leasePath), { code: 'ENOENT' });
+    await assert.rejects(access(markerPath), { code: 'ENOENT' });
   }, { provision: false });
 });
 
@@ -244,6 +252,17 @@ test('an uninitialized root cannot be silently adopted', async () => {
       acquireLease(config(root), { ownerToken: OWNER_B }),
       /External host marker is required/,
     );
+  }, { provision: false });
+});
+
+test('provisioning rejects a symlinked state path without writing through it', async () => {
+  await withRoot(async (root) => {
+    const state = join(root, '.kontour-physical-host-capacity');
+    const outside = join(root, 'outside-target');
+    await mkdir(outside);
+    await symlink(outside, state);
+    await assert.rejects(provisionHost(config(root)), /coordination state directory.*real directory, not a symlink or junction/);
+    assert.deepEqual(await readdir(outside), []);
   }, { provision: false });
 });
 

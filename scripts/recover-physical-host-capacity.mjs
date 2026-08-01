@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { lstat, readFile } from 'node:fs/promises';
+import { lstat, readFile, rm } from 'node:fs/promises';
+import { join } from 'node:path';
 
 import { parseConfig, recoverAbandonedRecord } from '../actions/physical-host-capacity/coordinator.mjs';
 
@@ -9,7 +10,7 @@ function argumentsToValues(argumentsList) {
   for (let index = 0; index < argumentsList.length; index += 2) {
     const flag = argumentsList[index];
     const value = argumentsList[index + 1];
-    if (!flag?.startsWith('--') || value === undefined) throw new Error('Expected paired --root, --host-id, --capacity-units, --recover, and --quiescence-marker values.');
+    if (!flag?.startsWith('--') || value === undefined) throw new Error('Expected paired --root, --host-id, --capacity-units, and --recover values.');
     values[flag.slice(2)] = value;
   }
   return values;
@@ -33,10 +34,12 @@ async function main() {
     PHYSICAL_HOST_CAPACITY_TIMEOUT_SECONDS: '0',
     PHYSICAL_HOST_CAPACITY_POLL_INTERVAL_MS: '1000',
   });
-  if (!values.recover || !values['quiescence-marker']) throw new Error('Recovery requires explicit --recover and --quiescence-marker values after runners are drained.');
+  if (!values.recover || values['quiescence-marker']) throw new Error('Recovery requires explicit --recover and the fixed .kontour-physical-host-quiesced marker after runners are drained.');
   const [kind, ownerToken] = values.recover.split(':', 2);
-  await assertQuiesced(values['quiescence-marker'], config.hostId);
+  const quiescenceMarker = join(config.root, '.kontour-physical-host-quiesced');
+  await assertQuiesced(quiescenceMarker, config.hostId);
   const recoveredPath = await recoverAbandonedRecord(config, { kind, ownerToken });
+  await rm(quiescenceMarker, { force: false });
   console.log(`Recovered confirmed-abandoned ${kind} record at ${recoveredPath}.`);
 }
 
