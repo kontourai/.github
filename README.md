@@ -67,6 +67,21 @@ jobs:
 
 Set `with: { install-browser: true }` only when the repository's evidence check needs Chromium. The shared job pins the supported Veritas version, retains the evidence artifact, and has a 30-minute outer timeout as defense in depth. It reports governance findings without promoting them to a required merge gate.
 
+## Secret scan
+
+Repositories can call the reusable `secret-scan.yml` workflow to scan complete
+git history reachable from the checked-out ref. It intentionally does not scan
+other fetched remote branches: those commits are not part of the caller's PR or
+branch and must not fail its gate. A secret in the caller's HEAD history,
+including a fixture intentionally committed on that PR, remains a failing,
+redacted finding.
+
+The checkout depth is not caller-configurable: the workflow always checks out
+full history (`fetch-depth: 0`) and fails closed with a non-zero exit unless
+`git rev-parse --is-shallow-repository` reports exactly `false`. A shallow
+checkout, an empty result, an unexpected value, or the command itself
+erroring all fail the run rather than silently scanning a partial history.
+
 ## Release-note policy
 
 Repositories that use normal merge commits use GitHub's supported `PR_TITLE/BLANK` setting pair.
