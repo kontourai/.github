@@ -168,6 +168,11 @@ an older larger job. Timeout cleanup retries independently for up to five
 seconds even when the acquisition timeout is zero.
 Contention diagnostics are capped and include an omitted-entry count.
 
+Sequence values are append-only directory markers, so a crash can leave a gap
+but cannot truncate or reorder an assigned value. Lease and ticket JSON is
+written and fsynced in the private `staging/` directory before an atomic rename
+publishes the final record.
+
 Control ownership uses an atomically created `control-tickets/active` directory;
 there is no shared empty-lock publication window. It has no
 automatic stale stealing. A wedged control ticket fails closed with a typed
@@ -186,10 +191,11 @@ node scripts/recover-physical-host-capacity.mjs \
   --recover lease:<owner-uuid>
 ```
 
-Use `--recover ticket:<owner-uuid>` for a confirmed-abandoned queue ticket or
-`--recover control:active` for a wedged control directory. The command never
+Use `--recover ticket:<owner-uuid>` for a confirmed-abandoned queue ticket,
+`--recover sequence:<20-digit-marker>` only for a malformed regular sequence
+entry, or `--recover control:active` for a wedged control directory. The command never
 accepts a broad clear operation. Never delete the external marker, manifest,
-queue-sequence file, or an unreviewed record. On success it removes the
+queue-sequence directory, staging directory, or an unreviewed record. On success it removes the
 quiescence marker; on failure, inspect it before removing it when the root is
 safe to resume.
 

@@ -1,15 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 
 const STATE_DIRECTORY = '.kontour-physical-host-capacity';
 const LEASE_DIRECTORY = 'leases';
 const TICKET_DIRECTORY = 'tickets';
 const CONTROL_TICKET_DIRECTORY = 'control-tickets';
-const QUEUE_SEQUENCE_FILE = 'queue-sequence.json';
+const QUEUE_SEQUENCE_DIRECTORY = 'queue-sequences';
+const STAGING_DIRECTORY = 'staging';
 const MANIFEST_FILE = 'host-manifest.json';
 const HOST_MARKER_FILE = '.kontour-physical-host-id';
-const MANIFEST_SCHEMA_VERSION = 5;
+const MANIFEST_SCHEMA_VERSION = 6;
 const RECOVERY_STRATEGY = 'explicit-quiesced-recovery-v1';
 const CLEANUP_RETRY_MS = 5_000;
 const MAX_DIAGNOSTIC_ENTRIES = 6;
@@ -89,7 +90,8 @@ function paths(root) {
     leases: join(state, LEASE_DIRECTORY),
     tickets: join(state, TICKET_DIRECTORY),
     controlTickets: join(state, CONTROL_TICKET_DIRECTORY),
-    queueSequence: join(state, QUEUE_SEQUENCE_FILE),
+    queueSequences: join(state, QUEUE_SEQUENCE_DIRECTORY),
+    staging: join(state, STAGING_DIRECTORY),
   };
 }
 
@@ -157,6 +159,32 @@ async function writeExclusive(path, contents) {
   }
 }
 
+async function publishJson(path, contents, stagingDirectory) {
+  const temporaryPath = join(stagingDirectory, `${basename(path)}.${randomUUID()}.tmp`);
+  let handle;
+  try {
+    handle = await open(temporaryPath, 'wx');
+    await handle.writeFile(contents, 'utf8');
+    await handle.sync();
+  } finally {
+    await handle?.close();
+  }
+  try {
+    await assertRegularFile(path, 'existing capacity record');
+    throw new CapacityCoordinationError(`Capacity record already exists at ${path}; refusing to replace it.`);
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      await rm(temporaryPath, { force: true });
+      throw error;
+    }
+  }
+  try {
+    await rename(temporaryPath, path);
+  } finally {
+    await rm(temporaryPath, { force: true });
+  }
+}
+
 async function removeRegularRecord(path, label) {
   await assertRegularFile(path, label);
   await rm(path, { force: false });
@@ -212,10 +240,8 @@ async function ensureProvisioned(config) {
   await assertDirectory(location.leases, 'lease directory');
   await assertDirectory(location.tickets, 'ticket directory');
   await assertDirectory(location.controlTickets, 'control-ticket directory');
-  const sequence = await readJson(location.queueSequence, 'queue sequence');
-  if (!Number.isSafeInteger(sequence.next) || sequence.next < 1 || Object.keys(sequence).length !== 1) {
-    throw new CapacityCoordinationError(`Invalid queue sequence at ${location.queueSequence}; refusing to guess FIFO order.`);
-  }
+  await assertDirectory(location.queueSequences, 'queue-sequence directory');
+  await assertDirectory(location.staging, 'staging directory');
   const manifest = validManifest(await readJson(location.manifest, 'host manifest'), location.manifest);
   assertManifestMatches(manifest, config, location.manifest);
 }
@@ -238,13 +264,8 @@ export async function provisionHost(config) {
   await createRealDirectory(location.leases, 'lease directory');
   await createRealDirectory(location.tickets, 'ticket directory');
   await createRealDirectory(location.controlTickets, 'control-ticket directory');
-  try {
-    const sequence = await readJson(location.queueSequence, 'queue sequence');
-    if (!Number.isSafeInteger(sequence.next) || sequence.next < 1 || Object.keys(sequence).length !== 1) throw new CapacityCoordinationError(`Invalid queue sequence at ${location.queueSequence}.`);
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-    await writeExclusive(location.queueSequence, JSON.stringify({ next: 1 }));
-  }
+  await createRealDirectory(location.queueSequences, 'queue-sequence directory');
+  await createRealDirectory(location.staging, 'staging directory');
   try {
     const manifest = validManifest(await readJson(location.manifest, 'host manifest'), location.manifest);
     assertManifestMatches(manifest, config, location.manifest);
@@ -331,14 +352,24 @@ function describe(leases, tickets, capacityUnits) {
 }
 
 async function createTicket(config, ownerToken) {
-  const sequencePath = paths(config.root).queueSequence;
-  const sequence = await readJson(sequencePath, 'queue sequence');
-  if (!Number.isSafeInteger(sequence.next) || sequence.next < 1 || Object.keys(sequence).length !== 1) {
-    throw new CapacityCoordinationError(`Invalid queue sequence at ${sequencePath}; refusing to guess FIFO order.`);
+  const location = paths(config.root);
+  const entries = await readdir(location.queueSequences, { withFileTypes: true });
+  let maximum = 0n;
+  for (const entry of entries) {
+    if (!entry.isDirectory() || !/^[0-9]{20}$/.test(entry.name)) {
+      throw new CapacityCoordinationError(`Invalid queue-sequence entry at ${join(location.queueSequences, entry.name)}; refusing to guess FIFO order.`);
+    }
+    const info = await lstat(join(location.queueSequences, entry.name));
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new CapacityCoordinationError(`Invalid queue-sequence entry at ${join(location.queueSequences, entry.name)}; refusing to follow a symlink or junction.`);
+    }
+    maximum = BigInt(entry.name) > maximum ? BigInt(entry.name) : maximum;
   }
-  await writeFile(sequencePath, JSON.stringify({ next: sequence.next + 1 }), 'utf8');
-  const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
-  await writeExclusive(ticketPath, JSON.stringify({ ownerToken, weight: config.leaseWeight, sequence: sequence.next }));
+  const sequence = maximum + 1n;
+  if (sequence > BigInt(Number.MAX_SAFE_INTEGER)) throw new CapacityCoordinationError('Queue sequence has exceeded safe integer range.');
+  await mkdir(join(location.queueSequences, sequence.toString().padStart(20, '0')));
+  const ticketPath = join(location.tickets, `${ownerToken}.json`);
+  await publishJson(ticketPath, JSON.stringify({ ownerToken, weight: config.leaseWeight, sequence: Number(sequence) }), location.staging);
   return ticketPath;
 }
 
@@ -381,7 +412,7 @@ export async function acquireLease(config, { ownerToken = randomUUID(), now = re
         if (position !== 0 || used + config.leaseWeight > config.capacityUnits) return null;
 
         const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
-        await writeExclusive(leasePath, JSON.stringify({ ...metadata, ownerToken, weight: config.leaseWeight, acquiredAt: new Date(now()).toISOString() }));
+        await publishJson(leasePath, JSON.stringify({ ...metadata, ownerToken, weight: config.leaseWeight, acquiredAt: new Date(now()).toISOString() }), paths(config.root).staging);
         await removeRegularRecord(ticketPath, 'queue ticket');
         return { leasePath };
       });
@@ -430,17 +461,25 @@ export async function recoverAbandonedRecord(config, { kind, ownerToken, now = r
     await rm(controlPath, { recursive: true, force: false });
     return controlPath;
   }
+  if (kind === 'sequence') {
+    if (!/^[0-9]{20}$/.test(ownerToken ?? '')) throw new CapacityCoordinationError('Sequence recovery requires a 20-digit sequence marker.');
+    const sequencePath = join(location.queueSequences, ownerToken);
+    const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
+    return withControlLock(config.root, cleanup, async () => {
+      await removeRegularRecord(sequencePath, 'queue-sequence entry');
+      return sequencePath;
+    });
+  }
   if (!['lease', 'ticket'].includes(kind) || !/^[a-f0-9-]{36}$/i.test(ownerToken ?? '')) {
     throw new CapacityCoordinationError('Recovery requires kind lease or ticket and a UUID owner token.');
   }
   const directory = kind === 'lease' ? location.leases : location.tickets;
   const label = kind === 'lease' ? 'lease record' : 'queue ticket';
-  const validate = kind === 'lease' ? validLease : validTicket;
   const recordPath = join(directory, `${ownerToken}.json`);
   const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
   return withControlLock(config.root, cleanup, async () => {
-    const record = validate(await readJson(recordPath, label), recordPath);
-    if (record.ownerToken !== ownerToken) throw new CapacityCoordinationError(`Recovery target ownership mismatch at ${recordPath}.`);
+    // The filename is the exact, UUID-validated recovery target. Do not parse
+    // it here: recovery exists specifically to remove a crash-corrupted record.
     await removeRegularRecord(recordPath, label);
     return recordPath;
   });

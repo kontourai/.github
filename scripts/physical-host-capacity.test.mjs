@@ -214,6 +214,39 @@ test('a partially published ticket fails closed and cannot be admitted', async (
   });
 });
 
+test('partial sequence, ticket, and lease records fail closed, then targeted recovery restores service', async () => {
+  await withRoot(async (root) => {
+    const state = join(root, '.kontour-physical-host-capacity');
+    const sequences = join(state, 'queue-sequences');
+    const tickets = join(state, 'tickets');
+    const leases = join(state, 'leases');
+    const marker = join(root, '.kontour-physical-host-quiesced');
+    const args = (target) => ['--root', root, '--host-id', 'desktop-win-01', '--capacity-units', '3', '--recover', target];
+
+    await writeFile(join(sequences, '00000000000000000001'), 'partial');
+    await assert.rejects(acquireLease(config(root), { ownerToken: OWNER_A }), /Invalid queue-sequence entry/);
+    await writeFile(marker, 'desktop-win-01\n');
+    await execFile(process.execPath, [recoverScript, ...args('sequence:00000000000000000001')]);
+    await assert.rejects(access(join(sequences, '00000000000000000001')), { code: 'ENOENT' });
+
+    const malformedTicket = join(tickets, `${OWNER_A}.json`);
+    await writeFile(malformedTicket, '{"ownerToken":');
+    await assert.rejects(acquireLease(config(root), { ownerToken: OWNER_B }), /Invalid queue ticket/);
+    await writeFile(marker, 'desktop-win-01\n');
+    await execFile(process.execPath, [recoverScript, ...args(`ticket:${OWNER_A}`)]);
+    await assert.rejects(access(malformedTicket), { code: 'ENOENT' });
+
+    const malformedLease = join(leases, `${OWNER_A}.json`);
+    await writeFile(malformedLease, '{"ownerToken":');
+    await assert.rejects(acquireLease(config(root), { ownerToken: OWNER_B }), /Invalid lease record/);
+    await writeFile(marker, 'desktop-win-01\n');
+    await execFile(process.execPath, [recoverScript, ...args(`lease:${OWNER_A}`)]);
+    await assert.rejects(access(malformedLease), { code: 'ENOENT' });
+    const acquired = await acquireLease(config(root), { ownerToken: OWNER_B });
+    assert.equal(await releaseLease(config(root), acquired.ownerToken), true);
+  });
+});
+
 test('host manifest rejects participants with conflicting capacity semantics', async () => {
   await withRoot(async (root) => {
     await acquireLease(config(root), { ownerToken: OWNER_A });
