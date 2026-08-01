@@ -7,7 +7,7 @@ function argumentsToEnvironment(argumentsList) {
   for (let index = 0; index < argumentsList.length; index += 2) {
     const flag = argumentsList[index];
     const value = argumentsList[index + 1];
-    if (!flag?.startsWith('--') || value === undefined) throw new Error('Expected --root, --host-id, --capacity-units, and --stale-after-seconds values.');
+    if (!flag?.startsWith('--') || value === undefined) throw new Error('Expected --root, --host-id, and --capacity-units values.');
     values[flag.slice(2)] = value;
   }
   return {
@@ -17,8 +17,6 @@ function argumentsToEnvironment(argumentsList) {
     PHYSICAL_HOST_CAPACITY_WEIGHT: '1',
     PHYSICAL_HOST_CAPACITY_TIMEOUT_SECONDS: '0',
     PHYSICAL_HOST_CAPACITY_POLL_INTERVAL_MS: '1000',
-    PHYSICAL_HOST_CAPACITY_STALE_AFTER_SECONDS: values['stale-after-seconds'],
-    PHYSICAL_HOST_CAPACITY_HEARTBEAT_INTERVAL_SECONDS: values['heartbeat-interval-seconds'] ?? '30',
   };
 }
 

@@ -114,8 +114,6 @@ jobs:
           capacity-units: '8'
           lease-weight: '5'
           timeout-seconds: '240'
-          stale-after-seconds: '2100'
-          heartbeat-interval-seconds: '60'
       - shell: pwsh
         run: npm test
 
@@ -133,8 +131,6 @@ jobs:
           capacity-units: '8'
           lease-weight: '3'
           timeout-seconds: '240'
-          stale-after-seconds: '2100'
-          heartbeat-interval-seconds: '60'
       - run: npm test
 ```
 
@@ -148,38 +144,53 @@ administrator account, using either the Windows root or its WSL mount:
 node scripts/provision-physical-host-capacity.mjs \
   --root /mnt/d/kontour-runner-capacity \
   --host-id desktop-win-01 \
-  --capacity-units 8 \
-  --stale-after-seconds 2100 \
-  --heartbeat-interval-seconds 60
+  --capacity-units 8
 ```
 
 Provisioning writes an externally located `.kontour-physical-host-id` marker
 and a schema-versioned `host-manifest.json`. Its host ID, capacity,
-stale duration, and `heartbeat-mtime-v1` lease strategy are authoritative:
-every participant must match them exactly before acquire, heartbeat, or release
+`explicit-quiesced-recovery-v1` strategy are authoritative:
+every participant must match them exactly before acquire or release
 can proceed. Update those values only after draining the root and deliberately
 re-provisioning it.
 
-An acquired action runs a detached Node heartbeat on both Windows and Linux;
-the heartbeat renews the lease under the control lock, and the always-running
-post step terminates it before release. An active heartbeat therefore survives
-the stale threshold; a lost runner or heartbeat is recovered only after it
-stops renewing for `stale-after-seconds`. Keep the heartbeat strictly shorter
-than the stale duration and leave sufficient margin for filesystem delays.
+The action never starts a detached process and never deletes a lease or queue
+ticket based on a timestamp. Its post step releases the lease on normal failure
+or cancellation. If the runner is lost before that step, the capacity remains
+blocked deliberately. There is no online stale-time policy and no automatic
+recovery authority.
 
-Waiting jobs create durable weighted FIFO tickets. Only the oldest ticket may
-claim available capacity, so later small jobs cannot starve an older larger
-job. Timeout cleanup retries independently for up to five seconds even when
-the acquisition timeout is zero. Contention diagnostics are capped and include
-an omitted-entry count.
+Waiting jobs create durable weighted FIFO tickets. Their order comes from a
+shared monotonic sequence assigned under the control protocol—not process
+clock time—so Windows/WSL wall-clock skew cannot reorder waiters. Only the
+oldest ticket may claim available capacity, so later small jobs cannot starve
+an older larger job. Timeout cleanup retries independently for up to five
+seconds even when the acquisition timeout is zero.
+Contention diagnostics are capped and include an omitted-entry count.
 
-Control locks intentionally have **no automatic stale stealing**. Portable
-Windows/WSL NTFS directory ownership has no safe compare-and-swap, and stealing
-could remove a replacement owner. A wedged control lock fails closed with a
-typed diagnostic. After confirming no owner process is live, an operator may
-remove only `<root>/.kontour-physical-host-capacity/control.lock`, then rerun
-the blocked job; never delete leases, tickets, the external marker, or the
-manifest as part of that recovery.
+Control ownership uses an atomically created `control-tickets/active` directory;
+there is no shared empty-lock publication window. It has no
+automatic stale stealing. A wedged control ticket fails closed with a typed
+diagnostic. After draining the runners and confirming no owner job is live, an
+operator must create a regular quiescence-marker file containing exactly the
+host ID after draining the runners, then run the explicit recovery command for
+one record:
+
+```sh
+printf 'desktop-win-01\n' > /mnt/d/kontour-runner-capacity/quiesced-desktop-win-01
+node scripts/recover-physical-host-capacity.mjs \
+  --root /mnt/d/kontour-runner-capacity \
+  --host-id desktop-win-01 \
+  --capacity-units 8 \
+  --recover lease:<owner-uuid> \
+  --quiescence-marker /mnt/d/kontour-runner-capacity/quiesced-desktop-win-01
+```
+
+Use `--recover ticket:<owner-uuid>` for a confirmed-abandoned queue ticket or
+`--recover control:active` for a wedged control directory. The command never
+accepts a broad clear operation. Never delete the external marker, manifest,
+queue-sequence file, or an unreviewed record. Remove the quiescence marker only
+after recovery is complete and runners are ready to resume.
 
 ## Issue intake to Project v2
 

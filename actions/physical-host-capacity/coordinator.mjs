@@ -1,15 +1,16 @@
 import { randomUUID } from 'node:crypto';
-import { mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 
 const STATE_DIRECTORY = '.kontour-physical-host-capacity';
 const LEASE_DIRECTORY = 'leases';
 const TICKET_DIRECTORY = 'tickets';
-const CONTROL_LOCK_DIRECTORY = 'control.lock';
+const CONTROL_TICKET_DIRECTORY = 'control-tickets';
+const QUEUE_SEQUENCE_FILE = 'queue-sequence.json';
 const MANIFEST_FILE = 'host-manifest.json';
 const HOST_MARKER_FILE = '.kontour-physical-host-id';
-const MANIFEST_SCHEMA_VERSION = 2;
-const STALE_LEASE_STRATEGY = 'heartbeat-mtime-v1';
+const MANIFEST_SCHEMA_VERSION = 5;
+const RECOVERY_STRATEGY = 'explicit-quiesced-recovery-v1';
 const CLEANUP_RETRY_MS = 5_000;
 const MAX_DIAGNOSTIC_ENTRIES = 6;
 
@@ -71,16 +72,11 @@ export function parseConfig(env = process.env) {
   const leaseWeight = positiveInteger(input(env, 'lease-weight') ?? env.PHYSICAL_HOST_CAPACITY_WEIGHT ?? '1', 'lease-weight');
   const timeoutMs = durationMilliseconds(input(env, 'timeout-seconds') ?? env.PHYSICAL_HOST_CAPACITY_TIMEOUT_SECONDS ?? '300', 'timeout-seconds', { allowZero: true }).milliseconds;
   const pollIntervalMs = positiveInteger(input(env, 'poll-interval-ms') ?? env.PHYSICAL_HOST_CAPACITY_POLL_INTERVAL_MS ?? '1000', 'poll-interval-ms');
-  const stale = durationMilliseconds(input(env, 'stale-after-seconds') ?? env.PHYSICAL_HOST_CAPACITY_STALE_AFTER_SECONDS ?? '1800', 'stale-after-seconds');
-  const heartbeat = durationMilliseconds(input(env, 'heartbeat-interval-seconds') ?? env.PHYSICAL_HOST_CAPACITY_HEARTBEAT_INTERVAL_SECONDS ?? '30', 'heartbeat-interval-seconds');
 
   if (leaseWeight > capacityUnits) throw new CapacityCoordinationError(`lease-weight (${leaseWeight}) cannot exceed capacity-units (${capacityUnits}).`);
-  if (heartbeat.milliseconds >= stale.milliseconds) throw new CapacityCoordinationError('heartbeat-interval-seconds must be shorter than stale-after-seconds.');
 
   return {
     root, hostId, capacityUnits, leaseWeight, timeoutMs, pollIntervalMs,
-    staleAfterSeconds: stale.seconds, staleAfterMs: stale.milliseconds,
-    heartbeatIntervalSeconds: heartbeat.seconds, heartbeatIntervalMs: heartbeat.milliseconds,
   };
 }
 
@@ -92,21 +88,35 @@ function paths(root) {
     manifest: join(state, MANIFEST_FILE),
     leases: join(state, LEASE_DIRECTORY),
     tickets: join(state, TICKET_DIRECTORY),
-    controlLock: join(state, CONTROL_LOCK_DIRECTORY),
+    controlTickets: join(state, CONTROL_TICKET_DIRECTORY),
+    queueSequence: join(state, QUEUE_SEQUENCE_FILE),
   };
 }
 
 async function assertDirectory(path, label) {
   let info;
   try {
-    info = await stat(path);
+    info = await lstat(path);
   } catch (error) {
     throw new CapacityCoordinationError(`${label} must already exist at ${path}; run the provisioning command first.`, error);
   }
-  if (!info.isDirectory()) throw new CapacityCoordinationError(`${label} at ${path} must be a directory.`);
+  if (info.isSymbolicLink() || !info.isDirectory()) throw new CapacityCoordinationError(`${label} at ${path} must be a real directory, not a symlink or junction.`);
+}
+
+async function assertRegularFile(path, label) {
+  let info;
+  try {
+    info = await lstat(path);
+  } catch (error) {
+    const wrapped = new CapacityCoordinationError(`Unable to inspect ${label} at ${path}: ${error.message}`, error);
+    wrapped.code = error.code;
+    throw wrapped;
+  }
+  if (info.isSymbolicLink() || !info.isFile()) throw new CapacityCoordinationError(`${label} at ${path} must be a regular file, not a symlink or junction.`);
 }
 
 async function readJson(path, label) {
+  await assertRegularFile(path, label);
   let raw;
   try {
     raw = await readFile(path, 'utf8');
@@ -132,18 +142,22 @@ async function writeExclusive(path, contents) {
   }
 }
 
+async function removeRegularRecord(path, label) {
+  await assertRegularFile(path, label);
+  await rm(path, { force: false });
+}
+
 function manifestFor(config) {
   return {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
     hostId: config.hostId,
     capacityUnits: config.capacityUnits,
-    staleAfterSeconds: config.staleAfterSeconds,
-    staleLeaseStrategy: STALE_LEASE_STRATEGY,
+    recoveryStrategy: RECOVERY_STRATEGY,
   };
 }
 
 function validManifest(manifest, path) {
-  const expectedKeys = ['capacityUnits', 'hostId', 'schemaVersion', 'staleAfterSeconds', 'staleLeaseStrategy'];
+  const expectedKeys = ['capacityUnits', 'hostId', 'recoveryStrategy', 'schemaVersion'];
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) || Object.keys(manifest).sort().join(',') !== expectedKeys.join(',')) {
     throw new CapacityCoordinationError(`Invalid host manifest at ${path}; refusing to guess capacity configuration.`);
   }
@@ -151,8 +165,7 @@ function validManifest(manifest, path) {
     manifest.schemaVersion !== MANIFEST_SCHEMA_VERSION ||
     !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(manifest.hostId) ||
     !Number.isSafeInteger(manifest.capacityUnits) || manifest.capacityUnits < 1 ||
-    !Number.isSafeInteger(manifest.staleAfterSeconds) || manifest.staleAfterSeconds < 1 ||
-    manifest.staleLeaseStrategy !== STALE_LEASE_STRATEGY
+    manifest.recoveryStrategy !== RECOVERY_STRATEGY
   ) throw new CapacityCoordinationError(`Invalid host manifest at ${path}; refusing to guess capacity configuration.`);
   return manifest;
 }
@@ -171,8 +184,10 @@ async function ensureProvisioned(config) {
   await assertDirectory(config.root, 'coordination-root');
   let marker;
   try {
+    await assertRegularFile(location.marker, 'external host marker');
     marker = await readFile(location.marker, 'utf8');
   } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
     throw new CapacityCoordinationError(`External host marker is required at ${location.marker}; run the provisioning command first.`, error);
   }
   if (marker !== `${config.hostId}\n`) {
@@ -181,6 +196,11 @@ async function ensureProvisioned(config) {
   await assertDirectory(location.state, 'coordination state directory');
   await assertDirectory(location.leases, 'lease directory');
   await assertDirectory(location.tickets, 'ticket directory');
+  await assertDirectory(location.controlTickets, 'control-ticket directory');
+  const sequence = await readJson(location.queueSequence, 'queue sequence');
+  if (!Number.isSafeInteger(sequence.next) || sequence.next < 1 || Object.keys(sequence).length !== 1) {
+    throw new CapacityCoordinationError(`Invalid queue sequence at ${location.queueSequence}; refusing to guess FIFO order.`);
+  }
   const manifest = validManifest(await readJson(location.manifest, 'host manifest'), location.manifest);
   assertManifestMatches(manifest, config, location.manifest);
 }
@@ -189,6 +209,7 @@ export async function provisionHost(config) {
   const location = paths(config.root);
   await assertDirectory(config.root, 'coordination-root');
   try {
+    await assertRegularFile(location.marker, 'external host marker');
     const marker = await readFile(location.marker, 'utf8');
     if (marker !== `${config.hostId}\n`) throw new CapacityCoordinationError(`External host marker mismatch at ${location.marker}.`);
   } catch (error) {
@@ -197,6 +218,14 @@ export async function provisionHost(config) {
   }
   await mkdir(location.leases, { recursive: true });
   await mkdir(location.tickets, { recursive: true });
+  await mkdir(location.controlTickets, { recursive: true });
+  try {
+    const sequence = await readJson(location.queueSequence, 'queue sequence');
+    if (!Number.isSafeInteger(sequence.next) || sequence.next < 1 || Object.keys(sequence).length !== 1) throw new CapacityCoordinationError(`Invalid queue sequence at ${location.queueSequence}.`);
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+    await writeExclusive(location.queueSequence, JSON.stringify({ next: 1 }));
+  }
   try {
     const manifest = validManifest(await readJson(location.manifest, 'host manifest'), location.manifest);
     assertManifestMatches(manifest, config, location.manifest);
@@ -209,78 +238,38 @@ export async function provisionHost(config) {
   }
 }
 
-function lockOwnerFile(lockPath, token) {
-  return join(lockPath, `owner-${token}.json`);
-}
-
-async function releaseLock(lockPath, token) {
-  try {
-    await rm(lockOwnerFile(lockPath, token), { force: false });
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
-  }
-}
-
-// This is deliberately token-addressed: it can remove only this owner's
-// marker, and rmdir refuses a non-empty replacement lock directory.
-export async function releaseOwnedControlLock(root, ownerToken) {
-  await releaseLock(paths(root).controlLock, ownerToken);
-}
-
-async function tryAcquireLock(lockPath, token, staleAfterMs, now) {
-  try {
-    await mkdir(lockPath);
-    try {
-      await writeFile(lockOwnerFile(lockPath, token), JSON.stringify({ ownerToken: token, acquiredAt: new Date(now()).toISOString() }), 'utf8');
-      return true;
-    } catch (error) {
-      throw error;
-    }
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-  }
-
-  // A released lock remains as an empty directory. Only an empty directory is
-  // retired, then retried. Its owner marker is token-addressed and a holder
-  // never removes the shared directory, so an old release cannot delete a
-  // replacement mkdir owner during the write-metadata gap (ABA).
-  let entries;
-  try {
-    entries = await readdir(lockPath);
-  } catch (error) {
-    if (error.code === 'ENOENT') return false;
-    throw error;
-  }
-  if (entries.length === 0) {
-    const retiredLock = `${lockPath}.released-${token}`;
-    try {
-      await rename(lockPath, retiredLock);
-      await rm(retiredLock, { recursive: true, force: true });
-      return tryAcquireLock(lockPath, token, staleAfterMs, now);
-    } catch (error) {
-      if (!['ENOENT', 'EEXIST'].includes(error.code)) throw error;
-    }
-  }
-  // Do not steal an owned control lock. NTFS and WSL do not provide a portable
-  // compare-and-swap for a directory owner. A wedged lock fails closed and
-  // requires the explicit recovery procedure documented with provisioning.
-  return false;
-}
-
-async function withControlLock(root, { staleAfterMs, timeoutMs, pollIntervalMs, now, sleep }, operation) {
-  const lockPath = paths(root).controlLock;
-  const token = randomUUID();
+async function withControlLock(root, { timeoutMs, pollIntervalMs, now, sleep }, operation) {
+  // The directory itself is the complete ownership record: mkdir is atomic on
+  // the shared filesystem, so another participant can never observe an empty
+  // lock before its owner has been published. There is intentionally no stale
+  // lock stealing; recovery is a human operation after checking the host.
+  const controlPath = join(paths(root).controlTickets, 'active');
   const deadline = now() + timeoutMs;
   while (true) {
-    if (await tryAcquireLock(lockPath, token, staleAfterMs, now)) {
+    try {
+      await mkdir(controlPath);
       try {
         return await operation();
       } finally {
-        await releaseLock(lockPath, token);
+        await rm(controlPath, { recursive: true, force: false });
       }
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      let info;
+      try {
+        info = await lstat(controlPath);
+      } catch (inspectionError) {
+        // The owner can release between mkdir's EEXIST and inspection. That is
+        // a normal handoff, not evidence that a path may be followed.
+        if (inspectionError.code === 'ENOENT') continue;
+        throw inspectionError;
+      }
+      if (info.isSymbolicLink() || !info.isDirectory()) {
+        throw new CapacityCoordinationError(`Invalid control-ticket entry at ${controlPath}; refusing to follow a symlink or junction.`);
+      }
+      if (now() >= deadline) throw new CapacityCoordinationError('Timed out waiting for the capacity coordination control ticket; automatic control-ticket stealing is disabled, so use the documented manual recovery procedure after confirming no owner is live.');
+      await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - now())));
     }
-    if (now() >= deadline) throw new CapacityCoordinationError('Timed out waiting for the capacity coordination control lock; automatic lock stealing is disabled, so use the documented manual recovery procedure after confirming no owner is live.');
-    await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - now())));
   }
 }
 
@@ -292,29 +281,23 @@ function validLease(record, path) {
 }
 
 function validTicket(record, path) {
-  if (!record || !/^[a-f0-9-]{36}$/i.test(record.ownerToken) || !Number.isSafeInteger(record.weight) || record.weight < 1 || typeof record.enqueuedAt !== 'string' || Number.isNaN(Date.parse(record.enqueuedAt))) {
+  if (!record || !/^[a-f0-9-]{36}$/i.test(record.ownerToken) || !Number.isSafeInteger(record.weight) || record.weight < 1 || !Number.isSafeInteger(record.sequence) || record.sequence < 1) {
     throw new CapacityCoordinationError(`Invalid queue ticket at ${path}; refusing to guess capacity state.`);
   }
   return record;
 }
 
-async function listRecords(directory, label, validate, staleAfterMs, now) {
+async function listRecords(directory, label, validate) {
   const entries = await readdir(directory, { withFileTypes: true });
   const active = [];
-  let recovered = 0;
   for (const entry of entries) {
     const path = join(directory, entry.name);
     if (!entry.isFile() || !entry.name.endsWith('.json')) throw new CapacityCoordinationError(`Unexpected ${label} entry at ${path}; refusing to guess capacity state.`);
-    const info = await stat(path);
-    const ageMs = Math.max(0, now() - info.mtimeMs);
-    if (ageMs >= staleAfterMs) {
-      await rm(path, { force: false });
-      recovered += 1;
-      continue;
-    }
-    active.push({ ...validate(await readJson(path, label), path), path, ageMs });
+    const info = await lstat(path);
+    if (info.isSymbolicLink() || !info.isFile()) throw new CapacityCoordinationError(`Unexpected ${label} entry at ${path}; refusing to follow a symlink or junction.`);
+    active.push({ ...validate(await readJson(path, label), path), path });
   }
-  return { active, recovered };
+  return { active };
 }
 
 function summarize(records, format) {
@@ -325,12 +308,18 @@ function summarize(records, format) {
 
 function describe(leases, tickets, capacityUnits) {
   const used = leases.reduce((total, lease) => total + lease.weight, 0);
-  return `used=${used}/${capacityUnits}; leases=${summarize(leases, (lease) => `${lease.ownerToken.slice(0, 8)} weight=${lease.weight} age=${Math.ceil(lease.ageMs / 1000)}s`)}; queue=${summarize(tickets, (ticket) => `${ticket.ownerToken.slice(0, 8)} weight=${ticket.weight} age=${Math.ceil(ticket.ageMs / 1000)}s`)}`;
+  return `used=${used}/${capacityUnits}; leases=${summarize(leases, (lease) => `${lease.ownerToken.slice(0, 8)} weight=${lease.weight}`)}; queue=${summarize(tickets, (ticket) => `${ticket.ownerToken.slice(0, 8)} weight=${ticket.weight}`)}`;
 }
 
-async function createTicket(config, ownerToken, now) {
+async function createTicket(config, ownerToken) {
+  const sequencePath = paths(config.root).queueSequence;
+  const sequence = await readJson(sequencePath, 'queue sequence');
+  if (!Number.isSafeInteger(sequence.next) || sequence.next < 1 || Object.keys(sequence).length !== 1) {
+    throw new CapacityCoordinationError(`Invalid queue sequence at ${sequencePath}; refusing to guess FIFO order.`);
+  }
+  await writeFile(sequencePath, JSON.stringify({ next: sequence.next + 1 }), 'utf8');
   const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
-  await writeExclusive(ticketPath, JSON.stringify({ ownerToken, weight: config.leaseWeight, enqueuedAt: new Date(now()).toISOString() }));
+  await writeExclusive(ticketPath, JSON.stringify({ ownerToken, weight: config.leaseWeight, sequence: sequence.next }));
   return ticketPath;
 }
 
@@ -338,7 +327,7 @@ async function removeTicket(config, ownerToken, { now = realClock.now, sleep = r
   const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
   return withControlLock(config.root, cleanup, async () => {
     try {
-      await rm(join(paths(config.root).tickets, `${ownerToken}.json`), { force: false });
+      await removeRegularRecord(join(paths(config.root).tickets, `${ownerToken}.json`), 'queue ticket');
       return true;
     } catch (error) {
       if (error.code === 'ENOENT') return false;
@@ -350,23 +339,22 @@ async function removeTicket(config, ownerToken, { now = realClock.now, sleep = r
 export async function acquireLease(config, { ownerToken = randomUUID(), now = realClock.now, sleep = realClock.sleep, metadata = {} } = {}) {
   if (!/^[a-f0-9-]{36}$/i.test(ownerToken)) throw new CapacityCoordinationError('ownerToken must be a UUID.');
   await ensureProvisioned(config);
-  await createTicket(config, ownerToken, now);
   const deadline = now() + config.timeoutMs;
   let lastDescription = 'no capacity check completed';
-  let recoveredLeases = 0;
-  let recoveredTickets = 0;
+  let ticketCreated = false;
 
   try {
+    await withControlLock(config.root, { ...config, timeoutMs: config.timeoutMs, now, sleep }, async () => {
+      await createTicket(config, ownerToken);
+      ticketCreated = true;
+    });
     while (true) {
       const remaining = Math.max(0, deadline - now());
       const result = await withControlLock(config.root, { ...config, timeoutMs: remaining, now, sleep }, async () => {
         const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
-        await utimes(ticketPath, new Date(now()), new Date(now()));
-        const leaseRecords = await listRecords(paths(config.root).leases, 'lease record', validLease, config.staleAfterMs, now);
-        const ticketRecords = await listRecords(paths(config.root).tickets, 'queue ticket', validTicket, config.staleAfterMs, now);
-        recoveredLeases += leaseRecords.recovered;
-        recoveredTickets += ticketRecords.recovered;
-        const tickets = ticketRecords.active.sort((a, b) => a.enqueuedAt.localeCompare(b.enqueuedAt) || a.ownerToken.localeCompare(b.ownerToken));
+        const leaseRecords = await listRecords(paths(config.root).leases, 'lease record', validLease);
+        const ticketRecords = await listRecords(paths(config.root).tickets, 'queue ticket', validTicket);
+        const tickets = ticketRecords.active.sort((a, b) => a.sequence - b.sequence);
         lastDescription = describe(leaseRecords.active, tickets, config.capacityUnits);
         const position = tickets.findIndex((ticket) => ticket.ownerToken === ownerToken);
         if (position < 0) throw new CapacityCoordinationError('This job queue ticket disappeared before admission; refusing to continue.');
@@ -375,40 +363,23 @@ export async function acquireLease(config, { ownerToken = randomUUID(), now = re
 
         const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
         await writeExclusive(leasePath, JSON.stringify({ ...metadata, ownerToken, weight: config.leaseWeight, acquiredAt: new Date(now()).toISOString() }));
-        await rm(ticketPath, { force: false });
+        await removeRegularRecord(ticketPath, 'queue ticket');
         return { leasePath };
       });
-      if (result) return { ownerToken, ...result, recovered: recoveredLeases, recoveredTickets };
-      if (now() >= deadline) throw new CapacityCoordinationError(`Timed out after ${Math.ceil(config.timeoutMs / 1000)}s waiting for physical-host capacity (${lastDescription}; recovered-stale-leases=${recoveredLeases}; recovered-stale-tickets=${recoveredTickets}).`);
+      if (result) return { ownerToken, ...result };
+      if (now() >= deadline) throw new CapacityCoordinationError(`Timed out after ${Math.ceil(config.timeoutMs / 1000)}s waiting for physical-host capacity (${lastDescription}). Existing lease or queue records are never reclaimed automatically; follow the documented manual recovery procedure after confirming no owner is live.`);
       await sleep(Math.min(config.pollIntervalMs, Math.max(1, deadline - now())));
     }
   } catch (error) {
-    try {
-      await removeTicket(config, ownerToken, { now, sleep });
-    } catch (cleanupError) {
-      throw new CapacityCoordinationError(`${error.message} Queue ticket cleanup also failed: ${cleanupError.message}`, cleanupError);
+    if (ticketCreated) {
+      try {
+        await removeTicket(config, ownerToken, { now, sleep });
+      } catch (cleanupError) {
+        throw new CapacityCoordinationError(`${error.message} Queue ticket cleanup also failed: ${cleanupError.message}`, cleanupError);
+      }
     }
     throw error;
   }
-}
-
-export async function heartbeatLease(config, ownerToken, { now = realClock.now, sleep = realClock.sleep } = {}) {
-  if (!/^[a-f0-9-]{36}$/i.test(ownerToken)) throw new CapacityCoordinationError('ownerToken must be a UUID.');
-  await ensureProvisioned(config);
-  const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
-  return withControlLock(config.root, cleanup, async () => {
-    const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
-    try {
-      const lease = validLease(await readJson(leasePath, 'lease record'), leasePath);
-      if (lease.ownerToken !== ownerToken) throw new CapacityCoordinationError(`Lease ownership mismatch at ${leasePath}; refusing to heartbeat another job's capacity.`);
-      const timestamp = new Date(now());
-      await utimes(leasePath, timestamp, timestamp);
-      return true;
-    } catch (error) {
-      if (error.code === 'ENOENT') return false;
-      throw error;
-    }
-  });
 }
 
 export async function releaseLease(config, ownerToken, { now = realClock.now, sleep = realClock.sleep } = {}) {
@@ -420,12 +391,39 @@ export async function releaseLease(config, ownerToken, { now = realClock.now, sl
     try {
       const lease = validLease(await readJson(leasePath, 'lease record'), leasePath);
       if (lease.ownerToken !== ownerToken) throw new CapacityCoordinationError(`Lease ownership mismatch at ${leasePath}; refusing to release another job's capacity.`);
-      await rm(leasePath, { force: false });
+      await removeRegularRecord(leasePath, 'lease record');
       return true;
     } catch (error) {
       if (error.code === 'ENOENT') return false;
       throw error;
     }
+  });
+}
+
+export async function recoverAbandonedRecord(config, { kind, ownerToken, now = realClock.now, sleep = realClock.sleep } = {}) {
+  await ensureProvisioned(config);
+  const location = paths(config.root);
+  if (kind === 'control') {
+    if (ownerToken !== 'active') throw new CapacityCoordinationError('Control recovery can target only the active control directory.');
+    await assertDirectory(location.controlTickets, 'control-ticket directory');
+    const controlPath = join(location.controlTickets, 'active');
+    await assertDirectory(controlPath, 'active control-ticket directory');
+    await rm(controlPath, { recursive: true, force: false });
+    return controlPath;
+  }
+  if (!['lease', 'ticket'].includes(kind) || !/^[a-f0-9-]{36}$/i.test(ownerToken ?? '')) {
+    throw new CapacityCoordinationError('Recovery requires kind lease or ticket and a UUID owner token.');
+  }
+  const directory = kind === 'lease' ? location.leases : location.tickets;
+  const label = kind === 'lease' ? 'lease record' : 'queue ticket';
+  const validate = kind === 'lease' ? validLease : validTicket;
+  const recordPath = join(directory, `${ownerToken}.json`);
+  const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
+  return withControlLock(config.root, cleanup, async () => {
+    const record = validate(await readJson(recordPath, label), recordPath);
+    if (record.ownerToken !== ownerToken) throw new CapacityCoordinationError(`Recovery target ownership mismatch at ${recordPath}.`);
+    await removeRegularRecord(recordPath, label);
+    return recordPath;
   });
 }
 

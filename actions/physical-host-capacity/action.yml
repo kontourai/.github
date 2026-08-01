@@ -24,14 +24,6 @@ inputs:
     description: Positive integer delay between capacity checks.
     required: false
     default: "1000"
-  stale-after-seconds:
-    description: Positive integer age after which an unheartbeated lease or queue ticket can be recovered.
-    required: false
-    default: "1800"
-  heartbeat-interval-seconds:
-    description: Positive integer heartbeat period. It must be shorter than stale-after-seconds.
-    required: false
-    default: "30"
 
 outputs:
   owner-token:

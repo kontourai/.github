@@ -63,8 +63,9 @@ test('physical-host capacity action is a required, cancellation-safe weighted le
   assert.equal(action.inputs['capacity-units'].default, '1');
   assert.equal(action.inputs['lease-weight'].default, '1');
   assert.equal(action.inputs['timeout-seconds'].default, '300');
-  assert.equal(action.inputs['stale-after-seconds'].default, '1800');
-  assert.equal(action.inputs['heartbeat-interval-seconds'].default, '30');
+  assert.equal(action.inputs['stale-after-seconds'], undefined);
+  assert.equal(action.inputs['heartbeat-interval-seconds'], undefined);
+  assert.equal(action.inputs['clock-skew-allowance-seconds'], undefined);
   assert.equal(action.runs.using, 'node20');
   assert.equal(action.runs.main, 'acquire.mjs');
   assert.equal(action.runs.post, 'release.mjs');
