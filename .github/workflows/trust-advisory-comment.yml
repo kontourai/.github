@@ -1,0 +1,68 @@
+name: Trust CI advisory comment
+
+on:
+  workflow_call:
+    inputs:
+      pr-number:
+        description: "Pull request number to comment on."
+        required: true
+        type: number
+      check-name:
+        description: "Completed Trust CI check name, such as Trust Verify or Trust Reconcile."
+        required: true
+        type: string
+      result:
+        description: "Completed Trust CI result."
+        required: true
+        type: string
+      run-url:
+        description: "URL of the completed Trust CI run."
+        required: true
+        type: string
+      details:
+        description: "Optional structured failure details for the advisory comment."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: none
+
+jobs:
+  publish:
+    name: Publish ${{ inputs.check-name }} advisory
+    runs-on: ubuntu-latest
+    permissions:
+      contents: none
+      pull-requests: write
+    steps:
+      - name: Create or update advisory comment
+        if: inputs.result != 'success'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88
+        with:
+          number_force: ${{ inputs.pr-number }}
+          header: trust-ci-advisory
+          message: |
+            ## ${{ inputs.check-name }} needs attention
+
+            ${{ inputs.check-name }} completed with result: `${{ inputs.result }}`.
+
+            [Open the workflow run](${{ inputs.run-url }})
+
+            <details>
+            <summary>Failure details</summary>
+
+            ```text
+            ${{ inputs.details || 'No structured failure details were reported; open the workflow run.' }}
+            ```
+            </details>
+
+            This is advisory and non-blocking; it does not change the ${{ inputs.check-name }} verdict or merge requirements.
+
+      - name: Remove resolved advisory comment
+        if: inputs.result == 'success'
+        uses: marocchino/sticky-pull-request-comment@5770ad5eb8f42dd2c4f34da00c94c5381e49af88
+        with:
+          number_force: ${{ inputs.pr-number }}
+          header: trust-ci-advisory
+          delete: true
