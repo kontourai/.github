@@ -481,6 +481,49 @@ test('a same-owner post cleanup followed by a new publisher cannot enter old pro
   });
 });
 
+test('an active replacement after retirement claim survives the losing cleaner', async () => {
+  await withRoot(async (root) => {
+    const controls = join(root, '.kontour-physical-host-capacity', 'control-tickets');
+    const active = join(controls, 'active');
+    let now = 0;
+
+    await assert.rejects(
+      acquireLease(config(root), {
+        ownerToken: OWNER_A,
+        now: () => now,
+        sleep: async () => { now += 6_000; },
+        controlHooks: {
+          async afterControlRetireClaim() {
+            await unlink(active);
+            await publishActiveControlLock(root, OWNER_B, LOCK_B);
+          },
+        },
+      }),
+      /no longer identifies this lock instance|no longer references this lock instance|Queue ticket cleanup also failed/,
+    );
+    assert.equal(JSON.parse(await readFile(active, 'utf8')).ownerToken, OWNER_B);
+    assert.equal(JSON.parse(await readFile(active, 'utf8')).lockToken, LOCK_B);
+  });
+});
+
+test('a detached exact retirement claim is consumed before a same-owner publication', async () => {
+  await withRoot(async (root) => {
+    const controls = join(root, '.kontour-physical-host-capacity', 'control-tickets');
+    const active = await publishActiveControlLock(root, OWNER_C, LOCK_C);
+    const candidate = join(controls, `.candidate-${OWNER_C}-${LOCK_C}.json`);
+    const retired = join(controls, `.retired-${OWNER_C}.json`);
+    await link(active, candidate);
+    await link(active, retired);
+    await unlink(active); // simulate a crash after unlink(active), before cleanup
+
+    const lease = await acquireLease(config(root), { ownerToken: OWNER_C });
+    assert.equal(lease.ownerToken, OWNER_C);
+    assert.equal(existsSync(candidate), false);
+    assert.equal(existsSync(retired), false);
+    await releaseLease(config(root), OWNER_C);
+  });
+});
+
 test('a stale same-owner cleanup cannot unlink a later foreign active lock', async () => {
   await withRoot(async (root) => {
     const raceConfig = config(root, { capacityUnits: 1, leaseWeight: 1, pollIntervalMs: 1 });

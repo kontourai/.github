@@ -452,7 +452,14 @@ async function retireActiveControlLock(controlTickets, expectedOwner, { controlH
     if (!sameControlLock(claimedOwner, expectedOwner)) return false;
     await controlHooks.afterControlRetireClaim?.(expectedOwner);
     try {
-      await assertActiveControlLockInstance(retiredPath, candidatePath ?? controlPath, expectedOwner);
+      if (candidatePath) {
+        // First retain the claim proof, then re-read the current directory
+        // entry. A replacement between those checks must survive untouched.
+        await assertActiveControlLockInstance(retiredPath, candidatePath, expectedOwner);
+        await assertActiveControlLockInstance(controlPath, candidatePath, expectedOwner);
+      } else {
+        await assertActiveControlLockInstance(controlPath, retiredPath, expectedOwner);
+      }
       await unlink(controlPath);
     } catch (error) {
       if (errorCode(error) === 'ENOENT') return false;
@@ -481,6 +488,41 @@ async function removeExactControlRecord(path, expectedOwner) {
   }
 }
 
+async function consumeDetachedRetirementBeforePublish(controlTickets, ownerToken) {
+  // This is deliberately O(1): never enumerate other owners' abandoned
+  // artifacts. A deterministic owner path lets a later same-owner invocation
+  // release only a detached retirement index from an interrupted cleanup.
+  const retiredPath = retiredControlPath(controlTickets, ownerToken);
+  let retiredOwner;
+  try {
+    retiredOwner = await readControlOwnerRecord(retiredPath);
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') return;
+    throw error;
+  }
+  if (retiredOwner.ownerToken !== ownerToken) {
+    throw new CapacityCoordinationError(`Retired control ticket at ${retiredPath} has an unexpected owner; refusing cleanup.`);
+  }
+
+  try {
+    const [activeInfo, retiredInfo] = await Promise.all([
+      stat(join(controlTickets, 'active')),
+      stat(retiredPath),
+    ]);
+    // A live retirement fence still names active's exact inode. It cannot be
+    // invalidated by a contender, even if that contender shares ownerToken.
+    if (activeInfo.dev === retiredInfo.dev && activeInfo.ino === retiredInfo.ino) return;
+  } catch (error) {
+    if (errorCode(error) !== 'ENOENT') throw error;
+  }
+
+  // There is no active link to this retirement inode. Remove only its exact
+  // matching candidate and index; a different instance at either path is
+  // never adopted or deleted.
+  await removeExactControlRecord(candidateControlPath(controlTickets, retiredOwner), retiredOwner);
+  await removeExactControlRecord(retiredPath, retiredOwner);
+}
+
 async function withControlLock(root, {
   timeoutMs,
   pollIntervalMs,
@@ -498,6 +540,7 @@ async function withControlLock(root, {
   const controlPath = join(controlTickets, 'active');
   const deadline = now() + timeoutMs;
   while (true) {
+    await consumeDetachedRetirementBeforePublish(controlTickets, ownerToken);
     const published = await publishControlLock(controlTickets, ownerToken, metadata, { linkOperation });
     if (published) {
       const heldOwner = published.record;
@@ -522,7 +565,7 @@ async function withControlLock(root, {
           if (!operationError) throw cleanupError;
         } finally {
           await rm(published.candidatePath, { force: true });
-          if (retired) await rm(retiredControlPath(controlTickets, heldOwner.ownerToken), { force: true });
+          if (retired) await removeExactControlRecord(retiredControlPath(controlTickets, heldOwner.ownerToken), heldOwner);
         }
       }
     }
@@ -539,7 +582,7 @@ async function withControlLock(root, {
       const retired = await retireActiveControlLock(controlTickets, owner, { controlHooks });
       if (retired) {
         await removeExactControlRecord(candidateControlPath(controlTickets, owner), owner);
-        await rm(retiredControlPath(controlTickets, owner.ownerToken), { force: true });
+        await removeExactControlRecord(retiredControlPath(controlTickets, owner.ownerToken), owner);
         continue;
       }
       if (now() >= deadline) throw new CapacityCoordinationError(`Timed out waiting for same-owner control cleanup at ${controlPath}; an exact cleanup is already in progress for ${diagnosticIdentity(owner)}.`);

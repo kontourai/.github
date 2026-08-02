@@ -228,7 +228,10 @@ Candidate and retired artifacts are cleaned only when their filename and
 owner token exactly match the post step. A retirement claim whose active link
 still exists is intentionally fail-closed: it means a cleaner may have died
 between claiming and unlinking, so it requires the documented quiesced manual
-recovery rather than automatic stealing. Different owners never steal
+recovery rather than automatic stealing. If `active` is already absent, a
+later invocation with that exact owner token consumes only its deterministic
+detached candidate and retirement paths before it publishes a new lock; it
+never scans or removes other owners' artifacts. Different owners never steal
 automatically, and incomplete, malformed, or redirected active records fail
 closed. After draining the runners and confirming no owner job is live, an
 operator must create the distinct regular
