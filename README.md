@@ -163,9 +163,13 @@ can proceed. Update those values only after draining the root and deliberately
 re-provisioning it.
 
 The action never starts a detached process. Its post step releases the lease on
-normal failure or cancellation. If the runner is lost before that step, a later
-participant reclaims its lease or queue ticket only after the recorded owner
-lifetime expires. Set `owner-lifetime-seconds` to at least the workflow job's
+normal failure or cancellation. If GitHub removes a command file after the
+lease is acquired, the main step releases its own lease immediately; the post
+step remains an idempotent fallback. Lease records include repository, run,
+workflow, job, and runner metadata to make contention diagnostics actionable.
+If the runner is lost before either cleanup path can run, a later participant
+reclaims its lease or queue ticket only after the recorded owner lifetime
+expires. Set `owner-lifetime-seconds` to at least the workflow job's
 `timeout-minutes` in seconds plus a conservative recovery margin; all callers
 for a root must use the same value.
 
