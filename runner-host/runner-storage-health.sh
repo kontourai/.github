@@ -8,16 +8,17 @@ Usage:
     [--timeout-seconds N] [--service SERVICE ...]
   runner-storage-health.sh watch --probe-path PATH --incident-path PATH \
     [--timeout-seconds N] [--interval-seconds N] [--service SERVICE ...]
-  runner-storage-health.sh contain --probe-path PATH --incident-path PATH \
-    [--timeout-seconds N] [--service SERVICE ...]
+  runner-storage-health.sh contain [--probe-path PATH] [--incident-path PATH] \
+    --service SERVICE [--service SERVICE ...]
   runner-storage-health.sh clear --probe-path PATH --incident-path PATH \
     [--timeout-seconds N] [--service SERVICE ...]
 
 probe writes and fsyncs one 4 KiB temporary file on the probe path. Failure or
 timeout persists an incident marker, stops and masks every declared service,
 and fails closed. watch repeats probe until an incident. contain is the trusted
-watcher-exit fail-safe. clear requires an existing matching marker and a new
-passing probe before unmasking services; it never starts them.
+watcher-exit fail-safe: it stops and masks before attempting optional marker
+or storage-identity recording. clear requires an existing matching marker and
+a new passing probe before unmasking services; it never starts them.
 EOF
 }
 
@@ -52,6 +53,19 @@ require_paths() {
   require_positive_integer "$timeout_seconds" timeout-seconds
   require_positive_integer "$interval_seconds" interval-seconds
   for service in "${services[@]}"; do require_service_name "$service"; done
+}
+
+require_containment() {
+  command -v systemctl >/dev/null || { echo 'systemctl is required for emergency containment.' >&2; exit 1; }
+  ((${#services[@]} > 0)) || { echo 'emergency containment requires at least one --service.' >&2; exit 2; }
+  for service in "${services[@]}"; do require_service_name "$service"; done
+}
+
+can_record_containment_incident() {
+  [[ -n $probe_path && -n $incident_path ]] || return 1
+  command -v findmnt >/dev/null && command -v realpath >/dev/null || return 1
+  [[ $probe_path == /* && $probe_path != *$'\n'* && -d $probe_path && $(realpath -e -- "$probe_path") == "$probe_path" ]] || return 1
+  [[ $incident_path == /* && $incident_path != *$'\n'* && $(realpath -m -- "$incident_path") == "$incident_path" ]] || return 1
 }
 
 print_containment_recovery() {
@@ -227,23 +241,18 @@ case "$mode" in
     done
     ;;
   contain)
-    require_paths
-    if marker_exists; then
-      if ! marker_is_regular || ! parse_incident_marker; then
-        echo "CRITICAL: health incident marker is malformed or non-regular: $incident_path. It remains in force." >&2
-      fi
-    elif ! write_incident watcher-exited 1; then
-      echo "CRITICAL: could not persist watcher-exit incident at $incident_path." >&2
-      if ! contain_services; then
-        print_containment_recovery
-      fi
-      exit 1
-    fi
+    require_containment
     if ! contain_services; then
       print_containment_recovery
       exit 1
     fi
-    echo "Runner storage watcher containment persisted at $incident_path; services were stopped and masked." >&2
+    if marker_exists; then
+      echo "Runner storage watcher containment preserved existing marker at ${incident_path:-unconfigured path}; services were stopped and masked." >&2
+    elif can_record_containment_incident && write_incident watcher-exited 1; then
+      echo "Runner storage watcher containment persisted at $incident_path; services were stopped and masked." >&2
+    else
+      echo 'CRITICAL: services were stopped and masked, but emergency containment could not record a storage incident because probe path, storage identity, or marker tooling is unavailable.' >&2
+    fi
     exit 0
     ;;
   clear)

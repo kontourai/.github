@@ -37,6 +37,8 @@ param(
 
   [string[]]$RunnerService = @(),
 
+  [string]$WslConfigurationBase64,
+
   [ValidateNotNullOrEmpty()]
   [string]$BootTaskName = 'Kontour WSL runner workspace VHD attach',
 
@@ -119,9 +121,37 @@ function Assert-WslCanonicalRootOwnedScript {
   }
 }
 
+function Import-WslOperationalConfiguration {
+  if ([string]::IsNullOrWhiteSpace($WslConfigurationBase64)) { return }
+  try {
+    $configurationJson = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($WslConfigurationBase64))
+    $configuration = $configurationJson | ConvertFrom-Json -ErrorAction Stop
+  } catch {
+    throw 'WslConfigurationBase64 must contain valid UTF-8 JSON configuration.'
+  }
+  foreach ($property in @('WslBootstrapScript', 'WslHealthScript', 'WslUuid', 'WslMountRoot', 'WslHealthIncidentPath', 'WslHealthTimeoutSeconds', 'WslHealthIntervalSeconds', 'WslBind', 'RunnerService')) {
+    if ($null -eq $configuration.PSObject.Properties[$property]) {
+      throw "WslConfigurationBase64 is missing required property: $property"
+    }
+  }
+  Set-Variable -Scope Script -Name WslBootstrapScript -Value ([string]$configuration.WslBootstrapScript)
+  Set-Variable -Scope Script -Name WslHealthScript -Value ([string]$configuration.WslHealthScript)
+  Set-Variable -Scope Script -Name WslUuid -Value ([string]$configuration.WslUuid)
+  Set-Variable -Scope Script -Name WslMountRoot -Value ([string]$configuration.WslMountRoot)
+  Set-Variable -Scope Script -Name WslHealthIncidentPath -Value ([string]$configuration.WslHealthIncidentPath)
+  Set-Variable -Scope Script -Name WslHealthTimeoutSeconds -Value ([int]$configuration.WslHealthTimeoutSeconds)
+  Set-Variable -Scope Script -Name WslHealthIntervalSeconds -Value ([int]$configuration.WslHealthIntervalSeconds)
+  Set-Variable -Scope Script -Name WslBind -Value @($configuration.WslBind | ForEach-Object { [string]$_ })
+  Set-Variable -Scope Script -Name RunnerService -Value @($configuration.RunnerService | ForEach-Object { [string]$_ })
+}
+
 function Assert-WslOperationalConfiguration {
+  Import-WslOperationalConfiguration
   if ([string]::IsNullOrWhiteSpace($WslUuid) -or $WslUuid -notmatch '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$') {
     throw 'Runner startup requires WslUuid in canonical UUID form.'
+  }
+  if ($WslHealthTimeoutSeconds -lt 1 -or $WslHealthTimeoutSeconds -gt 86400 -or $WslHealthIntervalSeconds -lt 1 -or $WslHealthIntervalSeconds -gt 86400) {
+    throw 'Runner startup requires health timeout and interval values between 1 and 86400 seconds.'
   }
   Assert-WslCanonicalPath -Path $WslMountRoot -Description 'WslMountRoot'
   Assert-WslCanonicalPath -Path $WslHealthIncidentPath -Description 'WslHealthIncidentPath'
@@ -296,15 +326,20 @@ switch ($Mode) {
     $quotedVhd = & $quote $VhdPath
     $quotedDistro = & $quote $DistroName
     $quotedUser = & $quote $WslWindowsUser
-    $quotedBootstrapScript = & $quote $WslBootstrapScript
-    $quotedHealthScript = & $quote $WslHealthScript
-    $quotedUuid = & $quote $WslUuid
-    $quotedMountRoot = & $quote $WslMountRoot
-    $quotedIncidentPath = & $quote $WslHealthIncidentPath
-    $commandParts = @("& $quotedScript", '-Mode AttachBootstrapAndKeepAlive', "-VhdPath $quotedVhd", "-DistroName $quotedDistro", "-WslWindowsUser $quotedUser", "-WslBootstrapScript $quotedBootstrapScript", "-WslHealthScript $quotedHealthScript", "-WslUuid $quotedUuid", "-WslMountRoot $quotedMountRoot", "-WslHealthIncidentPath $quotedIncidentPath", "-WslHealthTimeoutSeconds $WslHealthTimeoutSeconds", "-WslHealthIntervalSeconds $WslHealthIntervalSeconds")
-    foreach ($binding in $WslBind) { $commandParts += "-WslBind $(& $quote $binding)" }
-    foreach ($service in $RunnerService) { $commandParts += "-RunnerService $(& $quote $service)" }
-    $command = $commandParts -join ' '
+    $wslConfiguration = [ordered]@{
+      WslBootstrapScript = $WslBootstrapScript
+      WslHealthScript = $WslHealthScript
+      WslUuid = $WslUuid
+      WslMountRoot = $WslMountRoot
+      WslBind = @($WslBind)
+      WslHealthIncidentPath = $WslHealthIncidentPath
+      WslHealthTimeoutSeconds = $WslHealthTimeoutSeconds
+      WslHealthIntervalSeconds = $WslHealthIntervalSeconds
+      RunnerService = @($RunnerService)
+    }
+    $wslConfigurationBase64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($wslConfiguration | ConvertTo-Json -Compress)))
+    $quotedConfiguration = & $quote $wslConfigurationBase64
+    $command = "& $quotedScript -Mode AttachBootstrapAndKeepAlive -VhdPath $quotedVhd -DistroName $quotedDistro -WslWindowsUser $quotedUser -WslConfigurationBase64 $quotedConfiguration"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
     $bootTrigger = New-ScheduledTaskTrigger -AtStartup

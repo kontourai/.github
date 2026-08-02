@@ -33,6 +33,9 @@ test('Windows VHD helper is parameterized, elevated, and refuses overwrite', asy
   assert.match(script, /WslMountRoot/);
   assert.match(script, /WslBind/);
   assert.match(script, /RunnerService/);
+  assert.match(script, /WslConfigurationBase64/);
+  assert.match(script, /ConvertTo-Json -Compress/);
+  assert.match(script, /ConvertFrom-Json/);
   assert.match(script, /Assert-WslCanonicalRootOwnedScript/);
   assert.match(script, /\/usr\/bin\/readlink -f/);
   assert.match(script, /\/usr\/bin\/stat/);
@@ -70,6 +73,36 @@ test('Windows VHD helper is parameterized, elevated, and refuses overwrite', asy
   assert.doesNotMatch(script, /Station/i);
 });
 
+test('scheduled task structured configuration preserves every bind and runner service', async () => {
+  const script = await readFile(windowsScript, 'utf8');
+  const configuration = {
+    WslBootstrapScript: '/usr/local/sbin/bootstrap-wsl-runner-workspace.sh',
+    WslHealthScript: '/usr/local/sbin/runner-storage-health.sh',
+    WslUuid: '11111111-1111-1111-1111-111111111111',
+    WslMountRoot: '/mnt/runner-work',
+    WslBind: [
+      '/mnt/runner-work/a:/var/lib/runner-a/work',
+      '/mnt/runner-work/b:/var/lib/runner-b/work'
+    ],
+    WslHealthIncidentPath: '/var/lib/kontour-runner-storage/runner.incident',
+    WslHealthTimeoutSeconds: 30,
+    WslHealthIntervalSeconds: 60,
+    RunnerService: ['runner-a.service', 'runner-b.service']
+  };
+  const encoded = Buffer.from(JSON.stringify(configuration), 'utf8').toString('base64');
+  const scheduledCommand = `& protected.ps1 -Mode AttachBootstrapAndKeepAlive -WslConfigurationBase64 '${encoded}'`;
+  const encodedArgument = scheduledCommand.match(/-WslConfigurationBase64 '([^']+)'/)?.[1];
+  const restored = JSON.parse(Buffer.from(encodedArgument, 'base64').toString('utf8'));
+
+  assert.deepEqual(restored.WslBind, configuration.WslBind);
+  assert.deepEqual(restored.RunnerService, configuration.RunnerService);
+  assert.match(script, /WslBind = @\(\$WslBind\)/);
+  assert.match(script, /RunnerService = @\(\$RunnerService\)/);
+  assert.match(script, /-WslConfigurationBase64 \$quotedConfiguration/);
+  assert.doesNotMatch(script, /foreach \(\$binding in \$WslBind\) \{ \$commandParts/);
+  assert.doesNotMatch(script, /foreach \(\$service in \$RunnerService\) \{ \$commandParts/);
+});
+
 test('storage health probe fails closed and clears only after a passing recovery probe', async () => {
   const healthScript = await readFile(storageHealth, 'utf8');
   assert.match(healthScript, /timeout_seconds=30/);
@@ -77,6 +110,8 @@ test('storage health probe fails closed and clears only after a passing recovery
   assert.match(healthScript, /conv=fsync/);
   assert.match(healthScript, /Runner storage incident marker exists/);
   assert.match(healthScript, /contain_services/);
+  assert.match(healthScript, /require_containment/);
+  assert.match(healthScript, /can_record_containment_incident/);
   assert.match(healthScript, /is-active --quiet/);
   assert.match(healthScript, /UnitFileState/);
   assert.match(healthScript, /health incident marker does not exactly match/);
@@ -206,6 +241,47 @@ esac
       () => execFile(storageHealth, ['clear', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } }),
       /does not exactly match/
     );
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('emergency containment stops and masks services without probe storage tooling', async () => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), 'kontour-emergency-containment-'));
+  const bin = join(fixtureRoot, 'bin');
+  const stateRoot = join(fixtureRoot, 'state');
+  await Promise.all([mkdir(bin, { recursive: true }), mkdir(stateRoot, { recursive: true })]);
+  const writeExecutable = async (name, contents) => {
+    const path = join(bin, name);
+    await writeFile(path, contents);
+    await chmod(path, 0o755);
+  };
+  await writeExecutable('bash', '#!/bin/bash\nexec /bin/bash "$@"\n');
+  await writeExecutable('systemctl', `#!/bin/bash
+set -euo pipefail
+service="\${!#}"
+case "$1" in
+  stop) : > "$FAKE_CONTAINMENT_STATE/stopped-$service" ;;
+  is-active) exit 3 ;;
+  mask) : > "$FAKE_CONTAINMENT_STATE/masked-$service" ;;
+  show) printf 'masked\\n' ;;
+esac
+`);
+  const env = { ...process.env, PATH: bin, FAKE_CONTAINMENT_STATE: stateRoot };
+
+  try {
+    const result = await execFile(storageHealth, [
+      'contain',
+      '--probe-path', '/unavailable-runner-vhd',
+      '--incident-path', '/unavailable-runner-vhd/runner.incident',
+      '--service', 'fixture-a.service',
+      '--service', 'fixture-b.service'
+    ], { env });
+    assert.match(result.stderr, /services were stopped and masked, but emergency containment could not record a storage incident/);
+    for (const service of ['fixture-a.service', 'fixture-b.service']) {
+      await assert.doesNotReject(() => accessFile(join(stateRoot, `stopped-${service}`)));
+      await assert.doesNotReject(() => accessFile(join(stateRoot, `masked-${service}`)));
+    }
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true });
   }
@@ -382,6 +458,10 @@ test('runbook preserves the Windows-path and WSL-UUID recovery boundary', async 
   assert.match(text, /wsl\.exe --mount --vhd --bare/);
   assert.match(text, /WslBootstrapScript/);
   assert.match(text, /WslHealthScript/);
+  assert.match(text, /-WslBind @\('/);
+  assert.match(text, /-RunnerService @\('/);
+  assert.match(text, /serializes the WSL configuration once as validated structured\s+data/i);
+  assert.match(text, /storage identity is best-effort/i);
   assert.match(text, /wsl\.exe --exec/);
   assert.match(text, /root-owned and must not be group- or\s+world-writable/i);
   assert.doesNotMatch(text, /WslBootstrapCommand/);

@@ -93,11 +93,10 @@ health script's stop-and-mask containment command:
   -WslBootstrapScript '/usr/local/sbin/bootstrap-wsl-runner-workspace.sh' `
   -WslHealthScript '/usr/local/sbin/runner-storage-health.sh' `
   -WslUuid '<ext4-uuid>' -WslMountRoot '/mnt/runner-work' `
-  -WslBind '/mnt/runner-work/work:/var/lib/example-runner/work' `
-  -WslBind '/mnt/runner-work/work-2:/var/lib/example-runner/work-2' `
+  -WslBind @('/mnt/runner-work/work:/var/lib/example-runner/work', '/mnt/runner-work/work-2:/var/lib/example-runner/work-2') `
   -WslHealthIncidentPath '/var/lib/kontour-runner-storage/runner-work.incident' `
   -WslHealthTimeoutSeconds 30 -WslHealthIntervalSeconds 60 `
-  -RunnerService 'example-runner.service'
+  -RunnerService @('example-runner.service', 'example-runner-2.service')
 ```
 
 Run that command elevated as the WSL-owning Windows user. WSL distribution
@@ -123,6 +122,14 @@ and filesystem root match the declared source. To recover, stop the runner
 services, unmount the bind targets and mount root in WSL, then detach the VHD
 in Windows only after no process has an open file on it. Keep the VHD file: it
 is the recoverable workspace state.
+
+The installer serializes the WSL configuration once as validated structured
+data for the protected scheduled-task entrypoint, so every declared bind and
+runner service is preserved across task registration. If the health watcher
+cannot start or returns, its emergency `contain` invocation first verifies
+`systemctl` stop-and-mask containment; recording the incident marker and
+storage identity is best-effort so an unavailable VHD mount cannot prevent
+containment.
 
 ## Storage lifecycle hooks
 
