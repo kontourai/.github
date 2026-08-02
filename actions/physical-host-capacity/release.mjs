@@ -1,4 +1,4 @@
-import { parseConfig, releaseLease, stateName } from './coordinator.mjs';
+import { actionMetadata, parseConfig, releaseLease, stateName } from './coordinator.mjs';
 
 function postEnvironment() {
   const read = (name) => process.env[`STATE_${stateName(name)}`];
@@ -19,7 +19,7 @@ async function main() {
     console.log('Physical-host capacity post step has no acquired lease to release.');
     return;
   }
-  const released = await releaseLease(parseConfig(postEnvironment()), ownerToken);
+  const released = await releaseLease(parseConfig(postEnvironment()), ownerToken, { metadata: actionMetadata(process.env) });
   console.log(released ? `Released physical-host capacity lease ${ownerToken.slice(0, 8)}.` : `Physical-host capacity lease ${ownerToken.slice(0, 8)} was already absent.`);
 }
 

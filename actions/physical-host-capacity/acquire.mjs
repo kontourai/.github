@@ -61,7 +61,7 @@ export async function runAcquireAction({
 
     let cleanup;
     try {
-      const released = await releaseLease(config, lease.ownerToken);
+      const released = await releaseLease(config, lease.ownerToken, { metadata: actionMetadata(env) });
       cleanup = released ? 'released the owned lease' : 'found the owned lease already absent';
     } catch (cleanupError) {
       throw new CapacityCoordinationError(

@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readFile, readdir, rename, rm } from 'node:fs/promises';
+import { link, lstat, mkdir, open, readFile, readdir, rename, rm, stat, unlink } from 'node:fs/promises';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 
 const STATE_DIRECTORY = '.kontour-physical-host-capacity';
@@ -10,7 +10,6 @@ const QUEUE_SEQUENCE_DIRECTORY = 'queue-sequences';
 const STAGING_DIRECTORY = 'staging';
 const MANIFEST_FILE = 'host-manifest.json';
 const HOST_MARKER_FILE = '.kontour-physical-host-id';
-const CONTROL_OWNER_FILE = 'owner.json';
 const MANIFEST_SCHEMA_VERSION = 7;
 const RECOVERY_STRATEGY = 'bounded-owner-deadline-v1';
 const LEGACY_MANIFEST_SCHEMA_VERSION = 6;
@@ -19,6 +18,7 @@ const LEGACY_OWNER_LIFETIME_FLOOR_MS = 6_000_000;
 const CLEANUP_RETRY_MS = 5_000;
 const MAX_DIAGNOSTIC_ENTRIES = 6;
 const MAX_DIAGNOSTIC_VALUE_LENGTH = 120;
+const CONTROL_METADATA_FIELDS = ['repository', 'runId', 'runAttempt', 'workflow', 'job', 'runnerName'];
 
 export class CapacityCoordinationError extends Error {
   constructor(message, cause) {
@@ -323,61 +323,121 @@ function assertOwnerToken(ownerToken, label = 'ownerToken') {
   if (!/^[a-f0-9-]{36}$/i.test(ownerToken ?? '')) throw new CapacityCoordinationError(`${label} must be a UUID.`);
 }
 
+function boundedControlMetadata(metadata = {}) {
+  return Object.fromEntries(CONTROL_METADATA_FIELDS.map((field) => [field, diagnosticValue(metadata[field])]));
+}
+
+function controlOwnerRecord(ownerToken, lockToken, metadata) {
+  return {
+    ...boundedControlMetadata(metadata),
+    ownerToken,
+    lockToken,
+  };
+}
+
 function validControlOwner(record, path) {
-  if (!record || typeof record !== 'object' || Array.isArray(record) || Object.keys(record).sort().join(',') !== 'ownerToken' || !/^[a-f0-9-]{36}$/i.test(record.ownerToken)) {
+  const expectedKeys = ['job', 'lockToken', 'ownerToken', 'repository', 'runAttempt', 'runId', 'runnerName', 'workflow'];
+  if (
+    !record || typeof record !== 'object' || Array.isArray(record)
+    || Object.keys(record).sort().join(',') !== expectedKeys.join(',')
+    || !/^[a-f0-9-]{36}$/i.test(record.ownerToken)
+    || !/^[a-f0-9-]{36}$/i.test(record.lockToken)
+    || CONTROL_METADATA_FIELDS.some((field) => typeof record[field] !== 'string' || record[field].length > MAX_DIAGNOSTIC_VALUE_LENGTH)
+  ) {
     throw new CapacityCoordinationError(`Invalid active control ticket at ${path}; refusing to guess or steal control ownership.`);
   }
   return record;
 }
 
-async function readActiveControlOwner(controlPath) {
-  await assertDirectory(controlPath, 'active control-ticket entry');
-  const entries = await readdir(controlPath, { withFileTypes: true });
-  if (entries.length !== 1 || entries[0].name !== CONTROL_OWNER_FILE || !entries[0].isFile()) {
-    const shape = entries.map((entry) => `${entry.name}:${entry.isDirectory() ? 'directory' : entry.isFile() ? 'file' : 'other'}`).join(',') || 'empty';
-    throw new CapacityCoordinationError(`Invalid active control ticket at ${controlPath} (${shape}); refusing to guess or steal control ownership.`);
-  }
-  const ownerPath = join(controlPath, CONTROL_OWNER_FILE);
-  return validControlOwner(await readJson(ownerPath, 'active control ticket owner'), ownerPath);
+async function readControlOwnerRecord(controlPath) {
+  return validControlOwner(await readJson(controlPath, 'active control ticket'), controlPath);
 }
 
-async function publishControlLock(controlTickets, ownerToken) {
+async function readActiveControlOwner(controlPath) {
+  return readControlOwnerRecord(controlPath);
+}
+
+function errorCode(error) {
+  return error?.code ?? error?.cause?.code;
+}
+
+async function publishControlLock(controlTickets, ownerToken, metadata, { linkOperation = link } = {}) {
   const controlPath = join(controlTickets, 'active');
-  const candidatePath = join(controlTickets, `.candidate-${ownerToken}-${randomUUID()}`);
-  await mkdir(candidatePath);
+  const lockToken = randomUUID();
+  const candidatePath = join(controlTickets, `.candidate-${ownerToken}-${lockToken}.json`);
   try {
-    await writeExclusive(join(candidatePath, CONTROL_OWNER_FILE), JSON.stringify({ ownerToken }));
+    await writeExclusive(candidatePath, JSON.stringify(controlOwnerRecord(ownerToken, lockToken, metadata)));
     try {
-      await lstat(controlPath);
-      return false;
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
-    try {
-      await rename(candidatePath, controlPath);
+      await linkOperation(candidatePath, controlPath);
       return true;
     } catch (error) {
-      if (!['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error;
-      return false;
+      if (['EEXIST', 'ENOTEMPTY'].includes(error.code)) return false;
+      if (['EPERM', 'EACCES'].includes(error.code)) {
+        try {
+          await readActiveControlOwner(controlPath);
+          return false;
+        } catch (inspectionError) {
+          if (errorCode(inspectionError) === 'ENOENT') throw error;
+          throw inspectionError;
+        }
+      }
+      throw error;
     }
   } finally {
-    await rm(candidatePath, { recursive: true, force: true });
+    await rm(candidatePath, { force: true });
   }
 }
 
-async function removeActiveControlLock(controlTickets, ownerToken) {
+function sameControlLock(left, right) {
+  return left.ownerToken === right.ownerToken && left.lockToken === right.lockToken;
+}
+
+async function retireActiveControlLock(controlTickets, expectedOwner, { controlHooks = {} } = {}) {
   const controlPath = join(controlTickets, 'active');
-  const owner = await readActiveControlOwner(controlPath);
-  if (owner.ownerToken !== ownerToken) {
-    throw new CapacityCoordinationError(`Active control ticket at ${controlPath} belongs to a different owner; automatic control-ticket stealing is disabled.`);
+  const retiredPath = join(controlTickets, `.retired-${expectedOwner.ownerToken}-${expectedOwner.lockToken}.json`);
+  try {
+    await link(controlPath, retiredPath);
+  } catch (error) {
+    if (error.code === 'EEXIST') return false;
+    throw error;
   }
-  // Do not recursively remove `active` in place: that transiently removes its
-  // owner file before the directory, which would make a live lock look
-  // malformed. The rename makes active disappear atomically; cleanup occurs
-  // under a private retired name afterward.
-  const retiredPath = join(controlTickets, `.retired-${ownerToken}-${randomUUID()}`);
-  await rename(controlPath, retiredPath);
-  await rm(retiredPath, { recursive: true, force: false });
+  try {
+    // Linking active to a deterministic retired name atomically claims this
+    // exact inode. A second cleaner sees EEXIST and must not unlink active.
+    const claimedOwner = await readControlOwnerRecord(retiredPath);
+    if (!sameControlLock(claimedOwner, expectedOwner)) return false;
+    await controlHooks.afterControlRetireClaim?.(expectedOwner);
+    await unlink(controlPath);
+    await controlHooks.afterControlRetire?.(expectedOwner);
+    await rm(retiredPath, { force: false });
+    return true;
+  } finally {
+    // A foreign active record can never be removed here. If this cleanup did
+    // not unlink active, the private claim link is safe to discard.
+    await rm(retiredPath, { force: true });
+  }
+}
+
+async function cleanupOwnedControlResidue(controlTickets, ownerToken) {
+  const candidatePattern = new RegExp(`^\\.candidate-${ownerToken}-[a-f0-9-]{36}\\.json$`, 'i');
+  const retiredPattern = new RegExp(`^\\.retired-${ownerToken}-[a-f0-9-]{36}\\.json$`, 'i');
+  const entries = await readdir(controlTickets, { withFileTypes: true });
+  for (const entry of entries) {
+    if (!candidatePattern.test(entry.name) && !retiredPattern.test(entry.name)) continue;
+    const residuePath = join(controlTickets, entry.name);
+    const info = await lstat(residuePath);
+    if (info.isSymbolicLink() || !info.isFile()) continue;
+    if (retiredPattern.test(entry.name)) {
+      const activePath = join(controlTickets, 'active');
+      try {
+        const [activeInfo, retiredInfo] = await Promise.all([stat(activePath), stat(residuePath)]);
+        if (activeInfo.dev === retiredInfo.dev && activeInfo.ino === retiredInfo.ino) continue;
+      } catch (error) {
+        if (errorCode(error) !== 'ENOENT') throw error;
+      }
+    }
+    await rm(residuePath, { force: false });
+  }
 }
 
 async function withControlLock(root, {
@@ -386,45 +446,47 @@ async function withControlLock(root, {
   now = realClock.now,
   sleep = realClock.sleep,
   ownerToken,
+  metadata = {},
+  linkOperation = link,
+  controlHooks,
 }, operation) {
-  // A candidate directory carries a durable owner record before the atomic
-  // rename to `active`. A cancellation can therefore leave a known owner, but
-  // never an empty active lock. Only that same owner may reclaim it.
+  // A fully synced candidate file is atomically hard-linked to `active`. A
+  // cancellation can therefore leave a known owner, but never an empty lock.
   assertOwnerToken(ownerToken, 'control lock ownerToken');
   const controlTickets = paths(root).controlTickets;
   const controlPath = join(controlTickets, 'active');
   const deadline = now() + timeoutMs;
   while (true) {
-    try {
-      const published = await publishControlLock(controlTickets, ownerToken);
-      if (!published) {
-        const contention = new Error('Active control ticket already exists.');
-        contention.code = 'EEXIST';
-        throw contention;
-      }
+    const published = await publishControlLock(controlTickets, ownerToken, metadata, { linkOperation });
+    if (published) {
+      const heldOwner = await readActiveControlOwner(controlPath);
+      await controlHooks?.afterControlPublish?.(heldOwner, controlPath);
       try {
+        await controlHooks?.beforeControlOperation?.(heldOwner, controlPath);
         return await operation();
       } finally {
-        await removeActiveControlLock(controlTickets, ownerToken);
+        const retired = await retireActiveControlLock(controlTickets, heldOwner, { controlHooks });
+        if (!retired) throw new CapacityCoordinationError(`Active control ticket at ${controlPath} changed before its owner could release it; refusing to remove another owner's lock.`);
       }
-    } catch (error) {
-      if (error.code !== 'EEXIST' && error.code !== 'ENOTEMPTY') throw error;
-      let owner;
-      try {
-        owner = await readActiveControlOwner(controlPath);
-      } catch (inspectionError) {
-        // The owner can release between a failed publish and inspection. That
-        // is a normal handoff; malformed or redirected locks fail closed.
-        if (inspectionError.code === 'ENOENT' || inspectionError.cause?.code === 'ENOENT') continue;
-        throw inspectionError;
-      }
-      if (owner.ownerToken === ownerToken) {
-        await removeActiveControlLock(controlTickets, ownerToken);
-        continue;
-      }
-      if (now() >= deadline) throw new CapacityCoordinationError('Timed out waiting for the capacity coordination control ticket; it belongs to a different owner and automatic control-ticket stealing is disabled, so use the documented manual recovery procedure after confirming no owner is live.');
-      await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - now())));
     }
+    let owner;
+    try {
+      owner = await readActiveControlOwner(controlPath);
+    } catch (inspectionError) {
+      // The owner can release between a failed publish and inspection. That
+      // is a normal handoff; malformed or redirected locks fail closed.
+      if (errorCode(inspectionError) === 'ENOENT') continue;
+      throw inspectionError;
+    }
+    if (owner.ownerToken === ownerToken) {
+      const retired = await retireActiveControlLock(controlTickets, owner, { controlHooks });
+      if (retired) continue;
+      if (now() >= deadline) throw new CapacityCoordinationError(`Timed out waiting for same-owner control cleanup at ${controlPath}; an exact cleanup is already in progress for ${diagnosticIdentity(owner)}.`);
+      await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - now())));
+      continue;
+    }
+    if (now() >= deadline) throw new CapacityCoordinationError(`Timed out waiting for the capacity coordination control ticket; it belongs to a different owner (${diagnosticIdentity(owner)}) and automatic control-ticket stealing is disabled, so use the documented manual recovery procedure after confirming no owner is live.`);
+    await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - now())));
   }
 }
 
@@ -525,9 +587,15 @@ async function createTicket(config, ownerToken, now, metadata) {
   return ticketPath;
 }
 
-async function removeTicket(config, ownerToken, { now = realClock.now, sleep = realClock.sleep } = {}) {
+async function removeTicket(config, ownerToken, {
+  now = realClock.now,
+  sleep = realClock.sleep,
+  metadata = {},
+  linkOperation = link,
+  controlHooks,
+} = {}) {
   const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
-  return withControlLock(config.root, { ...cleanup, ownerToken }, async () => {
+  return withControlLock(config.root, { ...cleanup, ownerToken, metadata, linkOperation, controlHooks }, async () => {
     try {
       await removeRegularRecord(join(paths(config.root).tickets, `${ownerToken}.json`), 'queue ticket');
       return true;
@@ -538,7 +606,14 @@ async function removeTicket(config, ownerToken, { now = realClock.now, sleep = r
   });
 }
 
-export async function acquireLease(config, { ownerToken = randomUUID(), now = realClock.now, sleep = realClock.sleep, metadata = {} } = {}) {
+export async function acquireLease(config, {
+  ownerToken = randomUUID(),
+  now = realClock.now,
+  sleep = realClock.sleep,
+  metadata = {},
+  controlLinkOperation = link,
+  controlHooks,
+} = {}) {
   assertOwnerToken(ownerToken);
   await ensureProvisioned(config);
   const deadline = now() + config.timeoutMs;
@@ -546,13 +621,13 @@ export async function acquireLease(config, { ownerToken = randomUUID(), now = re
   let ticketCreated = false;
 
   try {
-    await withControlLock(config.root, { ...config, timeoutMs: config.timeoutMs, now, sleep, ownerToken }, async () => {
+    await withControlLock(config.root, { ...config, timeoutMs: config.timeoutMs, now, sleep, ownerToken, metadata, linkOperation: controlLinkOperation, controlHooks }, async () => {
       await createTicket(config, ownerToken, now, metadata);
       ticketCreated = true;
     });
     while (true) {
       const remaining = Math.max(0, deadline - now());
-      const result = await withControlLock(config.root, { ...config, timeoutMs: remaining, now, sleep, ownerToken }, async () => {
+      const result = await withControlLock(config.root, { ...config, timeoutMs: remaining, now, sleep, ownerToken, metadata, linkOperation: controlLinkOperation, controlHooks }, async () => {
         const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
         const leaseRecords = await listRecords(paths(config.root).leases, 'lease record', validLease, config, now);
         const ticketRecords = await listRecords(paths(config.root).tickets, 'queue ticket', validTicket, config, now);
@@ -586,7 +661,7 @@ export async function acquireLease(config, { ownerToken = randomUUID(), now = re
   } catch (error) {
     if (ticketCreated) {
       try {
-        await removeTicket(config, ownerToken, { now, sleep });
+        await removeTicket(config, ownerToken, { now, sleep, metadata, linkOperation: controlLinkOperation, controlHooks });
       } catch (cleanupError) {
         throw new CapacityCoordinationError(`${error.message} Queue ticket cleanup also failed: ${cleanupError.message}`, cleanupError);
       }
@@ -595,31 +670,43 @@ export async function acquireLease(config, { ownerToken = randomUUID(), now = re
   }
 }
 
-export async function releaseLease(config, ownerToken, { now = realClock.now, sleep = realClock.sleep } = {}) {
+export async function releaseLease(config, ownerToken, {
+  now = realClock.now,
+  sleep = realClock.sleep,
+  metadata = {},
+  controlLinkOperation = link,
+  controlHooks,
+} = {}) {
   assertOwnerToken(ownerToken);
   await ensureProvisioned(config);
   const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
-  return withControlLock(config.root, { ...cleanup, ownerToken }, async () => {
-    const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
-    const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
-    let releasedLease = false;
-    try {
-      const lease = validLease(await readJson(leasePath, 'lease record'), leasePath);
-      if (lease.ownerToken !== ownerToken) throw new CapacityCoordinationError(`Lease ownership mismatch at ${leasePath}; refusing to release another job's capacity.`);
-      await removeRegularRecord(leasePath, 'lease record');
-      releasedLease = true;
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
-    // The post step also runs when acquire.mjs was interrupted while waiting.
-    // Its UUID-targeted ticket is safe to remove even though no lease exists.
-    try {
-      await removeRegularRecord(ticketPath, 'queue ticket');
-    } catch (error) {
-      if (error.code !== 'ENOENT') throw error;
-    }
-    return releasedLease;
-  });
+  const controlTickets = paths(config.root).controlTickets;
+  await cleanupOwnedControlResidue(controlTickets, ownerToken);
+  try {
+    return await withControlLock(config.root, { ...cleanup, ownerToken, metadata, linkOperation: controlLinkOperation, controlHooks }, async () => {
+      const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
+      const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
+      let releasedLease = false;
+      try {
+        const lease = validLease(await readJson(leasePath, 'lease record'), leasePath);
+        if (lease.ownerToken !== ownerToken) throw new CapacityCoordinationError(`Lease ownership mismatch at ${leasePath}; refusing to release another job's capacity.`);
+        await removeRegularRecord(leasePath, 'lease record');
+        releasedLease = true;
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      // The post step also runs when acquire.mjs was interrupted while waiting.
+      // Its UUID-targeted ticket is safe to remove even though no lease exists.
+      try {
+        await removeRegularRecord(ticketPath, 'queue ticket');
+      } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+      }
+      return releasedLease;
+    });
+  } finally {
+    await cleanupOwnedControlResidue(controlTickets, ownerToken);
+  }
 }
 
 export async function recoverAbandonedRecord(config, { kind, ownerToken, controlOwnerToken = randomUUID(), now = realClock.now, sleep = realClock.sleep } = {}) {
@@ -629,9 +716,12 @@ export async function recoverAbandonedRecord(config, { kind, ownerToken, control
     if (ownerToken !== 'active') throw new CapacityCoordinationError('Control recovery can target only the active control directory.');
     const controlPath = join(location.controlTickets, 'active');
     // Quiesced manual recovery remains the escape hatch for a crash-corrupted
-    // active directory. Automatic callers require a valid owner record.
-    await assertDirectory(controlPath, 'active control-ticket directory');
-    await rm(controlPath, { recursive: true, force: false });
+    // active record. Automatic callers require a valid owner record.
+    const info = await lstat(controlPath);
+    if (info.isSymbolicLink() || (!info.isDirectory() && !info.isFile())) {
+      throw new CapacityCoordinationError(`active control-ticket entry at ${controlPath} must be a regular file or directory, not a symlink or junction.`);
+    }
+    await rm(controlPath, { recursive: info.isDirectory(), force: false });
     return controlPath;
   }
   if (kind === 'sequence') {

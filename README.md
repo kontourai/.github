@@ -210,16 +210,25 @@ but cannot truncate or reorder an assigned value. Lease and ticket JSON is
 written and fsynced in the private `staging/` directory before an atomic rename
 publishes the final record.
 
-Control ownership uses a candidate directory with an immutable owner record,
-then atomically renames it to `control-tickets/active`; there is no shared
-empty-lock publication window. The normal post step may reclaim an active lock
-only when its persisted owner token exactly matches that same job's token—for
-example, when GitHub cancelled its `acquire` process while it held control.
-Normal release atomically retires `active` before deleting it, so it does not
-create an empty ownership window while another runner is observing the lock.
-Different owners never steal automatically, and incomplete, malformed, or
-redirected active locks fail closed. After draining the runners and confirming
-no owner job is live, an operator must create the distinct regular
+Control ownership uses a fully-synced candidate JSON file with an immutable
+owner token, instance token, and bounded repository/run/workflow/job/runner
+metadata. It atomically hard-links that file to `control-tickets/active`, so
+Windows and WSL observe one immutable active record with no empty-lock window.
+The normal post step may reclaim an active lock only when its persisted owner
+token exactly matches that same job's token—for example, when GitHub cancelled
+its `acquire` process while it held control. Cleanup first hard-links the exact
+active instance to a deterministic private retirement claim; only the cleaner
+that created that claim may unlink `active`. A second same-owner cleanup never
+deletes a later foreign active record.
+
+Candidate and retired artifacts are cleaned only when their filename and
+owner token exactly match the post step. A retirement claim whose active link
+still exists is intentionally fail-closed: it means a cleaner may have died
+between claiming and unlinking, so it requires the documented quiesced manual
+recovery rather than automatic stealing. Different owners never steal
+automatically, and incomplete, malformed, or redirected active records fail
+closed. After draining the runners and confirming no owner job is live, an
+operator must create the distinct regular
 `.kontour-physical-host-quiesced` file (never the permanent identity marker)
 containing exactly the host ID after draining the runners, then run the
 explicit recovery command for one record:
@@ -236,7 +245,7 @@ node scripts/recover-physical-host-capacity.mjs \
 
 Use `--recover ticket:<owner-uuid>` for a confirmed-abandoned queue ticket,
 `--recover sequence:<20-digit-marker>` only for a malformed regular sequence
-entry, or `--recover control:active` for a wedged control directory. The command never
+entry, or `--recover control:active` for a wedged control record. The command never
 accepts a broad clear operation. Never delete the external marker, manifest,
 queue-sequence directory, staging directory, or an unreviewed record. On success it removes the
 quiescence marker; on failure, inspect it before removing it when the root is
