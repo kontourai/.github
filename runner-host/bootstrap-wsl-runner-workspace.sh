@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: bootstrap-wsl-runner-workspace.sh --uuid UUID --mount-root PATH \
   --bind SOURCE:TARGET [--bind SOURCE:TARGET ...] \
-  [--service SERVICE ...]
+  [--service SERVICE ...] [--no-start-services]
 
 Mounts the ext4 filesystem identified by UUID, bind-mounts each source below
 that filesystem over its runner target, then starts the named services. Run as
@@ -17,6 +17,7 @@ uuid=''
 mount_root=''
 declare -a bindings=()
 declare -a services=()
+no_start_services=no
 
 while (($#)); do
   case "$1" in
@@ -24,6 +25,7 @@ while (($#)); do
     --mount-root) mount_root="${2:?missing mount root}"; shift 2 ;;
     --bind) bindings+=("${2:?missing source:target binding}"); shift 2 ;;
     --service) services+=("${2:?missing service name}"); shift 2 ;;
+    --no-start-services) no_start_services=yes; shift ;;
     --help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -77,6 +79,8 @@ for binding in "${bindings[@]}"; do
   fi
 done
 
-for service in "${services[@]}"; do
-  systemctl start "$service"
-done
+if [[ $no_start_services == no ]]; then
+  for service in "${services[@]}"; do
+    systemctl start "$service"
+  done
+fi

@@ -18,6 +18,10 @@ letter. It does not change a live host by itself.
 - Install the bootstrap as a systemd prerequisite for runner services so the
   bind mounts exist before work begins. It starts services only after every
   mount succeeds.
+- The Windows task runs only as the Windows user that owns the WSL
+  distribution. Its protected copy is installed under `ProgramData`, and it
+  keeps a blocking WSL process open after bootstrapping so the distribution
+  remains available for the runner services.
 
 ## One-time setup
 
@@ -65,11 +69,17 @@ $bootstrap = '/usr/local/sbin/bootstrap-wsl-runner-workspace.sh --uuid <ext4-uui
 Run that command elevated as the WSL-owning Windows user. WSL distribution
 registrations are per Windows user, so the installer checks that this user can
 enumerate `DistroName` before it creates the task. The task runs as that
-interactive user at highest run level and has both boot and logon triggers.
-The logon trigger is authoritative: a boot trigger only runs when Windows has a
-usable token for that user. If boot and logon race, an already attached VHD is
-accepted only after the UUID bootstrap validates its filesystem and bind
-identity; otherwise the task fails and leaves services stopped.
+interactive user at highest run level and has both boot and logon triggers; it
+cannot run headlessly as `SYSTEM` or another Windows user. The installer copies
+the entrypoint to an administrator-owned, ACL-verified location under
+`ProgramData` before registering it, so the highest task never points at this
+checkout. The task has no execution-time limit, keeps WSL alive with a blocking
+process, retries failures three times at one-minute intervals, and ignores a
+second simultaneous trigger. The logon trigger is authoritative: a boot trigger
+only runs when Windows has a usable token for that user. If boot and logon race,
+an already attached VHD is accepted only after the UUID bootstrap validates its
+filesystem and bind identity; otherwise the task fails and leaves services
+stopped.
 
 The task attaches the VHD through WSL, invokes the selected distribution as
 root, then the Linux bootstrap finds the ext4 volume by UUID, binds work paths,
@@ -98,6 +108,7 @@ sudo ./runner-host/install-runner-storage-hooks.sh \
   --headroom-path /mnt/runner-work \
   --minimum-free-gb 20 --minimum-free-percent 15 \
   --usage-log /var/log/example-runner/storage-usage.log \
+  --runner-service-user example-runner \
   --runner-root /var/lib/example-runner-a \
   --runner-root /var/lib/example-runner-b
 ```
@@ -105,8 +116,11 @@ sudo ./runner-host/install-runner-storage-hooks.sh \
 It prints `ACTIONS_RUNNER_HOOK_JOB_STARTED` and
 `ACTIONS_RUNNER_HOOK_JOB_COMPLETED` for each root. Put those values in that
 runner's systemd service environment, then restart the service during a
-maintenance window. The installer intentionally does not edit or restart a
-runner service.
+maintenance window. The installer requires the runner service identity,
+provisions a dedicated new log directory with that identity, and verifies that
+the service user can write both the directory and log before generating hooks.
+For an existing log directory or log it validates writability without changing
+ownership. It intentionally does not edit or restart a runner service.
 
 If a runner creates disposable per-job scratch data outside its normal work
 path, opt into cleanup only with both `--ephemeral-root` and `--job-id`. The
@@ -115,25 +129,49 @@ it contains the `.kontour-ephemeral-job` marker. Do not point this at a normal
 runner work directory, cache, receipt store, or VHD mount root.
 
 For capacity reclamation, do not schedule deletion. During a maintenance
-window, stop every runner service, confirm there is no `Runner.Worker`, then
-run the idle-only trim command:
+window, first disable the Windows keepalive task so it cannot re-run the UUID
+bootstrap, then stop every runner service and confirm there is no
+`Runner.Worker` or `Runner.Listener`. Begin a persisted drain:
+
+```powershell
+Disable-ScheduledTask -TaskName 'Kontour WSL runner workspace VHD attach'
+```
 
 ```sh
 sudo ./runner-host/idle-runner-storage-maintenance.sh \
-  --confirm-idle --mount-root /mnt/runner-work \
+  begin --confirm-idle --mount-root /mnt/runner-work \
+  --drain-state /var/lib/example-runner/vhd-maintenance.drain \
   --service example-runner-a.service --service example-runner-b.service
 ```
 
-It rejects unknown or non-inactive service units, runtime-masks the declared
-units while it rechecks for `Runner.Worker` or `Runner.Listener`, and only then
-issues `fstrim`; the runtime masks are removed on exit. To compact the dynamic
-VHD, repeat the idle checks, unmount and detach it, retain a backup or copy of
-the VHD, then run from elevated Windows PowerShell:
+It rejects unknown, externally masked, or non-inactive service units, masks the
+declared units persistently, rechecks both processes, and only then issues
+`fstrim`. Keep that drain state while you unmount the bind targets and mount
+root in WSL, detach and compact the VHD, then reattach it. Restore the UUID
+mount and bindings with the normal bootstrap command plus `--no-start-services`
+(the persistent masks deliberately prevent it from starting runners during the
+drain). To compact the dynamic VHD, retain a backup or copy first, then run
+from elevated Windows PowerShell:
 
 ```powershell
 .\runner-host\windows-wsl-runner-workspace.ps1 -Mode Compact `
-  -VhdPath 'C:\RunnerStorage\runner-work.vhdx' -ConfirmIdle -ConfirmDetached
+  -VhdPath 'C:\RunnerStorage\runner-work.vhdx' -ConfirmDrainActive -ConfirmDetached
 ```
 
 `Compact` requires the operator to confirm that WSL already detached the VHD;
-it does not stop services, detach storage, or delete files.
+it does not stop services, detach storage, or delete files. After the bootstrap
+has restored the workspace mount, end the drain to remove the persisted masks:
+
+```sh
+sudo ./runner-host/idle-runner-storage-maintenance.sh \
+  end --confirm-drain-end \
+  --drain-state /var/lib/example-runner/vhd-maintenance.drain
+```
+
+If unmasking fails, `end` exits nonzero, keeps the drain state, and prints the
+exact recovery command. Re-enable the Windows task only after `end` succeeds:
+
+```powershell
+Enable-ScheduledTask -TaskName 'Kontour WSL runner workspace VHD attach'
+Start-ScheduledTask -TaskName 'Kontour WSL runner workspace VHD attach'
+```
