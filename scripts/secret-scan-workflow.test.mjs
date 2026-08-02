@@ -109,7 +109,7 @@ test('self-hosted scans fail closed unless they reserve shared host capacity', a
   assert.match(workflow, /timeout-minutes: 20/);
   assert.match(
     workflow,
-    /uses: kontourai\/\.github\/actions\/physical-host-capacity@d996ff0496c9e11b27a0a8643c160eb73e0cf142/,
+    /uses: kontourai\/\.github\/actions\/physical-host-capacity@bc715d79df756e4398b91c098a504745283403e8/,
   );
   for (const input of [
     'coordination-root: ${{ inputs.capacity-coordination-root }}',
