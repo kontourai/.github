@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { existsSync, lstatSync, readFileSync, readdirSync } from 'node:fs';
 import { access, appendFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -215,7 +216,7 @@ test('explicit recovery requires a distinct, regular quiescence marker and remov
 
 test('durable FIFO tickets admit an older weighted waiter before a later waiter', async () => {
   await withRoot(async (root) => {
-    const fifoConfig = config(root, { capacityUnits: 1, leaseWeight: 1, timeoutMs: 500, pollIntervalMs: 2 });
+    const fifoConfig = config(root, { capacityUnits: 1, leaseWeight: 1, timeoutMs: 5_000, pollIntervalMs: 2 });
     await provisionHost(fifoConfig);
     await acquireLease(fifoConfig, { ownerToken: OWNER_A });
     const older = acquireLease(fifoConfig, { ownerToken: OWNER_B });
@@ -239,34 +240,74 @@ test('a zero-timeout contender cleans up its durable ticket with an independent 
   });
 });
 
-test('post release removes a waiting owner ticket after cancellation before lease admission', async () => {
+async function publishActiveControlLock(root, ownerToken) {
+  const active = join(root, '.kontour-physical-host-capacity', 'control-tickets', 'active');
+  await mkdir(active);
+  await writeFile(join(active, 'owner.json'), JSON.stringify({ ownerToken }));
+  return active;
+}
+
+test('control locks atomically publish immutable ownership before protected work', async () => {
+  await withRoot(async (root) => {
+    const controls = join(root, '.kontour-physical-host-capacity', 'control-tickets');
+    let observed = false;
+    const metadata = {};
+    Object.defineProperty(metadata, 'repository', {
+      enumerable: true,
+      get() {
+        const active = join(controls, 'active');
+        assert.equal(lstatSync(active).isDirectory(), true);
+        assert.deepEqual(readdirSync(active), ['owner.json']);
+        assert.deepEqual(JSON.parse(readFileSync(join(active, 'owner.json'), 'utf8')), { ownerToken: OWNER_A });
+        observed = true;
+        return 'kontourai/station';
+      },
+    });
+
+    const acquired = await acquireLease(config(root), { ownerToken: OWNER_A, metadata });
+    assert.equal(observed, true);
+    assert.equal(existsSync(join(controls, 'active')), false);
+    await releaseLease(config(root), acquired.ownerToken);
+  });
+});
+
+test('the action post release reclaims a cancelled same-owner control lock and cleans its queue ticket', async () => {
   await withRoot(async (root) => {
     const waitingConfig = config(root, { capacityUnits: 1, leaseWeight: 1, timeoutMs: 5_000, pollIntervalMs: 2 });
     await provisionHost(waitingConfig);
-    await acquireLease(waitingConfig, { ownerToken: OWNER_A });
-    const waiting = acquireLease(waitingConfig, { ownerToken: OWNER_B });
-    const ticketPath = join(root, '.kontour-physical-host-capacity', 'tickets', `${OWNER_B}.json`);
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      try {
-        await access(ticketPath);
-        break;
-      } catch {
-        await new Promise((resolveSleep) => setTimeout(resolveSleep, 2));
-      }
-    }
-    await access(ticketPath);
-    assert.equal(await releaseLease(waitingConfig, OWNER_B), false);
-    await assert.rejects(waiting, /queue ticket disappeared/);
-    assert.deepEqual(await readdir(join(root, '.kontour-physical-host-capacity', 'tickets')), []);
-    await releaseLease(waitingConfig, OWNER_A);
+    const state = join(root, '.kontour-physical-host-capacity');
+    const ticket = join(state, 'tickets', `${OWNER_C}.json`);
+    await writeFile(ticket, JSON.stringify({
+      ownerToken: OWNER_C,
+      weight: 1,
+      sequence: 1,
+      acquiredAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    }));
+    const active = await publishActiveControlLock(root, OWNER_C);
+
+    const post = await execFile(process.execPath, [releaseScript], {
+      env: {
+        ...process.env,
+        STATE_PHYSICAL_HOST_CAPACITY_ROOT: root,
+        STATE_PHYSICAL_HOST_CAPACITY_HOST_ID: 'desktop-win-01',
+        STATE_PHYSICAL_HOST_CAPACITY_CAPACITY_UNITS: '1',
+        STATE_PHYSICAL_HOST_CAPACITY_LEASE_WEIGHT: '1',
+        STATE_PHYSICAL_HOST_CAPACITY_TIMEOUT_SECONDS: '5000',
+        STATE_PHYSICAL_HOST_CAPACITY_POLL_INTERVAL_MS: '2',
+        STATE_PHYSICAL_HOST_CAPACITY_OWNER_LIFETIME_SECONDS: '60',
+        STATE_PHYSICAL_HOST_CAPACITY_OWNER_TOKEN: OWNER_C,
+      },
+    });
+    assert.match(post.stdout, /lease 33333333 was already absent/);
+    assert.equal(existsSync(ticket), false);
+    assert.equal(existsSync(active), false);
   }, { provision: false });
 });
 
-test('control candidates publish atomically and a held candidate cannot be stolen', async () => {
+test('a different owner cannot steal an active control lock', async () => {
   await withRoot(async (root) => {
-    const controls = join(root, '.kontour-physical-host-capacity', 'control-tickets');
-    const held = join(controls, 'active');
-    await mkdir(held);
+    const active = await publishActiveControlLock(root, OWNER_A);
 
     let now = Date.now();
     await assert.rejects(
@@ -275,12 +316,33 @@ test('control candidates publish atomically and a held candidate cannot be stole
         now: () => now,
         sleep: async () => { now += 10_000; },
       }),
-      /automatic control-ticket stealing is disabled/,
+      /belongs to a different owner.*automatic control-ticket stealing is disabled/,
     );
-    await access(held);
-    await rm(held, { recursive: true, force: true }); // explicit operator recovery after confirming no owner is live
+    assert.deepEqual(JSON.parse(await readFile(join(active, 'owner.json'), 'utf8')), { ownerToken: OWNER_A });
+    await rm(active, { recursive: true, force: true }); // explicit operator recovery after confirming no owner is live
     const acquired = await acquireLease(config(root), { ownerToken: OWNER_B });
     assert.equal(acquired.ownerToken, OWNER_B);
+  });
+});
+
+test('a malformed active control lock fails closed', async () => {
+  await withRoot(async (root) => {
+    const controls = join(root, '.kontour-physical-host-capacity', 'control-tickets');
+    await mkdir(join(controls, 'active'));
+    await assert.rejects(
+      acquireLease(config(root), { ownerToken: OWNER_B }),
+      /Invalid active control ticket/,
+    );
+  });
+  await withRoot(async (root) => {
+    const controls = join(root, '.kontour-physical-host-capacity', 'control-tickets');
+    const replacement = join(root, 'control-ticket-replacement');
+    await mkdir(replacement);
+    await symlink(replacement, join(controls, 'active'));
+    await assert.rejects(
+      acquireLease(config(root), { ownerToken: OWNER_B }),
+      /active control-ticket entry.*real directory, not a symlink or junction/,
+    );
   });
 });
 

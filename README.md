@@ -210,11 +210,16 @@ but cannot truncate or reorder an assigned value. Lease and ticket JSON is
 written and fsynced in the private `staging/` directory before an atomic rename
 publishes the final record.
 
-Control ownership uses an atomically created `control-tickets/active` directory;
-there is no shared empty-lock publication window. It has no
-automatic stale stealing. A wedged control ticket fails closed with a typed
-diagnostic. After draining the runners and confirming no owner job is live, an
-operator must create the distinct regular
+Control ownership uses a candidate directory with an immutable owner record,
+then atomically renames it to `control-tickets/active`; there is no shared
+empty-lock publication window. The normal post step may reclaim an active lock
+only when its persisted owner token exactly matches that same job's token—for
+example, when GitHub cancelled its `acquire` process while it held control.
+Normal release atomically retires `active` before deleting it, so it does not
+create an empty ownership window while another runner is observing the lock.
+Different owners never steal automatically, and incomplete, malformed, or
+redirected active locks fail closed. After draining the runners and confirming
+no owner job is live, an operator must create the distinct regular
 `.kontour-physical-host-quiesced` file (never the permanent identity marker)
 containing exactly the host ID after draining the runners, then run the
 explicit recovery command for one record:
