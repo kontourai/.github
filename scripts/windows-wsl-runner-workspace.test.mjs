@@ -18,10 +18,14 @@ test('Windows VHD helper is parameterized, elevated, and refuses overwrite', asy
   assert.match(script, /\[string\]\$DistroName = 'Ubuntu'/);
   assert.match(script, /Assert-Administrator/);
   assert.match(script, /Refusing to overwrite existing VHD/);
-  assert.match(script, /Mount-DiskImage -ImagePath \$VhdPath -NoDriveLetter/);
+  assert.match(script, /wsl\.exe --mount \$VhdPath --vhd --bare/);
+  assert.match(script, /wsl\.exe --distribution \$DistroName --user root -- bash -lc \$WslBootstrapCommand/);
+  assert.match(script, /InstallBootTask requires WslBootstrapCommand/);
+  assert.match(script, /-Mode AttachAndBootstrap/);
+  assert.doesNotMatch(script, /Mount-DiskImage|Get-DiskImage|Set-Disk/);
   assert.match(script, /New-ScheduledTaskTrigger -AtStartup/);
   assert.match(script, /Optimize-VHD -Path \$VhdPath -Mode Full/);
-  assert.match(script, /Compaction requires -ConfirmIdle/);
+  assert.match(script, /Compaction requires -ConfirmIdle and -ConfirmDetached/);
   assert.doesNotMatch(script, /Station/i);
 });
 
@@ -63,6 +67,8 @@ test('runbook preserves the Windows-path and WSL-UUID recovery boundary', async 
 
   assert.match(text, /refuses to overwrite/i);
   assert.match(text, /mounts by the recorded ext4 UUID/i);
+  assert.match(text, /wsl\.exe --mount --vhd --bare/);
+  assert.match(text, /WslBootstrapCommand/);
   assert.match(text, /manual, destructive confirmation step/i);
   assert.match(text, /stop the runner services/i);
   assert.match(text, /Storage lifecycle hooks/);

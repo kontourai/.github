@@ -8,8 +8,9 @@ letter. It does not change a live host by itself.
 
 - The Windows script requires elevation, creates a VHD only when its path is
   absent, and refuses to overwrite an existing file.
-- Windows attaches the VHD but never initializes or formats its disk. Format it
-  once from the selected WSL distribution after confirming the disk identity.
+- Windows attaches the VHD through `wsl.exe --mount --vhd --bare`, never via a
+  Windows drive mount and never initializes or formats its disk. Format it once
+  from the selected WSL distribution after confirming the disk identity.
 - The WSL bootstrap mounts by the recorded ext4 UUID, not a volatile `/dev/sdX`
   path. It refuses an occupied mount point, a missing UUID, an invalid bind, or
   a target already mounted from somewhere else.
@@ -49,18 +50,23 @@ sudo /usr/local/sbin/bootstrap-wsl-runner-workspace.sh \
   --service example-runner.service
 ```
 
-Create the Windows startup attachment task only after the VHD has been
-formatted and the WSL bootstrap has been tested manually:
+Create the Windows startup task only after the VHD has been formatted and the
+WSL bootstrap has been tested manually. The task needs the exact single-line
+bootstrap command, including the UUID and every bind/service mapping:
 
 ```powershell
+$bootstrap = '/usr/local/sbin/bootstrap-wsl-runner-workspace.sh --uuid <ext4-uuid> --mount-root /mnt/runner-work --bind /mnt/runner-work/work:/var/lib/example-runner/work --bind /mnt/runner-work/work-2:/var/lib/example-runner/work-2 --service example-runner.service'
 .\runner-host\windows-wsl-runner-workspace.ps1 -Mode InstallBootTask `
-  -VhdPath 'C:\RunnerStorage\runner-work.vhdx' -DistroName 'Ubuntu'
+  -VhdPath 'C:\RunnerStorage\runner-work.vhdx' -DistroName 'Ubuntu' `
+  -WslBootstrapCommand $bootstrap
 ```
 
-The boot task attaches by VHD path; the Linux bootstrap finds the ext4 volume
-by UUID. To recover, stop the runner services, unmount the bind targets and
-mount root in WSL, then detach the VHD in Windows only after no process has an
-open file on it. Keep the VHD file: it is the recoverable workspace state.
+The boot task attaches the VHD through WSL, invokes the selected distribution
+as root, then the Linux bootstrap finds the ext4 volume by UUID, binds work
+paths, and starts services. A bootstrap failure fails the task and leaves
+services stopped. To recover, stop the runner services, unmount the bind targets
+and mount root in WSL, then detach the VHD in Windows only after no process has
+an open file on it. Keep the VHD file: it is the recoverable workspace state.
 
 ## Storage lifecycle hooks
 
@@ -112,7 +118,8 @@ copy of the VHD, then run from elevated Windows PowerShell:
 
 ```powershell
 .\runner-host\windows-wsl-runner-workspace.ps1 -Mode Compact `
-  -VhdPath 'C:\RunnerStorage\runner-work.vhdx' -ConfirmIdle
+  -VhdPath 'C:\RunnerStorage\runner-work.vhdx' -ConfirmIdle -ConfirmDetached
 ```
 
-`Compact` refuses an attached VHD; it does not stop services or delete files.
+`Compact` requires the operator to confirm that WSL already detached the VHD;
+it does not stop services, detach storage, or delete files.
