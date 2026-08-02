@@ -503,14 +503,23 @@ async function withControlLock(root, {
       const heldOwner = published.record;
       await controlHooks?.afterControlPublish?.(heldOwner, controlPath, published.candidatePath);
       let retired = false;
+      let operationError;
       try {
         await assertActiveControlLockInstance(controlPath, published.candidatePath, heldOwner);
         await controlHooks?.beforeControlOperation?.(heldOwner, controlPath, published.candidatePath);
         return await operation();
+      } catch (error) {
+        operationError = error;
+        throw error;
       } finally {
         try {
           retired = await retireActiveControlLock(controlTickets, heldOwner, { controlHooks, candidatePath: published.candidatePath });
           if (!retired) throw new CapacityCoordinationError(`Active control ticket at ${controlPath} changed before its owner could release it; refusing to remove another owner's lock.`);
+        } catch (cleanupError) {
+          // Preserve the original proof/operation failure. A replacement lock
+          // must remain untouched, but it must not hide why protected work
+          // was refused in the first place.
+          if (!operationError) throw cleanupError;
         } finally {
           await rm(published.candidatePath, { force: true });
           if (retired) await rm(retiredControlPath(controlTickets, heldOwner.ownerToken), { force: true });

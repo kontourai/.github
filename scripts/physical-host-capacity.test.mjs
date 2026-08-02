@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import { access, appendFile, link, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { execFile as execFileCallback } from 'node:child_process';
@@ -64,7 +64,7 @@ test('configuration rejects ambiguous capacity inputs and accepts environment co
       PHYSICAL_HOST_CAPACITY_OWNER_LIFETIME_SECONDS: '120',
     }),
     {
-      root: '/coordination',
+      root: resolve('/coordination'),
       hostId: 'desktop-win-01',
       capacityUnits: 4,
       leaseWeight: 3,
@@ -85,7 +85,7 @@ test('configuration rejects ambiguous capacity inputs and accepts environment co
       'INPUT_OWNER-LIFETIME-SECONDS': '120',
     }),
     {
-      root: '/coordination',
+      root: resolve('/coordination'),
       hostId: 'desktop-win-01',
       capacityUnits: 4,
       leaseWeight: 3,
@@ -453,6 +453,31 @@ test('a same-owner replacement with identical JSON cannot enter or release prote
     assert.equal(operations, 0);
     assert.equal(JSON.parse(await readFile(active, 'utf8')).ownerToken, OWNER_A);
     assert.equal(JSON.parse(await readFile(active, 'utf8')).lockToken.length, 36);
+  });
+});
+
+test('a same-owner post cleanup followed by a new publisher cannot enter old protected work', async () => {
+  await withRoot(async (root) => {
+    const active = join(root, '.kontour-physical-host-capacity', 'control-tickets', 'active');
+    let operations = 0;
+
+    await assert.rejects(
+      acquireLease(config(root), {
+        ownerToken: OWNER_A,
+        controlHooks: {
+          async afterControlPublish() {
+            assert.equal(await releaseLease(config(root), OWNER_A), false);
+            await publishActiveControlLock(root, OWNER_A, LOCK_B);
+          },
+          beforeControlOperation() {
+            operations += 1;
+          },
+        },
+      }),
+      /no longer references this lock instance inode|no longer identifies this lock instance|changed before its owner could release/,
+    );
+    assert.equal(operations, 0);
+    assert.equal(JSON.parse(await readFile(active, 'utf8')).lockToken, LOCK_B);
   });
 });
 
