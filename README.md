@@ -217,6 +217,8 @@ Windows and WSL observe one immutable active record with no empty-lock window.
 Native NTFS can transiently deny a just-published `active` read while another
 handle is closing; those reads retry only within the existing control deadline
 and must eventually validate a complete owner record or fail closed.
+The same deadline applies when NTFS denies publication itself and no active
+owner record appears, preventing an unbounded contention loop.
 The normal post step may reclaim an active lock only when its persisted owner
 token exactly matches that same job's token—for example, when GitHub cancelled
 its `acquire` process while it held control. Cleanup first hard-links the exact

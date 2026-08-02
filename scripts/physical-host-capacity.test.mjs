@@ -402,6 +402,34 @@ test('native Windows-style EPERM contention is accepted only after a valid activ
   });
 });
 
+test('native Windows-style EPERM publishing without active owner is deadline-bounded', async () => {
+  await withRoot(async (root) => {
+    let now = 0;
+    let sleeps = 0;
+    let attempts = 0;
+    await assert.rejects(
+      acquireLease(config(root, { timeoutMs: 10, pollIntervalMs: 1 }), {
+        ownerToken: OWNER_A,
+        now: () => now,
+        sleep: async () => {
+          sleeps += 1;
+          now += 10;
+        },
+        controlLinkOperation: async () => {
+          attempts += 1;
+          const error = new Error('EPERM persistent native sharing publish');
+          error.code = 'EPERM';
+          throw error;
+        },
+      }),
+      /Timed out publishing the capacity control ticket/,
+    );
+    assert.equal(attempts, 2);
+    assert.equal(sleeps, 1);
+    assert.equal(existsSync(join(root, '.kontour-physical-host-capacity', 'control-tickets', 'active')), false);
+  });
+});
+
 test('native Windows-style EPERM while reading active is retried, then fails closed at deadline', async () => {
   await withRoot(async (root) => {
     const active = join(root, '.kontour-physical-host-capacity', 'control-tickets', 'active');

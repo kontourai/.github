@@ -411,7 +411,9 @@ async function publishControlLock(controlTickets, ownerToken, metadata, { linkOp
       return { candidatePath, record };
     } catch (error) {
       if (['EEXIST', 'ENOTEMPTY'].includes(error.code)) return false;
-      if (['EPERM', 'EACCES'].includes(error.code)) return false;
+      // Preserve the failed-link reason. The caller must distinguish a real
+      // active owner from an NTFS sharing denial with no active entry.
+      if (['EPERM', 'EACCES'].includes(error.code)) return { accessError: error };
       throw error;
     }
   } finally {
@@ -579,15 +581,15 @@ async function withControlLock(root, {
   });
   while (true) {
     await consumeDetachedRetirementBeforePublish(controlTickets, ownerToken);
-    const published = await publishControlLock(controlTickets, ownerToken, metadata, { linkOperation });
-    if (published) {
-      const heldOwner = published.record;
-      await controlHooks?.afterControlPublish?.(heldOwner, controlPath, published.candidatePath);
+    const publication = await publishControlLock(controlTickets, ownerToken, metadata, { linkOperation });
+    if (publication?.record) {
+      const heldOwner = publication.record;
+      await controlHooks?.afterControlPublish?.(heldOwner, controlPath, publication.candidatePath);
       let retired = false;
       let operationError;
       try {
-        await assertActiveControlLockInstance(controlPath, published.candidatePath, heldOwner, { readOperation, readOwner: inspectActive });
-        await controlHooks?.beforeControlOperation?.(heldOwner, controlPath, published.candidatePath);
+        await assertActiveControlLockInstance(controlPath, publication.candidatePath, heldOwner, { readOperation, readOwner: inspectActive });
+        await controlHooks?.beforeControlOperation?.(heldOwner, controlPath, publication.candidatePath);
         return await operation();
       } catch (error) {
         operationError = error;
@@ -596,7 +598,7 @@ async function withControlLock(root, {
         try {
           retired = await retireActiveControlLock(controlTickets, heldOwner, {
             controlHooks,
-            candidatePath: published.candidatePath,
+            candidatePath: publication.candidatePath,
             readOperation,
             inspectActive,
           });
@@ -607,7 +609,7 @@ async function withControlLock(root, {
           // was refused in the first place.
           if (!operationError) throw cleanupError;
         } finally {
-          await rm(published.candidatePath, { force: true });
+          await rm(publication.candidatePath, { force: true });
           if (retired) await removeExactControlRecord(retiredControlPath(controlTickets, heldOwner.ownerToken), heldOwner);
         }
       }
@@ -618,7 +620,15 @@ async function withControlLock(root, {
     } catch (inspectionError) {
       // The owner can release between a failed publish and inspection. That
       // is a normal handoff; malformed or redirected locks fail closed.
-      if (errorCode(inspectionError) === 'ENOENT') continue;
+      if (errorCode(inspectionError) === 'ENOENT') {
+        if (publication?.accessError) {
+          if (now() >= deadline) {
+            throw new CapacityCoordinationError(`Timed out publishing the capacity control ticket at ${controlPath}; native sharing contention never produced an active owner record.`, publication.accessError);
+          }
+          await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - now())));
+        }
+        continue;
+      }
       throw inspectionError;
     }
     if (owner.ownerToken === ownerToken) {
