@@ -5,9 +5,10 @@ usage() {
   cat <<'EOF'
 Usage:
   runner-storage-health.sh probe --probe-path PATH --incident-path PATH \
-    [--timeout-seconds N] [--service SERVICE ...]
+    [--timeout-seconds N] [--maintenance-lock PATH] [--service SERVICE ...]
   runner-storage-health.sh watch --probe-path PATH --incident-path PATH \
-    [--timeout-seconds N] [--interval-seconds N] [--service SERVICE ...]
+    [--timeout-seconds N] [--interval-seconds N] [--maintenance-lock PATH] \
+    [--service SERVICE ...]
   runner-storage-health.sh contain [--probe-path PATH] [--incident-path PATH] \
     --service SERVICE [--service SERVICE ...]
   runner-storage-health.sh clear --probe-path PATH --incident-path PATH \
@@ -26,6 +27,7 @@ mode="${1:-}"
 [[ -n $mode ]] || { usage >&2; exit 2; }
 shift || true
 probe_path=''; incident_path=''; timeout_seconds=30; interval_seconds=60
+maintenance_lock='/run/lock/kontour-runner-host-maintenance.lock'
 declare -a services=()
 while (($#)); do
   case "$1" in
@@ -33,6 +35,7 @@ while (($#)); do
     --incident-path) incident_path="${2:?missing incident path}"; shift 2 ;;
     --timeout-seconds) timeout_seconds="${2:?missing timeout seconds}"; shift 2 ;;
     --interval-seconds) interval_seconds="${2:?missing interval seconds}"; shift 2 ;;
+    --maintenance-lock) maintenance_lock="${2:?missing maintenance lock path}"; shift 2 ;;
     --service) services+=("${2:?missing service}"); shift 2 ;;
     --help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
@@ -50,6 +53,9 @@ require_paths() {
   command -v systemctl >/dev/null || { echo 'systemctl is required.' >&2; exit 1; }
   [[ $probe_path == /* && $probe_path != *$'\n'* && -d $probe_path && $(realpath -e -- "$probe_path") == "$probe_path" ]] || { echo 'probe-path must be an existing canonical absolute directory.' >&2; exit 2; }
   [[ $incident_path == /* && $incident_path != *$'\n'* && $(realpath -m -- "$incident_path") == "$incident_path" ]] || { echo 'incident-path must be a canonical absolute path.' >&2; exit 2; }
+  [[ $maintenance_lock == /* && $maintenance_lock != *$'\n'* && $(realpath -m -- "$maintenance_lock") == "$maintenance_lock" ]] || { echo 'maintenance-lock must be a canonical absolute path.' >&2; exit 2; }
+  [[ -d $(dirname "$maintenance_lock") ]] || { echo 'maintenance-lock parent must exist.' >&2; exit 2; }
+  command -v flock >/dev/null || { echo 'flock is required.' >&2; exit 1; }
   require_positive_integer "$timeout_seconds" timeout-seconds
   require_positive_integer "$interval_seconds" interval-seconds
   for service in "${services[@]}"; do require_service_name "$service"; done
@@ -164,6 +170,14 @@ perform_probe() {
   return 1
 }
 
+perform_coordinated_probe() {
+  # Coordinate only the disk operation. A watch process must release this lock
+  # while sleeping so bounded idle maintenance can run between probes.
+  exec 8>"$maintenance_lock"
+  flock -s 8
+  perform_probe
+}
+
 marker_exists() { [[ -e $incident_path || -L $incident_path ]]; }
 marker_is_regular() { [[ -f $incident_path && ! -L $incident_path ]]; }
 
@@ -230,13 +244,13 @@ case "$mode" in
   probe)
     require_paths
     if refuse_marker; then exit 1; fi
-    perform_probe
+    perform_coordinated_probe
     ;;
   watch)
     require_paths
     while :; do
       if refuse_marker; then exit 1; fi
-      perform_probe || exit 1
+      perform_coordinated_probe || exit 1
       sleep "$interval_seconds"
     done
     ;;
@@ -270,7 +284,7 @@ case "$mode" in
     fi
     marker_path="$incident_path"
     incident_path="${incident_path}.clear-attempt"
-    if ! perform_probe; then
+    if ! perform_coordinated_probe; then
       rm -f -- "$incident_path"
       incident_path="$marker_path"
       echo "Recovery probe failed; existing incident remains in force: $marker_path" >&2

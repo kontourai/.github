@@ -186,6 +186,63 @@ Only after that command succeeds may you re-enable and start the Windows task.
 If its probe still fails or times out, it recreates/retains the marker and
 keeps services masked.
 
+## Bounded Docker build-cache maintenance
+
+Project jobs own their image tags and must remove those tags when their smoke
+tests finish. The host must not guess which project images, volumes, containers,
+dependency caches, or semantic receipts are disposable. Its only automatic
+reclamation is inactive Docker **build cache**, bounded by a reserved-cache
+floor and filesystem headroom thresholds.
+
+Install the generic maintenance command and optional systemd timer with every
+runner listener service on the Docker host declared explicitly:
+
+```sh
+sudo ./runner-host/install-idle-runner-docker-maintenance.sh \
+  --maintenance-script ./runner-host/idle-runner-docker-maintenance.sh \
+  --headroom-path / \
+  --service actions.runner.example-linux.service \
+  --service actions.runner.example-linux-2.service \
+  --minimum-free-gb 20 --minimum-free-percent 15 \
+  --reserved-space 20GB --on-calendar '*-*-* 03:30:00' \
+  --enable-timer
+```
+
+The oneshot takes `/run/lock/kontour-runner-host-maintenance.lock`
+exclusively and non-blockingly. Each storage-health probe takes the same lock
+shared only while it writes and fsyncs its probe file. A scheduled run therefore
+skips cleanly if a probe is in progress. After taking the lock, maintenance
+requires every declared service to be known and explicitly `inactive`, no
+`Runner.Worker` or `Runner.Listener`, no running container, and no local Docker
+build client. It rechecks these conditions on every invocation. Busy and
+headroom-sufficient runs succeed as explicit skips; they do not queue behind a
+job or stack another prune.
+The timer never drains or restarts a listener on its own: it becomes mutating
+only during an independently coordinated maintenance window in which all
+declared runner services are already stopped. At ordinary nightly times it is
+a cheap, explicit `skipped_busy` check. This preserves the no-job race boundary
+instead of guessing that an active listener will remain idle.
+
+Inspect without mutation:
+
+```sh
+sudo /usr/local/sbin/idle-runner-docker-maintenance.sh status \
+  --headroom-path / --service actions.runner.example-linux.service
+sudo /usr/local/sbin/idle-runner-docker-maintenance.sh dry-run \
+  --headroom-path / --service actions.runner.example-linux.service
+```
+
+Each completed check atomically replaces a small receipt under
+`/var/lib/kontour-runner-storage/` with disk bytes before and after. Prune output
+is truncated to the last 200 lines under `/var/log`; normal stdout is one line.
+To drain or roll back the scheduler, run
+`systemctl disable --now kontour-runner-docker-maintenance.timer`. Disabling the
+timer cannot interrupt a job because the service never prunes while a listener
+or worker is active. If a maintenance invocation itself must be stopped, first
+inspect `systemctl status kontour-runner-docker-maintenance.service` and Docker
+state; Docker's build-cache prune is idempotent, retains the configured floor,
+and does not delete images.
+
 ## Recommended topology
 
 Use one SSD-backed VHD per runner listener. Give each invocation its own VHD
