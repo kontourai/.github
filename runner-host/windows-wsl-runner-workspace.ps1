@@ -82,8 +82,36 @@ function Invoke-WslKeepAlive {
   # `tail -f /dev/null` is intentionally blocking: Scheduled Tasks owns this
   # process so WSL cannot immediately idle-shutdown after the bootstrap exits.
   & wsl.exe --distribution $DistroName --user root --exec /bin/sh -lc 'exec tail -f /dev/null'
-  if ($LASTEXITCODE -ne 0) {
-    throw "WSL keepalive exited unexpectedly for distribution $DistroName."
+  throw "WSL keepalive returned unexpectedly for distribution $DistroName with exit code $LASTEXITCODE."
+}
+
+function Set-AndAssertProtectedAcl {
+  param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][bool]$IsDirectory)
+  $administrators = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid, $null)
+  $system = [Security.Principal.SecurityIdentifier]::new([Security.Principal.WellKnownSidType]::LocalSystemSid, $null)
+  $inheritance = if ($IsDirectory) { [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit } else { [Security.AccessControl.InheritanceFlags]::None }
+  $acl = Get-Acl -LiteralPath $Path
+  $acl.SetAccessRuleProtection($true, $false)
+  foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleAll($rule) }
+  $acl.SetOwner($administrators)
+  $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($administrators, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+  $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+  Set-Acl -LiteralPath $Path -AclObject $acl
+
+  $verifiedAcl = Get-Acl -LiteralPath $Path
+  $owner = $verifiedAcl.GetOwner([Security.Principal.SecurityIdentifier])
+  if (-not $verifiedAcl.AreAccessRulesProtected -or $owner.Value -ne $administrators.Value) {
+    throw "Protected task entrypoint ACL verification failed for $Path."
+  }
+  $writeSids = $verifiedAcl.Access | Where-Object {
+    $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
+    ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write) -ne 0
+  } | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
+  if ($administrators.Value -notin $writeSids -or $system.Value -notin $writeSids) {
+    throw "Protected task entrypoint is missing administrator or SYSTEM write access: $Path."
+  }
+  if ($writeSids | Where-Object { $_ -notin @($administrators.Value, $system.Value) }) {
+    throw "Protected task entrypoint has unexpected write access: $Path."
   }
 }
 
@@ -91,62 +119,46 @@ function Install-ProtectedTaskEntrypoint {
   if ([string]::IsNullOrWhiteSpace($PSCommandPath) -or -not (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)) {
     throw 'InstallBootTask must be run from a saved script file so it can install a protected entrypoint copy.'
   }
-  if (-not [IO.Path]::IsPathRooted($TaskEntrypointPath)) {
-    throw 'TaskEntrypointPath must be an absolute Windows path.'
+  $programData = Get-Item -LiteralPath $env:ProgramData -Force
+  if ($programData.PSIsContainer -ne $true -or ($programData.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+    throw 'ProgramData must be a real, non-reparse directory.'
   }
-  if ((Test-Path -LiteralPath $TaskEntrypointPath) -and (Get-Item -LiteralPath $TaskEntrypointPath).PSIsContainer) {
-    throw "TaskEntrypointPath is a directory: $TaskEntrypointPath"
+  $programDataPath = [IO.Path]::GetFullPath($programData.FullName).TrimEnd('\')
+  $entrypointPath = [IO.Path]::GetFullPath($TaskEntrypointPath)
+  if ($TaskEntrypointPath -ne $entrypointPath) {
+    throw 'TaskEntrypointPath must be a canonical Windows path without traversal.'
   }
-  if ((Test-Path -LiteralPath $TaskEntrypointPath) -and ((Get-Item -LiteralPath $TaskEntrypointPath).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-    throw "TaskEntrypointPath may not be a reparse point: $TaskEntrypointPath"
+  if (-not $entrypointPath.StartsWith("$programDataPath\", [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'TaskEntrypointPath must be canonically under the real ProgramData directory.'
   }
-  $entrypointDirectory = Split-Path -Parent $TaskEntrypointPath
-  if ([string]::IsNullOrWhiteSpace($entrypointDirectory)) {
-    throw 'TaskEntrypointPath must include a parent directory.'
+  $relativePath = $entrypointPath.Substring($programDataPath.Length + 1)
+  $segments = $relativePath.Split('\')
+  if ($segments.Count -lt 2 -or ($segments | Where-Object { [string]::IsNullOrWhiteSpace($_) -or $_ -in @('.', '..') })) {
+    throw 'TaskEntrypointPath must name a file below a protected ProgramData subdirectory.'
   }
-  New-Item -ItemType Directory -Path $entrypointDirectory -Force | Out-Null
-  if (((Get-Item -LiteralPath $entrypointDirectory).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-    throw "TaskEntrypointPath parent may not be a reparse point: $entrypointDirectory"
-  }
-  Copy-Item -LiteralPath $PSCommandPath -Destination $TaskEntrypointPath -Force
-
-  $administrators = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
-  $system = [Security.Principal.SecurityIdentifier]::new('S-1-5-18')
-  $inherit = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
-  foreach ($protectedPath in @($entrypointDirectory, $TaskEntrypointPath)) {
-    $inheritance = if ((Get-Item -LiteralPath $protectedPath).PSIsContainer) { $inherit } else { [Security.AccessControl.InheritanceFlags]::None }
-    $acl = Get-Acl -LiteralPath $protectedPath
-    $acl.SetAccessRuleProtection($true, $false)
-    foreach ($rule in @($acl.Access)) { [void]$acl.RemoveAccessRuleAll($rule) }
-    $acl.SetOwner($administrators)
-    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($administrators, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
-    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($system, [Security.AccessControl.FileSystemRights]::FullControl, $inheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
-    Set-Acl -LiteralPath $protectedPath -AclObject $acl
-  }
-
-  foreach ($protectedPath in @($entrypointDirectory, $TaskEntrypointPath)) {
-    $verifiedAcl = Get-Acl -LiteralPath $protectedPath
-    $owner = [Security.Principal.SecurityIdentifier]::new($verifiedAcl.Owner)
-    if (-not $verifiedAcl.AreAccessRulesProtected -or $owner.Value -ne $administrators.Value) {
-      throw "Protected task entrypoint ACL verification failed for $protectedPath."
+  $sourceHash = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
+  $currentDirectory = $programDataPath
+  foreach ($segment in $segments[0..($segments.Count - 2)]) {
+    $currentDirectory = Join-Path $currentDirectory $segment
+    if (-not (Test-Path -LiteralPath $currentDirectory)) { New-Item -ItemType Directory -Path $currentDirectory | Out-Null }
+    $directoryItem = Get-Item -LiteralPath $currentDirectory -Force
+    if (-not $directoryItem.PSIsContainer -or ($directoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or [IO.Path]::GetFullPath($directoryItem.FullName) -ne $currentDirectory) {
+      throw "ProgramData task-entrypoint ancestry is unsafe: $currentDirectory"
     }
-    $writeSids = $verifiedAcl.Access | Where-Object {
-      $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
-      ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write) -ne 0
-    } | ForEach-Object { $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value }
-    if ($administrators.Value -notin $writeSids -or $system.Value -notin $writeSids) {
-      throw "Protected task entrypoint is missing administrator or SYSTEM write access: $protectedPath."
-    }
-    $unexpectedWrite = $verifiedAcl.Access | Where-Object {
-      $_.AccessControlType -eq [Security.AccessControl.AccessControlType]::Allow -and
-      $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]) -notin @($administrators, $system) -and
-      ($_.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write) -ne 0
-    }
-    if ($unexpectedWrite) {
-      throw "Protected task entrypoint has unexpected write access: $protectedPath."
-    }
+    Set-AndAssertProtectedAcl -Path $currentDirectory -IsDirectory $true
   }
-  return $TaskEntrypointPath
+  if ((Test-Path -LiteralPath $entrypointPath) -and ((Get-Item -LiteralPath $entrypointPath -Force).PSIsContainer -or ((Get-Item -LiteralPath $entrypointPath -Force).Attributes -band [IO.FileAttributes]::ReparsePoint))) {
+    throw "TaskEntrypointPath is not a regular file target: $entrypointPath"
+  }
+  Copy-Item -LiteralPath $PSCommandPath -Destination $entrypointPath -Force
+  $entrypointItem = Get-Item -LiteralPath $entrypointPath -Force
+  if ($entrypointItem.PSIsContainer -or ($entrypointItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -or [IO.Path]::GetFullPath($entrypointItem.FullName) -ne $entrypointPath) {
+    throw "Protected task entrypoint identity verification failed: $entrypointPath"
+  }
+  Set-AndAssertProtectedAcl -Path $entrypointPath -IsDirectory $false
+  $installedHash = (Get-FileHash -LiteralPath $entrypointPath -Algorithm SHA256).Hash
+  if ($installedHash -ne $sourceHash) { throw "Protected task entrypoint hash verification failed: $entrypointPath" }
+  return $entrypointPath
 }
 
 Assert-Administrator

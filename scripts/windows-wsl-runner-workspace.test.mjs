@@ -33,11 +33,17 @@ test('Windows VHD helper is parameterized, elevated, and refuses overwrite', asy
   assert.match(script, /Attach-WorkspaceVhd -AllowAlreadyAttached/);
   assert.match(script, /UUID bootstrap validated it before services were started/);
   assert.match(script, /exec tail -f \/dev\/null/);
+  assert.match(script, /WSL keepalive returned unexpectedly[\s\S]*exit code \$LASTEXITCODE/);
   assert.match(script, /New-ScheduledTaskSettingsSet -ExecutionTimeLimit \(New-TimeSpan -Seconds 0\) -RestartCount 3 -RestartInterval \(New-TimeSpan -Minutes 1\) -MultipleInstances IgnoreNew/);
   assert.match(script, /Install-ProtectedTaskEntrypoint/);
   assert.match(script, /TaskEntrypointPath = "\$env:ProgramData\\Kontour\\runner-host\\windows-wsl-runner-workspace\.ps1"/);
   assert.match(script, /SetAccessRuleProtection\(\$true, \$false\)/);
-  assert.match(script, /TaskEntrypointPath may not be a reparse point/);
+  assert.match(script, /ProgramData task-entrypoint ancestry is unsafe/);
+  assert.match(script, /TaskEntrypointPath must be canonically under the real ProgramData directory/);
+  assert.match(script, /TaskEntrypointPath must be a canonical Windows path without traversal/);
+  assert.match(script, /GetOwner\(\[Security\.Principal\.SecurityIdentifier\]\)/);
+  assert.match(script, /Protected task entrypoint identity verification failed/);
+  assert.match(script, /Protected task entrypoint hash verification failed/);
   assert.match(script, /Protected task entrypoint ACL verification failed/);
   assert.match(script, /missing administrator or SYSTEM write access/);
   assert.doesNotMatch(script, /Mount-DiskImage|Get-DiskImage|Set-Disk/);
@@ -74,11 +80,13 @@ test('storage hooks fail before job steps, retain bounded usage, and clean only 
   assert.match(installer, /ACTIONS_RUNNER_HOOK_JOB_STARTED/);
   assert.match(installer, /ACTIONS_RUNNER_HOOK_JOB_COMPLETED/);
   assert.match(idle, /begin --confirm-idle/);
+  assert.match(idle, /--uuid UUID --mount-root PATH/);
+  assert.match(idle, /--bind SOURCE:TARGET/);
   assert.match(idle, /end --confirm-drain-end/);
   assert.match(idle, /drain-state must be canonical and may not traverse symlinks/);
   assert.match(idle, /systemctl mask "\$service"/);
   assert.match(idle, /systemctl unmask "\$service"/);
-  assert.match(idle, /Recovery: keep the VHD attached/);
+  assert.match(idle, /all declared services were re-masked/);
   assert.match(idle, /Trim failed\. Keep services masked/);
   assert.match(idle, /unknown service unit/);
   assert.match(idle, /service is not explicitly inactive/);
@@ -87,14 +95,17 @@ test('storage hooks fail before job steps, retain bounded usage, and clean only 
   assert.doesNotMatch(hook + installer + idle, /Station/i);
 });
 
-test('maintenance drain persists masks through begin/end and retains recovery state on unmask failure', async () => {
+test('maintenance drain validates recorded identities and re-masks every service after a partial unmask failure', async () => {
   const fixtureRoot = await mkdtemp(join(tmpdir(), 'kontour-runner-drain-'));
   const bin = join(fixtureRoot, 'bin');
   const mountRoot = join(fixtureRoot, 'mount');
+  const sourcePath = join(mountRoot, 'work');
+  const targetPath = join(fixtureRoot, 'target');
   const stateRoot = join(fixtureRoot, 'state');
   const drainState = join(fixtureRoot, 'drain.state');
   await mkdir(bin, { recursive: true });
-  await mkdir(mountRoot, { recursive: true });
+  await mkdir(sourcePath, { recursive: true });
+  await mkdir(targetPath, { recursive: true });
   await mkdir(stateRoot, { recursive: true });
   const writeExecutable = async (name, contents) => {
     const path = join(bin, name);
@@ -104,41 +115,47 @@ test('maintenance drain persists masks through begin/end and retains recovery st
   await writeExecutable('realpath', '#!/usr/bin/env bash\n[[ $1 == -m || $1 == -e ]] && shift\n[[ $1 == -- ]] && shift\nprintf "%s\\n" "$1"\n');
   await writeExecutable('systemctl', `#!/usr/bin/env bash
 set -euo pipefail
+service="\${!#}"
 case "$1" in
   show)
     case "$2" in
       --property=LoadState) printf 'loaded\\n' ;;
-      --property=UnitFileState) [[ -f "$FAKE_STATE/masked" ]] && printf 'masked\\n' || printf 'disabled\\n' ;;
+      --property=UnitFileState) [[ -f "$FAKE_STATE/masked-$service" ]] && printf 'masked\\n' || printf 'disabled\\n' ;;
     esac
     ;;
   is-active) printf 'inactive\\n'; exit 3 ;;
-  mask) : > "$FAKE_STATE/masked" ;;
-  unmask) [[ "\${FAKE_UNMASK_FAIL:-}" != yes ]] || exit 1; rm -f "$FAKE_STATE/masked" ;;
+  mask) : > "$FAKE_STATE/masked-$service" ;;
+  unmask) [[ "\${FAKE_UNMASK_FAIL_SERVICE:-}" != "$service" ]] || exit 1; rm -f "$FAKE_STATE/masked-$service" ;;
 esac
 `);
+  await writeExecutable('findmnt', '#!/usr/bin/env bash\ncase "$2" in UUID) printf "%s\\n" "$FAKE_UUID" ;; FSROOT) printf "/work\\n" ;; esac\n');
   await writeExecutable('mountpoint', '#!/usr/bin/env bash\nexit 0\n');
   await writeExecutable('pgrep', '#!/usr/bin/env bash\nexit 1\n');
   await writeExecutable('fstrim', '#!/usr/bin/env bash\nprintf "trimmed %s\\n" "$*"\n');
-  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_STATE: stateRoot };
+  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_STATE: stateRoot, FAKE_UUID: '11111111-1111-1111-1111-111111111111' };
 
   try {
-    await execFile(maintenance, ['begin', '--confirm-idle', '--mount-root', mountRoot, '--drain-state', drainState, '--service', 'fixture-runner.service'], { env });
+    await execFile(maintenance, ['begin', '--confirm-idle', '--uuid', env.FAKE_UUID, '--mount-root', mountRoot, '--bind', `${sourcePath}:${targetPath}`, '--drain-state', drainState, '--service', 'fixture-a.service', '--service', 'fixture-b.service'], { env });
     await assert.doesNotReject(() => accessFile(drainState));
-    await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked')));
+    await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked-fixture-a.service')));
+    await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked-fixture-b.service')));
 
     let failure;
     try {
-      await execFile(maintenance, ['end', '--confirm-drain-end', '--drain-state', drainState], { env: { ...env, FAKE_UNMASK_FAIL: 'yes' } });
+      await execFile(maintenance, ['end', '--confirm-drain-end', '--drain-state', drainState], { env: { ...env, FAKE_UNMASK_FAIL_SERVICE: 'fixture-b.service' } });
     } catch (error) {
       failure = error;
     }
     assert.ok(failure, 'end must fail if persistent masks cannot be removed');
-    assert.match(failure.stderr, /Recovery: keep the VHD attached/);
+    assert.match(failure.stderr, /all declared services were re-masked/);
     await assert.doesNotReject(() => accessFile(drainState));
+    await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked-fixture-a.service')));
+    await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked-fixture-b.service')));
 
     await execFile(maintenance, ['end', '--confirm-drain-end', '--drain-state', drainState], { env });
     await assert.rejects(() => accessFile(drainState));
-    await assert.rejects(() => accessFile(join(stateRoot, 'masked')));
+    await assert.rejects(() => accessFile(join(stateRoot, 'masked-fixture-a.service')));
+    await assert.rejects(() => accessFile(join(stateRoot, 'masked-fixture-b.service')));
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true });
   }
@@ -173,9 +190,12 @@ test('runbook preserves the Windows-path and WSL-UUID recovery boundary', async 
   assert.match(text, /WslBootstrapCommand/);
   assert.match(text, /WSL-owning Windows user/i);
   assert.match(text, /logon trigger is authoritative/i);
-  assert.match(text, /administrator-owned, ACL-verified/i);
+  assert.match(text, /canonical, non-reparse `ProgramData` ancestry/i);
+  assert.match(text, /SHA-256/i);
   assert.match(text, /no execution-time limit/i);
   assert.match(text, /keeps WSL alive with a blocking/i);
+  assert.match(text, /Stop-ScheduledTask -TaskName \$taskName/);
+  assert.match(text, /Task did not stop; do not detach the VHD/i);
   assert.match(text, /UUID and filesystem root/i);
   assert.match(text, /manual, destructive confirmation step/i);
   assert.match(text, /stop the runner\s+services/i);

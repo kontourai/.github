@@ -71,9 +71,10 @@ registrations are per Windows user, so the installer checks that this user can
 enumerate `DistroName` before it creates the task. The task runs as that
 interactive user at highest run level and has both boot and logon triggers; it
 cannot run headlessly as `SYSTEM` or another Windows user. The installer copies
-the entrypoint to an administrator-owned, ACL-verified location under
-`ProgramData` before registering it, so the highest task never points at this
-checkout. The task has no execution-time limit, keeps WSL alive with a blocking
+the entrypoint through a canonical, non-reparse `ProgramData` ancestry, hardens
+each new parent top-down, and verifies the protected file identity and SHA-256
+before registering it, so the highest task never points at this checkout. The
+task has no execution-time limit, keeps WSL alive with a blocking
 process, retries failures three times at one-minute intervals, and ignores a
 second simultaneous trigger. The logon trigger is authoritative: a boot trigger
 only runs when Windows has a usable token for that user. If boot and logon race,
@@ -134,24 +135,36 @@ bootstrap, then stop every runner service and confirm there is no
 `Runner.Worker` or `Runner.Listener`. Begin a persisted drain:
 
 ```powershell
-Disable-ScheduledTask -TaskName 'Kontour WSL runner workspace VHD attach'
+$taskName = 'Kontour WSL runner workspace VHD attach'
+Disable-ScheduledTask -TaskName $taskName
+Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+$deadline = (Get-Date).AddSeconds(30)
+do {
+  $state = (Get-ScheduledTask -TaskName $taskName).State
+  if ($state -ne 'Running') { break }
+  Start-Sleep -Seconds 1
+} while ((Get-Date) -lt $deadline)
+if ($state -eq 'Running') { throw "Task did not stop; do not detach the VHD: $taskName" }
 ```
 
 ```sh
 sudo ./runner-host/idle-runner-storage-maintenance.sh \
-  begin --confirm-idle --mount-root /mnt/runner-work \
+  begin --confirm-idle --uuid <ext4-uuid> --mount-root /mnt/runner-work \
+  --bind /mnt/runner-work/work:/var/lib/example-runner/work \
+  --bind /mnt/runner-work/work-2:/var/lib/example-runner/work-2 \
   --drain-state /var/lib/example-runner/vhd-maintenance.drain \
   --service example-runner-a.service --service example-runner-b.service
 ```
 
-It rejects unknown, externally masked, or non-inactive service units, masks the
-declared units persistently, rechecks both processes, and only then issues
-`fstrim`. Keep that drain state while you unmount the bind targets and mount
-root in WSL, detach and compact the VHD, then reattach it. Restore the UUID
-mount and bindings with the normal bootstrap command plus `--no-start-services`
-(the persistent masks deliberately prevent it from starting runners during the
-drain). To compact the dynamic VHD, retain a backup or copy first, then run
-from elevated Windows PowerShell:
+It records the UUID and UUID+filesystem-root identity of every bind, rejects
+unknown, externally masked, or non-inactive service units, masks the declared
+units persistently, rechecks both processes, and only then issues `fstrim`.
+Only after the task stop poll succeeds may you unmount the bind targets and
+mount root in WSL, then detach and compact the VHD. Keep the drain state through
+reattach. Restore the UUID mount and bindings with the normal bootstrap command
+plus `--no-start-services` (the persistent masks deliberately prevent it from
+starting runners during the drain). To compact the dynamic VHD, retain a backup
+or copy first, then run from elevated Windows PowerShell:
 
 ```powershell
 .\runner-host\windows-wsl-runner-workspace.ps1 -Mode Compact `
@@ -168,8 +181,10 @@ sudo ./runner-host/idle-runner-storage-maintenance.sh \
   --drain-state /var/lib/example-runner/vhd-maintenance.drain
 ```
 
-If unmasking fails, `end` exits nonzero, keeps the drain state, and prints the
-exact recovery command. Re-enable the Windows task only after `end` succeeds:
+`end` validates the recorded UUID and bind identities before removing a mask.
+If any unmask fails, it re-masks every declared service, exits nonzero, keeps
+the drain state, and prints the exact recovery command. Re-enable the Windows
+task only after `end` succeeds:
 
 ```powershell
 Enable-ScheduledTask -TaskName 'Kontour WSL runner workspace VHD attach'
