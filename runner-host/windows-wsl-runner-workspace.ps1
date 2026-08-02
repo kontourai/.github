@@ -19,6 +19,8 @@ param(
 
   [string]$WslBootstrapCommand,
 
+  [string]$WslHealthCommand,
+
   [ValidateNotNullOrEmpty()]
   [string]$BootTaskName = 'Kontour WSL runner workspace VHD attach',
 
@@ -79,9 +81,12 @@ function Invoke-WslBootstrap {
 }
 
 function Invoke-WslKeepAlive {
+  if ([string]::IsNullOrWhiteSpace($WslHealthCommand) -or $WslHealthCommand.Contains("`n") -or $WslHealthCommand.Contains("`r") -or $WslHealthCommand -notmatch 'runner-storage-health\.sh\s+watch' -or $WslHealthCommand -notmatch '--probe-path\s+' -or $WslHealthCommand -notmatch '--incident-path\s+' -or $WslHealthCommand -notmatch '--service\s+') {
+    throw 'AttachBootstrapAndKeepAlive requires a single-line WslHealthCommand that runs runner-storage-health.sh watch with probe, incident, and service arguments.'
+  }
   # `tail -f /dev/null` is intentionally blocking: Scheduled Tasks owns this
-  # process so WSL cannot immediately idle-shutdown after the bootstrap exits.
-  & wsl.exe --distribution $DistroName --user root --exec /bin/sh -lc 'exec tail -f /dev/null'
+  # process while the health watcher continuously probes runner storage.
+  & wsl.exe --distribution $DistroName --user root -- bash -lc $WslHealthCommand
   throw "WSL keepalive returned unexpectedly for distribution $DistroName with exit code $LASTEXITCODE."
 }
 
@@ -198,6 +203,9 @@ switch ($Mode) {
     if ([string]::IsNullOrWhiteSpace($WslBootstrapCommand)) {
       throw 'InstallBootTask requires WslBootstrapCommand so every boot mounts by UUID and starts runner services.'
     }
+    if ([string]::IsNullOrWhiteSpace($WslHealthCommand)) {
+      throw 'InstallBootTask requires WslHealthCommand so the blocking WSL process periodically probes storage and fails closed.'
+    }
     $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     if ($WslWindowsUser -ne $currentUser) {
       throw "Run InstallBootTask elevated as the WSL-owning user $WslWindowsUser; the current user $currentUser cannot safely validate another user's distro registration."
@@ -213,7 +221,8 @@ switch ($Mode) {
     $quotedDistro = & $quote $DistroName
     $quotedUser = & $quote $WslWindowsUser
     $quotedBootstrap = & $quote $WslBootstrapCommand
-    $command = "& $quotedScript -Mode AttachBootstrapAndKeepAlive -VhdPath $quotedVhd -DistroName $quotedDistro -WslWindowsUser $quotedUser -WslBootstrapCommand $quotedBootstrap"
+    $quotedHealth = & $quote $WslHealthCommand
+    $command = "& $quotedScript -Mode AttachBootstrapAndKeepAlive -VhdPath $quotedVhd -DistroName $quotedDistro -WslWindowsUser $quotedUser -WslBootstrapCommand $quotedBootstrap -WslHealthCommand $quotedHealth"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
     $bootTrigger = New-ScheduledTaskTrigger -AtStartup

@@ -22,6 +22,10 @@ letter. It does not change a live host by itself.
   distribution. Its protected copy is installed under `ProgramData`, and it
   keeps a blocking WSL process open after bootstrapping so the distribution
   remains available for the runner services.
+- Every runner listener starts only after a bounded same-filesystem 4 KiB
+  write+fsync probe succeeds. A failed or timed-out probe persists an incident
+  marker outside the VHD and masks its runner services until an operator runs a
+  verified clear command.
 
 ## One-time setup
 
@@ -42,28 +46,37 @@ sudo mkfs.ext4 /dev/<new-disk>
 sudo blkid /dev/<new-disk> # record the UUID
 ```
 
-Install `bootstrap-wsl-runner-workspace.sh` on the distribution and make its
-systemd unit run before the runner services. Supply the UUID, a mount root, and
-one binding for every runner work path. For example, the sources are directories
-inside the VHD mount and the targets are existing runner work paths:
+Install both `bootstrap-wsl-runner-workspace.sh` and
+`runner-storage-health.sh` on the distribution (for example under
+`/usr/local/sbin`) and make the bootstrap systemd unit run before the runner
+services. Supply the UUID, a mount root, and one binding for every runner work
+path. For example, the sources are directories inside the VHD mount and the
+targets are existing runner work paths:
 
 ```sh
 sudo /usr/local/sbin/bootstrap-wsl-runner-workspace.sh \
   --uuid <ext4-uuid> --mount-root /mnt/runner-work \
   --bind /mnt/runner-work/work:/var/lib/example-runner/work \
   --bind /mnt/runner-work/work-2:/var/lib/example-runner/work-2 \
+  --health-script /usr/local/sbin/runner-storage-health.sh \
+  --health-incident-path /var/lib/kontour-runner-storage/runner-work.incident \
+  --health-timeout-seconds 30 \
   --service example-runner.service
 ```
 
 Create the Windows startup task only after the VHD has been formatted and the
 WSL bootstrap has been tested manually. The task needs the exact single-line
-bootstrap command, including the UUID and every bind/service mapping:
+bootstrap command plus a health watcher command. The watcher is the blocking
+WSL process; it checks the same filesystem every 60 seconds and exits after
+masking services on any health incident:
 
 ```powershell
-$bootstrap = '/usr/local/sbin/bootstrap-wsl-runner-workspace.sh --uuid <ext4-uuid> --mount-root /mnt/runner-work --bind /mnt/runner-work/work:/var/lib/example-runner/work --bind /mnt/runner-work/work-2:/var/lib/example-runner/work-2 --service example-runner.service'
+$bootstrap = '/usr/local/sbin/bootstrap-wsl-runner-workspace.sh --uuid <ext4-uuid> --mount-root /mnt/runner-work --bind /mnt/runner-work/work:/var/lib/example-runner/work --bind /mnt/runner-work/work-2:/var/lib/example-runner/work-2 --health-script /usr/local/sbin/runner-storage-health.sh --health-incident-path /var/lib/kontour-runner-storage/runner-work.incident --health-timeout-seconds 30 --service example-runner.service'
+$health = '/usr/local/sbin/runner-storage-health.sh watch --probe-path /mnt/runner-work --incident-path /var/lib/kontour-runner-storage/runner-work.incident --timeout-seconds 30 --interval-seconds 60 --service example-runner.service'
 .\runner-host\windows-wsl-runner-workspace.ps1 -Mode InstallBootTask `
   -VhdPath 'C:\RunnerStorage\runner-work.vhdx' -DistroName 'Ubuntu' `
-  -WslWindowsUser 'EXAMPLE\runner-owner' -WslBootstrapCommand $bootstrap
+  -WslWindowsUser 'EXAMPLE\runner-owner' -WslBootstrapCommand $bootstrap `
+  -WslHealthCommand $health
 ```
 
 Run that command elevated as the WSL-owning Windows user. WSL distribution
@@ -122,6 +135,36 @@ provisions a dedicated new log directory with that identity, and verifies that
 the service user can write both the directory and log before generating hooks.
 For an existing log directory or log it validates writability without changing
 ownership. It intentionally does not edit or restart a runner service.
+
+## Storage health incident recovery
+
+An incident marker means the automatic task and bootstrap will keep runners
+masked; do not delete it or start services manually. First use the maintenance
+drain described below, detach the VHD, and run an offline `fsck.ext4 -f` on the
+exact VHD filesystem from a trusted Linux recovery environment. Reattach the
+VHD, restore its UUID mount and bindings with `--no-start-services`, and run
+the maintenance `end` command to verify the recorded bind identities. Then run
+a verified clear. It performs another write+fsync probe before unmasking, and
+it does not start services:
+
+```sh
+sudo /usr/local/sbin/runner-storage-health.sh clear \
+  --probe-path /mnt/runner-work \
+  --incident-path /var/lib/kontour-runner-storage/runner-work.incident \
+  --timeout-seconds 30 --service example-runner.service
+```
+
+Only after that command succeeds may you re-enable and start the Windows task.
+If its probe still fails or times out, it recreates/retains the marker and
+keeps services masked.
+
+## Recommended topology
+
+Use one SSD-backed VHD per runner listener. Give each invocation its own VHD
+path, UUID, mount root, incident path, service name, and scheduled task name.
+This isolates a storage incident and offline repair to one runner. The kit also
+supports multiple independent invocations on a host; it does not migrate an
+existing shared VHD automatically.
 
 If a runner creates disposable per-job scratch data outside its normal work
 path, opt into cleanup only with both `--ephemeral-root` and `--job-id`. The

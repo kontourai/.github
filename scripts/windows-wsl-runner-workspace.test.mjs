@@ -12,6 +12,7 @@ const execFile = promisify(execFileCallback);
 const windowsScript = fileURLToPath(new URL('../runner-host/windows-wsl-runner-workspace.ps1', import.meta.url));
 const bootstrapScript = fileURLToPath(new URL('../runner-host/bootstrap-wsl-runner-workspace.sh', import.meta.url));
 const storageHook = fileURLToPath(new URL('../runner-host/runner-storage-hook.sh', import.meta.url));
+const storageHealth = fileURLToPath(new URL('../runner-host/runner-storage-health.sh', import.meta.url));
 const hookInstaller = fileURLToPath(new URL('../runner-host/install-runner-storage-hooks.sh', import.meta.url));
 const maintenance = fileURLToPath(new URL('../runner-host/idle-runner-storage-maintenance.sh', import.meta.url));
 const runbook = fileURLToPath(new URL('../runner-host/README.md', import.meta.url));
@@ -32,7 +33,10 @@ test('Windows VHD helper is parameterized, elevated, and refuses overwrite', asy
   assert.match(script, /AttachBootstrapAndKeepAlive/);
   assert.match(script, /Attach-WorkspaceVhd -AllowAlreadyAttached/);
   assert.match(script, /UUID bootstrap validated it before services were started/);
-  assert.match(script, /exec tail -f \/dev\/null/);
+  assert.match(script, /WslHealthCommand/);
+  assert.match(script, /requires WslHealthCommand/);
+  assert.match(script, /runner-storage-health\\\.sh\\s\+watch/);
+  assert.match(script, /--service\\s\+/);
   assert.match(script, /WSL keepalive returned unexpectedly[\s\S]*exit code \$LASTEXITCODE/);
   assert.match(script, /New-ScheduledTaskSettingsSet -ExecutionTimeLimit \(New-TimeSpan -Seconds 0\) -RestartCount 3 -RestartInterval \(New-TimeSpan -Minutes 1\) -MultipleInstances IgnoreNew/);
   assert.match(script, /Install-ProtectedTaskEntrypoint/);
@@ -56,6 +60,71 @@ test('Windows VHD helper is parameterized, elevated, and refuses overwrite', asy
   assert.match(script, /Optimize-VHD -Path \$VhdPath -Mode Full/);
   assert.match(script, /Compaction requires -ConfirmDrainActive and -ConfirmDetached/);
   assert.doesNotMatch(script, /Station/i);
+});
+
+test('storage health probe fails closed and clears only after a passing recovery probe', async () => {
+  const healthScript = await readFile(storageHealth, 'utf8');
+  assert.match(healthScript, /timeout_seconds=30/);
+  assert.match(healthScript, /timeout --foreground --kill-after=2s/);
+  assert.match(healthScript, /conv=fsync/);
+  assert.match(healthScript, /Runner storage incident marker exists/);
+  assert.match(healthScript, /mask_services/);
+  assert.match(healthScript, /Storage recovery probe passed and incident marker cleared/);
+  const fixtureRoot = await mkdtemp(join(tmpdir(), 'kontour-storage-health-'));
+  const bin = join(fixtureRoot, 'bin');
+  const probePath = join(fixtureRoot, 'probe');
+  const stateRoot = join(fixtureRoot, 'state');
+  const incidentPath = join(fixtureRoot, 'incidents', 'runner.incident');
+  await Promise.all([mkdir(bin, { recursive: true }), mkdir(probePath, { recursive: true }), mkdir(stateRoot, { recursive: true })]);
+  const writeExecutable = async (name, contents) => {
+    const path = join(bin, name);
+    await writeFile(path, contents);
+    await chmod(path, 0o755);
+  };
+  await writeExecutable('realpath', '#!/usr/bin/env bash\n[[ $1 == -m || $1 == -e ]] && shift\n[[ $1 == -- ]] && shift\nprintf "%s\\n" "$1"\n');
+  await writeExecutable('findmnt', '#!/usr/bin/env bash\ncase "$2" in UUID) printf "22222222-2222-2222-2222-222222222222\\n" ;; FSROOT) printf "/\\n" ;; esac\n');
+  await writeExecutable('timeout', '#!/usr/bin/env bash\ncase "${FAKE_HEALTH_RESULT:-healthy}" in healthy) exit 0 ;; timeout) exit 124 ;; *) exit 1 ;; esac\n');
+  await writeExecutable('systemctl', `#!/usr/bin/env bash
+set -euo pipefail
+service="\${!#}"
+case "$1" in
+  stop) : > "$FAKE_HEALTH_STATE/stopped-$service" ;;
+  mask) : > "$FAKE_HEALTH_STATE/masked-$service" ;;
+  unmask) rm -f "$FAKE_HEALTH_STATE/masked-$service" ;;
+esac
+`);
+  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_HEALTH_STATE: stateRoot };
+  const args = ['--probe-path', probePath, '--incident-path', incidentPath, '--timeout-seconds', '30', '--service', 'fixture.service'];
+
+  try {
+    await execFile(storageHealth, ['probe', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } });
+    await assert.rejects(() => accessFile(incidentPath));
+
+    await assert.rejects(() => execFile(storageHealth, ['probe', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'timeout' } }));
+    const incident = await readFile(incidentPath, 'utf8');
+    assert.match(incident, /reason=timeout/);
+    assert.match(incident, new RegExp(`probe_path=${probePath}`));
+    assert.match(incident, /filesystem_uuid=22222222-2222-2222-2222-222222222222/);
+    await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked-fixture.service')));
+
+    let markerRefusal;
+    try {
+      await execFile(storageHealth, ['probe', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } });
+    } catch (error) {
+      markerRefusal = error;
+    }
+    assert.ok(markerRefusal, 'a persisted incident must refuse an otherwise healthy automatic probe');
+    assert.match(markerRefusal.stderr, /Refusing automatic restart/);
+
+    await assert.rejects(() => execFile(storageHealth, ['clear', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'timeout' } }));
+    await assert.doesNotReject(() => accessFile(incidentPath));
+
+    await execFile(storageHealth, ['clear', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } });
+    await assert.rejects(() => accessFile(incidentPath));
+    await assert.rejects(() => accessFile(join(stateRoot, 'masked-fixture.service')));
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
 });
 
 test('storage hooks fail before job steps, retain bounded usage, and clean only marked scratch', async () => {
@@ -178,6 +247,8 @@ test('WSL bootstrap mounts by UUID, validates bindings, then starts services', a
   assert.match(script, /mount --bind "\$source_path" "\$target_path"/);
   assert.match(script, /systemctl start "\$service"/);
   assert.match(script, /--no-start-services/);
+  assert.match(script, /--health-script/);
+  assert.match(script, /services require an executable health script/);
   assert.doesNotMatch(script, /Station/i);
 });
 
@@ -204,4 +275,6 @@ test('runbook preserves the Windows-path and WSL-UUID recovery boundary', async 
   assert.match(text, /does not delete workspaces,\s*dependency caches,[\s\S]*semantic receipts/i);
   assert.match(text, /persisted drain/i);
   assert.match(text, /confirm-drain-end/i);
+  assert.match(text, /offline `fsck\.ext4 -f`/i);
+  assert.match(text, /one SSD-backed VHD per runner listener/i);
 });

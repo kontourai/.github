@@ -5,7 +5,8 @@ usage() {
   cat <<'EOF'
 Usage: bootstrap-wsl-runner-workspace.sh --uuid UUID --mount-root PATH \
   --bind SOURCE:TARGET [--bind SOURCE:TARGET ...] \
-  [--service SERVICE ...] [--no-start-services]
+  [--service SERVICE ...] [--health-script PATH --health-incident-path PATH \
+  [--health-timeout-seconds N]] [--no-start-services]
 
 Mounts the ext4 filesystem identified by UUID, bind-mounts each source below
 that filesystem over its runner target, then starts the named services. Run as
@@ -18,6 +19,9 @@ mount_root=''
 declare -a bindings=()
 declare -a services=()
 no_start_services=no
+health_script=''
+health_incident_path=''
+health_timeout_seconds=30
 
 while (($#)); do
   case "$1" in
@@ -25,6 +29,9 @@ while (($#)); do
     --mount-root) mount_root="${2:?missing mount root}"; shift 2 ;;
     --bind) bindings+=("${2:?missing source:target binding}"); shift 2 ;;
     --service) services+=("${2:?missing service name}"); shift 2 ;;
+    --health-script) health_script="${2:?missing health script}"; shift 2 ;;
+    --health-incident-path) health_incident_path="${2:?missing health incident path}"; shift 2 ;;
+    --health-timeout-seconds) health_timeout_seconds="${2:?missing health timeout seconds}"; shift 2 ;;
     --no-start-services) no_start_services=yes; shift ;;
     --help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -38,6 +45,9 @@ done
 command -v findmnt >/dev/null || { echo 'findmnt is required.' >&2; exit 1; }
 command -v mount >/dev/null || { echo 'mount is required.' >&2; exit 1; }
 command -v realpath >/dev/null || { echo 'realpath is required.' >&2; exit 1; }
+if ((${#services[@]} > 0)); then
+  [[ -x $health_script && $health_incident_path == /* && $health_timeout_seconds =~ ^[1-9][0-9]*$ ]] || { echo 'services require an executable health script, an absolute incident path, and a positive health timeout.' >&2; exit 2; }
+fi
 
 canonical_mount_root="$(realpath -m -- "$mount_root")"
 [[ $canonical_mount_root == "$mount_root" ]] || { echo "mount root must be canonical and may not traverse symlinks: $mount_root" >&2; exit 2; }
@@ -80,6 +90,11 @@ for binding in "${bindings[@]}"; do
 done
 
 if [[ $no_start_services == no ]]; then
+  if ((${#services[@]} > 0)); then
+    health_args=(probe --probe-path "$mount_root" --incident-path "$health_incident_path" --timeout-seconds "$health_timeout_seconds")
+    for service in "${services[@]}"; do health_args+=(--service "$service"); done
+    "$health_script" "${health_args[@]}"
+  fi
   for service in "${services[@]}"; do
     systemctl start "$service"
   done
