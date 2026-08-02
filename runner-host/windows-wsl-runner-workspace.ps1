@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
   [Parameter(Mandatory = $true)]
-  [ValidateSet('Provision', 'Attach', 'InstallBootTask')]
+  [ValidateSet('Provision', 'Attach', 'InstallBootTask', 'Compact')]
   [string]$Mode,
 
   [Parameter(Mandatory = $true)]
@@ -15,7 +15,9 @@ param(
   [string]$DistroName = 'Ubuntu',
 
   [ValidateNotNullOrEmpty()]
-  [string]$BootTaskName = 'Kontour WSL runner workspace VHD attach'
+  [string]$BootTaskName = 'Kontour WSL runner workspace VHD attach',
+
+  [switch]$ConfirmIdle
 )
 
 Set-StrictMode -Version Latest
@@ -81,5 +83,16 @@ switch ($Mode) {
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
     Register-ScheduledTask -TaskName $BootTaskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
     Write-Output "Installed boot task '$BootTaskName'. The WSL bootstrap must still mount by UUID before runner services start."
+  }
+  'Compact' {
+    if (-not $ConfirmIdle) {
+      throw 'Compaction requires -ConfirmIdle after runner services and Runner.Worker processes have been stopped.'
+    }
+    $image = Get-DiskImage -ImagePath $VhdPath -ErrorAction SilentlyContinue
+    if ($image -and $image.Attached) {
+      throw 'Refusing to compact an attached VHD. Stop WSL runner services, unmount it, and detach the VHD first.'
+    }
+    Optimize-VHD -Path $VhdPath -Mode Full
+    Write-Output "Compacted detached VHD $VhdPath. Reattach only after the runner workspace bootstrap is ready."
   }
 }

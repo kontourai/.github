@@ -61,3 +61,58 @@ The boot task attaches by VHD path; the Linux bootstrap finds the ext4 volume
 by UUID. To recover, stop the runner services, unmount the bind targets and
 mount root in WSL, then detach the VHD in Windows only after no process has an
 open file on it. Keep the VHD file: it is the recoverable workspace state.
+
+## Storage lifecycle hooks
+
+Self-hosted runners do not automatically enforce useful workspace headroom.
+Install `runner-storage-hook.sh` as the documented Actions Runner job hooks:
+the `preflight` hook checks the workspace filesystem and a separately supplied
+host-headroom path before job steps run. The `completed` hook appends one
+bounded usage record; it does not delete workspaces, dependency caches, or
+semantic receipts.
+
+Generate wrappers for each runner root rather than sharing a mutable wrapper:
+
+```sh
+sudo ./runner-host/install-runner-storage-hooks.sh \
+  --hook-script /usr/local/sbin/runner-storage-hook.sh \
+  --workspace-root /var/lib/example-runner/work \
+  --headroom-path /mnt/runner-work \
+  --minimum-free-gb 20 --minimum-free-percent 15 \
+  --usage-log /var/log/example-runner/storage-usage.log \
+  --runner-root /var/lib/example-runner-a \
+  --runner-root /var/lib/example-runner-b
+```
+
+It prints `ACTIONS_RUNNER_HOOK_JOB_STARTED` and
+`ACTIONS_RUNNER_HOOK_JOB_COMPLETED` for each root. Put those values in that
+runner's systemd service environment, then restart the service during a
+maintenance window. The installer intentionally does not edit or restart a
+runner service.
+
+If a runner creates disposable per-job scratch data outside its normal work
+path, opt into cleanup only with both `--ephemeral-root` and `--job-id`. The
+completed hook removes only the direct child named by that simple job ID when
+it contains the `.kontour-ephemeral-job` marker. Do not point this at a normal
+runner work directory, cache, receipt store, or VHD mount root.
+
+For capacity reclamation, do not schedule deletion. During a maintenance
+window, stop every runner service, confirm there is no `Runner.Worker`, then
+run the idle-only trim command:
+
+```sh
+sudo ./runner-host/idle-runner-storage-maintenance.sh \
+  --confirm-idle --mount-root /mnt/runner-work \
+  --service example-runner-a.service --service example-runner-b.service
+```
+
+It refuses active services or workers and only issues `fstrim`. To compact the
+dynamic VHD, repeat the idle checks, unmount and detach it, retain a backup or
+copy of the VHD, then run from elevated Windows PowerShell:
+
+```powershell
+.\runner-host\windows-wsl-runner-workspace.ps1 -Mode Compact `
+  -VhdPath 'C:\RunnerStorage\runner-work.vhdx' -ConfirmIdle
+```
+
+`Compact` refuses an attached VHD; it does not stop services or delete files.
