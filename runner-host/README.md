@@ -12,8 +12,9 @@ letter. It does not change a live host by itself.
   Windows drive mount and never initializes or formats its disk. Format it once
   from the selected WSL distribution after confirming the disk identity.
 - The WSL bootstrap mounts by the recorded ext4 UUID, not a volatile `/dev/sdX`
-  path. It refuses an occupied mount point, a missing UUID, an invalid bind, or
-  a target already mounted from somewhere else.
+  path. It refuses an occupied mount point, a missing UUID, non-canonical or
+  symlink-traversing bind paths, a source outside the recorded filesystem, or
+  a target mounted with a different UUID and filesystem root.
 - Install the bootstrap as a systemd prerequisite for runner services so the
   bind mounts exist before work begins. It starts services only after every
   mount succeeds.
@@ -58,24 +59,35 @@ bootstrap command, including the UUID and every bind/service mapping:
 $bootstrap = '/usr/local/sbin/bootstrap-wsl-runner-workspace.sh --uuid <ext4-uuid> --mount-root /mnt/runner-work --bind /mnt/runner-work/work:/var/lib/example-runner/work --bind /mnt/runner-work/work-2:/var/lib/example-runner/work-2 --service example-runner.service'
 .\runner-host\windows-wsl-runner-workspace.ps1 -Mode InstallBootTask `
   -VhdPath 'C:\RunnerStorage\runner-work.vhdx' -DistroName 'Ubuntu' `
-  -WslBootstrapCommand $bootstrap
+  -WslWindowsUser 'EXAMPLE\runner-owner' -WslBootstrapCommand $bootstrap
 ```
 
-The boot task attaches the VHD through WSL, invokes the selected distribution
-as root, then the Linux bootstrap finds the ext4 volume by UUID, binds work
-paths, and starts services. A bootstrap failure fails the task and leaves
-services stopped. To recover, stop the runner services, unmount the bind targets
-and mount root in WSL, then detach the VHD in Windows only after no process has
-an open file on it. Keep the VHD file: it is the recoverable workspace state.
+Run that command elevated as the WSL-owning Windows user. WSL distribution
+registrations are per Windows user, so the installer checks that this user can
+enumerate `DistroName` before it creates the task. The task runs as that
+interactive user at highest run level and has both boot and logon triggers.
+The logon trigger is authoritative: a boot trigger only runs when Windows has a
+usable token for that user. If boot and logon race, an already attached VHD is
+accepted only after the UUID bootstrap validates its filesystem and bind
+identity; otherwise the task fails and leaves services stopped.
+
+The task attaches the VHD through WSL, invokes the selected distribution as
+root, then the Linux bootstrap finds the ext4 volume by UUID, binds work paths,
+and starts services. Existing bind mounts are idempotent only when their UUID
+and filesystem root match the declared source. To recover, stop the runner
+services, unmount the bind targets and mount root in WSL, then detach the VHD
+in Windows only after no process has an open file on it. Keep the VHD file: it
+is the recoverable workspace state.
 
 ## Storage lifecycle hooks
 
 Self-hosted runners do not automatically enforce useful workspace headroom.
 Install `runner-storage-hook.sh` as the documented Actions Runner job hooks:
 the `preflight` hook checks the workspace filesystem and a separately supplied
-host-headroom path before job steps run. The `completed` hook appends one
-bounded usage record; it does not delete workspaces, dependency caches, or
-semantic receipts.
+host-headroom path before job steps run. The `completed` hook records cheap
+filesystem capacity from `df`, rather than scanning the whole workspace; it
+locks and bounds the shared log safely. It does not delete workspaces,
+dependency caches, or semantic receipts.
 
 Generate wrappers for each runner root rather than sharing a mutable wrapper:
 
@@ -112,9 +124,11 @@ sudo ./runner-host/idle-runner-storage-maintenance.sh \
   --service example-runner-a.service --service example-runner-b.service
 ```
 
-It refuses active services or workers and only issues `fstrim`. To compact the
-dynamic VHD, repeat the idle checks, unmount and detach it, retain a backup or
-copy of the VHD, then run from elevated Windows PowerShell:
+It rejects unknown or non-inactive service units, runtime-masks the declared
+units while it rechecks for `Runner.Worker` or `Runner.Listener`, and only then
+issues `fstrim`; the runtime masks are removed on exit. To compact the dynamic
+VHD, repeat the idle checks, unmount and detach it, retain a backup or copy of
+the VHD, then run from elevated Windows PowerShell:
 
 ```powershell
 .\runner-host\windows-wsl-runner-workspace.ps1 -Mode Compact `

@@ -13,9 +13,24 @@ while (($#)); do
   esac
 done
 [[ $confirm == yes && $mount_root == /* && -d $mount_root && ${#services[@]} -gt 0 ]] || { usage >&2; exit 2; }
+declare -a runtime_masked_services=()
+cleanup_runtime_masks() {
+  local service
+  for service in "${runtime_masked_services[@]}"; do
+    systemctl unmask --runtime "$service" >/dev/null || echo "warning: could not remove runtime mask for $service" >&2
+  done
+}
+trap cleanup_runtime_masks EXIT
 for service in "${services[@]}"; do
-  systemctl is-active --quiet "$service" && { echo "service is active: $service" >&2; exit 1; }
+  load_state="$(systemctl show --property=LoadState --value "$service" 2>/dev/null || true)"
+  [[ $load_state == loaded ]] || { echo "unknown service unit: $service" >&2; exit 2; }
+  [[ $(systemctl is-active "$service" || true) == inactive ]] || { echo "service is not explicitly inactive: $service" >&2; exit 1; }
 done
-pgrep -f '[R]unner.Worker' >/dev/null && { echo 'Runner.Worker is still active.' >&2; exit 1; }
+for service in "${services[@]}"; do
+  systemctl mask --runtime "$service" >/dev/null
+  runtime_masked_services+=("$service")
+  [[ $(systemctl is-active "$service" || true) == inactive ]] || { echo "service restarted while preparing trim: $service" >&2; exit 1; }
+done
+pgrep -f '[R]unner\.(Worker|Listener)' >/dev/null && { echo 'Runner.Worker or Runner.Listener is still active.' >&2; exit 1; }
 fstrim -v "$mount_root"
-echo 'Trim complete. Compact the detached VHD from elevated Windows PowerShell only after repeating these idle checks.'
+echo 'Trim complete. Runtime service masks will now be removed. Compact the detached VHD from elevated Windows PowerShell only after repeating these idle checks.'

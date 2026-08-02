@@ -14,6 +14,9 @@ param(
   [ValidateNotNullOrEmpty()]
   [string]$DistroName = 'Ubuntu',
 
+  [ValidateNotNullOrEmpty()]
+  [string]$WslWindowsUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name,
+
   [string]$WslBootstrapCommand,
 
   [ValidateNotNullOrEmpty()]
@@ -47,18 +50,23 @@ function Assert-VhdPath {
 }
 
 function Attach-WorkspaceVhd {
+  param([switch]$AllowAlreadyAttached)
   if (-not (Test-Path -LiteralPath $VhdPath -PathType Leaf)) {
     throw "VHD does not exist: $VhdPath"
   }
   & wsl.exe --mount $VhdPath --vhd --bare
   if ($LASTEXITCODE -ne 0) {
-    throw "WSL failed to attach VHD $VhdPath. Refusing to guess whether an existing attachment is safe."
+    if (-not $AllowAlreadyAttached) {
+      throw "WSL failed to attach VHD $VhdPath. Refusing to guess whether an existing attachment is safe."
+    }
+    return $false
   }
   Write-Output "Attached VHD $VhdPath to WSL. Mount it only from the $DistroName UUID bootstrap path."
+  return $true
 }
 
 function Invoke-WslBootstrap {
-  if ([string]::IsNullOrWhiteSpace($WslBootstrapCommand) -or $WslBootstrapCommand.Contains("`n") -or $WslBootstrapCommand.Contains("`r")) {
+  if ([string]::IsNullOrWhiteSpace($WslBootstrapCommand) -or $WslBootstrapCommand.Contains("`n") -or $WslBootstrapCommand.Contains("`r") -or $WslBootstrapCommand -notmatch '--uuid\s+[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}') {
     throw 'AttachAndBootstrap requires a single-line WslBootstrapCommand that mounts by UUID, binds runner paths, and starts services.'
   }
   & wsl.exe --distribution $DistroName --user root -- bash -lc $WslBootstrapCommand
@@ -83,8 +91,11 @@ switch ($Mode) {
     Attach-WorkspaceVhd
   }
   'AttachAndBootstrap' {
-    Attach-WorkspaceVhd
+    $newAttachment = Attach-WorkspaceVhd -AllowAlreadyAttached
     Invoke-WslBootstrap
+    if (-not $newAttachment) {
+      Write-Output 'WSL reported an existing VHD attachment; UUID bootstrap validated it before services were started.'
+    }
   }
   'InstallBootTask' {
     if (-not (Test-Path -LiteralPath $VhdPath -PathType Leaf)) {
@@ -93,18 +104,28 @@ switch ($Mode) {
     if ([string]::IsNullOrWhiteSpace($WslBootstrapCommand)) {
       throw 'InstallBootTask requires WslBootstrapCommand so every boot mounts by UUID and starts runner services.'
     }
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    if ($WslWindowsUser -ne $currentUser) {
+      throw "Run InstallBootTask elevated as the WSL-owning user $WslWindowsUser; the current user $currentUser cannot safely validate another user's distro registration."
+    }
+    $registeredDistros = & wsl.exe --list --quiet
+    if ($LASTEXITCODE -ne 0 -or -not ($registeredDistros | Where-Object { $_.Trim() -eq $DistroName })) {
+      throw "WSL distribution $DistroName is not registered for Windows user $WslWindowsUser."
+    }
     $quote = { param([string]$value) "'" + $value.Replace("'", "''") + "'" }
     $quotedScript = & $quote $PSCommandPath
     $quotedVhd = & $quote $VhdPath
     $quotedDistro = & $quote $DistroName
+    $quotedUser = & $quote $WslWindowsUser
     $quotedBootstrap = & $quote $WslBootstrapCommand
-    $command = "& $quotedScript -Mode AttachAndBootstrap -VhdPath $quotedVhd -DistroName $quotedDistro -WslBootstrapCommand $quotedBootstrap"
+    $command = "& $quotedScript -Mode AttachAndBootstrap -VhdPath $quotedVhd -DistroName $quotedDistro -WslWindowsUser $quotedUser -WslBootstrapCommand $quotedBootstrap"
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
-    $trigger = New-ScheduledTaskTrigger -AtStartup
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
-    Register-ScheduledTask -TaskName $BootTaskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
-    Write-Output "Installed boot task '$BootTaskName'. It attaches through WSL, runs the UUID bootstrap, and starts runner services only after mounts succeed."
+    $bootTrigger = New-ScheduledTaskTrigger -AtStartup
+    $logonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $WslWindowsUser
+    $principal = New-ScheduledTaskPrincipal -UserId $WslWindowsUser -LogonType Interactive -RunLevel Highest
+    Register-ScheduledTask -TaskName $BootTaskName -Action $action -Trigger @($bootTrigger, $logonTrigger) -Principal $principal -Force | Out-Null
+    Write-Output "Installed task '$BootTaskName' for WSL user $WslWindowsUser. The logon trigger is authoritative; the boot trigger runs only when Windows has a usable interactive token."
   }
   'Compact' {
     if (-not $ConfirmIdle -or -not $ConfirmDetached) {

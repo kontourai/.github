@@ -22,6 +22,7 @@ require_absolute_directory() {
 
 free_bytes() { df -Pk "$1" | awk 'NR == 2 { print $4 * 1024 }'; }
 free_percent() { df -Pk "$1" | awk 'NR == 2 { sub(/%/, "", $5); print 100 - $5 }'; }
+filesystem_used_bytes() { df -Pk "$1" | awk 'NR == 2 { print ($2 - $4) * 1024 }'; }
 
 mode="${1:-}"; [[ -n $mode ]] || { usage >&2; exit 2; }; shift || true
 workspace_root=''; headroom_path=''; minimum_free_gb=''; minimum_free_percent=''
@@ -59,10 +60,14 @@ case "$mode" in
   completed)
     require_absolute_directory "$workspace_root" workspace-root
     [[ $usage_log == /* && $usage_log_lines =~ ^[1-9][0-9]*$ ]] || { echo 'usage log must be absolute and usage-log-lines positive.' >&2; exit 2; }
+    command -v flock >/dev/null || { echo 'flock is required to write a shared usage log safely.' >&2; exit 1; }
     mkdir -p "$(dirname "$usage_log")"
-    printf '%s workspace=%s used_bytes=%s free_bytes=%s\n' "$(date -u +%FT%TZ)" "$workspace_root" "$(du -sxB1 "$workspace_root" | awk '{print $1}')" "$(free_bytes "$workspace_root")" >> "$usage_log"
-    tail -n "$usage_log_lines" "$usage_log" > "${usage_log}.tmp"
-    mv "${usage_log}.tmp" "$usage_log"
+    exec 9>"${usage_log}.lock"
+    flock -x 9
+    printf '%s filesystem=%s filesystem_used_bytes=%s free_bytes=%s\n' "$(date -u +%FT%TZ)" "$workspace_root" "$(filesystem_used_bytes "$workspace_root")" "$(free_bytes "$workspace_root")" >> "$usage_log"
+    usage_tmp="$(mktemp "${usage_log}.tmp.XXXXXX")"
+    tail -n "$usage_log_lines" "$usage_log" > "$usage_tmp"
+    mv "$usage_tmp" "$usage_log"
     if [[ -n $ephemeral_root || -n $job_id ]]; then
       require_absolute_directory "$ephemeral_root" ephemeral-root
       [[ $job_id =~ ^[A-Za-z0-9._-]+$ ]] || { echo 'job-id must be a simple path component.' >&2; exit 2; }

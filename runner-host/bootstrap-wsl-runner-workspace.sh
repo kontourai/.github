@@ -35,8 +35,13 @@ done
 ((${#bindings[@]} > 0)) || { echo 'At least one --bind is required.' >&2; exit 2; }
 command -v findmnt >/dev/null || { echo 'findmnt is required.' >&2; exit 1; }
 command -v mount >/dev/null || { echo 'mount is required.' >&2; exit 1; }
+command -v realpath >/dev/null || { echo 'realpath is required.' >&2; exit 1; }
 
+canonical_mount_root="$(realpath -m -- "$mount_root")"
+[[ $canonical_mount_root == "$mount_root" ]] || { echo "mount root must be canonical and may not traverse symlinks: $mount_root" >&2; exit 2; }
 mkdir -p "$mount_root"
+mount_root="$(realpath -e -- "$mount_root")"
+[[ $mount_root == "$canonical_mount_root" ]] || { echo 'mount root resolved through a symlink.' >&2; exit 2; }
 if mountpoint -q "$mount_root"; then
   source_uuid="$(findmnt -no UUID --target "$mount_root" || true)"
   [[ ${source_uuid,,} == ${uuid,,} ]] || { echo "mount root is occupied by UUID ${source_uuid:-unknown}, expected $uuid" >&2; exit 1; }
@@ -47,14 +52,26 @@ else
 fi
 
 for binding in "${bindings[@]}"; do
-  source_path="${binding%%:*}"
-  target_path="${binding#*:}"
-  [[ $source_path != "$binding" && $source_path == /* && $target_path == /* ]] || { echo "binding must be absolute SOURCE:TARGET: $binding" >&2; exit 2; }
+  source_input="${binding%%:*}"
+  target_input="${binding#*:}"
+  [[ $source_input != "$binding" && $source_input == /* && $target_input == /* ]] || { echo "binding must be absolute SOURCE:TARGET: $binding" >&2; exit 2; }
+
+  # Reject lexical traversal and existing symlink indirection before mkdir can
+  # create a directory outside the declared source or target path.
+  source_path="$(realpath -m -- "$source_input")"
+  target_path="$(realpath -m -- "$target_input")"
+  [[ $source_path == "$source_input" && $target_path == "$target_input" ]] || { echo "binding paths must be canonical and may not traverse symlinks: $binding" >&2; exit 2; }
   case "$source_path" in "$mount_root"/*) ;; *) echo "source must be below mount root: $source_path" >&2; exit 2;; esac
   mkdir -p "$source_path" "$target_path"
+  [[ $(realpath -e -- "$source_path") == "$source_path" && $(realpath -e -- "$target_path") == "$target_path" ]] || { echo "binding path resolved through a symlink: $binding" >&2; exit 2; }
+  source_uuid="$(findmnt -no UUID --target "$source_path" || true)"
+  [[ ${source_uuid,,} == ${uuid,,} ]] || { echo "source is not on the recorded UUID filesystem: $source_path" >&2; exit 1; }
+  source_fsroot="${source_path#"$mount_root"}"
+  [[ -n $source_fsroot ]] || source_fsroot='/'
   if mountpoint -q "$target_path"; then
-    current_source="$(findmnt -no SOURCE --target "$target_path" || true)"
-    [[ $current_source == "$source_path" ]] || { echo "target already has a different mount: $target_path" >&2; exit 1; }
+    current_uuid="$(findmnt -no UUID --target "$target_path" || true)"
+    current_fsroot="$(findmnt -no FSROOT --target "$target_path" || true)"
+    [[ ${current_uuid,,} == ${uuid,,} && $current_fsroot == "$source_fsroot" ]] || { echo "target already has a different mount identity: $target_path" >&2; exit 1; }
   else
     mount --bind "$source_path" "$target_path"
   fi
