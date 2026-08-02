@@ -219,7 +219,10 @@ token exactly matches that same job's token—for example, when GitHub cancelled
 its `acquire` process while it held control. Cleanup first hard-links the exact
 active instance to a deterministic private retirement claim; only the cleaner
 that created that claim may unlink `active`. A second same-owner cleanup never
-deletes a later foreign active record.
+deletes a later foreign active record. The live candidate remains an inode
+witness until protected work exits: immediately before entering that work,
+`active` must still name the exact owner/instance and inode, never merely the
+same owner token.
 
 Candidate and retired artifacts are cleaned only when their filename and
 owner token exactly match the post step. A retirement claim whose active link

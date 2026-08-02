@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
-import { access, appendFile, link, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { access, appendFile, link, mkdir, mkdtemp, readFile, readdir, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -425,6 +425,37 @@ test('protected operation errors are not reclassified as contention or replayed'
   });
 });
 
+test('a same-owner replacement with identical JSON cannot enter or release protected work', async () => {
+  await withRoot(async (root) => {
+    const controls = join(root, '.kontour-physical-host-capacity', 'control-tickets');
+    const active = join(controls, 'active');
+    const replacement = join(root, 'same-owner-replacement.json');
+    let operations = 0;
+
+    await assert.rejects(
+      acquireLease(config(root), {
+        ownerToken: OWNER_A,
+        controlHooks: {
+          async afterControlPublish(expectedOwner, activePath, candidatePath) {
+            assert.equal(activePath, active);
+            assert.equal(existsSync(candidatePath), true);
+            await writeFile(replacement, JSON.stringify(expectedOwner));
+            await unlink(activePath);
+            await link(replacement, activePath);
+          },
+          beforeControlOperation() {
+            operations += 1;
+          },
+        },
+      }),
+      /no longer references this lock instance inode/,
+    );
+    assert.equal(operations, 0);
+    assert.equal(JSON.parse(await readFile(active, 'utf8')).ownerToken, OWNER_A);
+    assert.equal(JSON.parse(await readFile(active, 'utf8')).lockToken.length, 36);
+  });
+});
+
 test('a stale same-owner cleanup cannot unlink a later foreign active lock', async () => {
   await withRoot(async (root) => {
     const raceConfig = config(root, { capacityUnits: 1, leaseWeight: 1, pollIntervalMs: 1 });
@@ -479,23 +510,19 @@ test('a stale same-owner cleanup cannot unlink a later foreign active lock', asy
   }, { provision: false });
 });
 
-test('post cleanup removes only exact same-owner candidate and retired residue', async () => {
+test('control cleanup has bounded exact-path work despite foreign residue', async () => {
   await withRoot(async (root) => {
     const residueConfig = config(root, { capacityUnits: 1, leaseWeight: 1 });
     await provisionHost(residueConfig);
     const controls = join(root, '.kontour-physical-host-capacity', 'control-tickets');
-    const candidate = join(controls, `.candidate-${OWNER_C}-${LOCK_C}.json`);
-    const retired = join(controls, `.retired-${OWNER_C}-${LOCK_C}.json`);
     const foreign = join(controls, `.candidate-${OWNER_B}-${LOCK_B}.json`);
-    await Promise.all([
-      writeFile(candidate, JSON.stringify(controlRecord(OWNER_C, LOCK_C))),
-      writeFile(retired, JSON.stringify(controlRecord(OWNER_C, LOCK_C))),
-      writeFile(foreign, JSON.stringify(controlRecord(OWNER_B, LOCK_B))),
-    ]);
+    await Promise.all(Array.from({ length: 128 }, (_, index) => writeFile(
+      join(controls, `.candidate-99999999-9999-4999-8999-${String(index).padStart(12, '0')}-dddddddd-dddd-4ddd-8ddd-dddddddddddd.json`),
+      JSON.stringify(controlRecord(OWNER_B, LOCK_B)),
+    )));
+    await writeFile(foreign, JSON.stringify(controlRecord(OWNER_B, LOCK_B)));
 
     assert.equal(await releaseLease(residueConfig, OWNER_C), false);
-    assert.equal(existsSync(candidate), false);
-    assert.equal(existsSync(retired), false);
     assert.equal(existsSync(foreign), true);
   }, { provision: false });
 });
