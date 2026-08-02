@@ -32,6 +32,7 @@ async function main() {
     [stateName('LEASE_WEIGHT'), String(config.leaseWeight)],
     [stateName('TIMEOUT_SECONDS'), String(config.timeoutMs / 1000)],
     [stateName('POLL_INTERVAL_MS'), String(config.pollIntervalMs)],
+    [stateName('OWNER_LIFETIME_SECONDS'), String(config.ownerLifetimeSeconds)],
   ]);
   const lease = await acquireLease(config, { ownerToken, metadata: actionMetadata() });
   await writeCommand(process.env.GITHUB_OUTPUT, 'owner-token', lease.ownerToken);

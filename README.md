@@ -114,6 +114,7 @@ jobs:
           capacity-units: '8'
           lease-weight: '5'
           timeout-seconds: '240'
+          owner-lifetime-seconds: '6000' # shared 90-minute maximum plus 10-minute margin
       - shell: pwsh
         run: npm test
 
@@ -131,6 +132,7 @@ jobs:
           capacity-units: '8'
           lease-weight: '3'
           timeout-seconds: '240'
+          owner-lifetime-seconds: '6000' # shared 90-minute maximum plus 10-minute margin
       - run: npm test
 ```
 
@@ -144,27 +146,45 @@ administrator account, using either the Windows root or its WSL mount:
 node scripts/provision-physical-host-capacity.mjs \
   --root /mnt/d/kontour-runner-capacity \
   --host-id desktop-win-01 \
-  --capacity-units 8
+  --capacity-units 8 \
+  --owner-lifetime-seconds 6000
 ```
 
 Provisioning writes an externally located `.kontour-physical-host-id` marker
 and a schema-versioned `host-manifest.json`. Its host ID, capacity,
-`explicit-quiesced-recovery-v1` strategy are authoritative:
+owner lifetime, and `bounded-owner-deadline-v1` strategy are authoritative:
 every participant must match them exactly before acquire or release
 can proceed. Update those values only after draining the root and deliberately
 re-provisioning it.
 
-The action never starts a detached process and never deletes a lease or queue
-ticket based on a timestamp. Its post step releases the lease on normal failure
-or cancellation. If the runner is lost before that step, the capacity remains
-blocked deliberately. There is no online stale-time policy and no automatic
-recovery authority.
+The action never starts a detached process. Its post step releases the lease on
+normal failure or cancellation. If the runner is lost before that step, a later
+participant reclaims its lease or queue ticket only after the recorded owner
+lifetime expires. Set `owner-lifetime-seconds` to at least the workflow job's
+`timeout-minutes` in seconds plus a conservative recovery margin; all callers
+for a root must use the same value.
+
+This is the action's liveness boundary without a GitHub token or API: expiry
+does not probe GitHub or prove a process died. It is safe only because the
+workflow contract guarantees the owner cannot still run beyond its declared job
+timeout. Do not set a lifetime below that timeout. The shared default is 6000
+seconds: Station's 90-minute maximum job timeout plus ten minutes of margin.
+
+Roots provisioned by schema v6 are read in compatibility mode so the first
+updated participant can clear the stranded records from a killed runner. Those
+legacy records have no deadline, so their shared-file timestamp uses at least
+the 6000-second shared safety floor even if a caller supplies a shorter value.
+Drain and re-provision the root afterward to make the v7 deadline contract
+authoritative. Do not change a v7 root's shared lifetime while live records
+exist: drain it first, then re-provision every caller with the same value.
 
 Waiting jobs create durable weighted FIFO tickets. Their order comes from a
 shared monotonic sequence assigned under the control protocol—not process
 clock time—so Windows/WSL wall-clock skew cannot reorder waiters. Only the
 oldest ticket may claim available capacity, so later small jobs cannot starve
-an older larger job. Timeout cleanup retries independently for up to five
+an older larger job. The action deliberately does not backfill a smaller ticket
+around an oversized head: without a separate bounded-bypass and aging policy,
+that optimization can starve the head indefinitely. Timeout cleanup retries independently for up to five
 seconds even when the acquisition timeout is zero.
 Contention diagnostics are capped and include an omitted-entry count.
 
@@ -188,6 +208,7 @@ node scripts/recover-physical-host-capacity.mjs \
   --root /mnt/d/kontour-runner-capacity \
   --host-id desktop-win-01 \
   --capacity-units 8 \
+  --owner-lifetime-seconds 6000 \
   --recover lease:<owner-uuid>
 ```
 
@@ -268,6 +289,11 @@ full history (`fetch-depth: 0`) and fails closed with a non-zero exit unless
 `git rev-parse --is-shallow-repository` reports exactly `false`. A shallow
 checkout, an empty result, an unexpected value, or the command itself
 erroring all fail the run rather than silently scanning a partial history.
+
+Self-hosted secret scans must provide capacity root and host identity. The
+reusable workflow fixes `capacity-owner-lifetime-seconds` at 6000 seconds and
+forwards it to the physical-host action, so it remains compatible with the
+shared 90-minute Station capacity manifest.
 
 ## Release-note policy
 

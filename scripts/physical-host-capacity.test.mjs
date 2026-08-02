@@ -41,6 +41,8 @@ function config(root, overrides = {}) {
     leaseWeight: 2,
     timeoutMs: 0,
     pollIntervalMs: 1,
+    ownerLifetimeSeconds: 60,
+    ownerLifetimeMs: 60_000,
     ...overrides,
   };
 }
@@ -54,6 +56,7 @@ test('configuration rejects ambiguous capacity inputs and accepts environment co
       PHYSICAL_HOST_CAPACITY_WEIGHT: '3',
       PHYSICAL_HOST_CAPACITY_TIMEOUT_SECONDS: '0',
       PHYSICAL_HOST_CAPACITY_POLL_INTERVAL_MS: '25',
+      PHYSICAL_HOST_CAPACITY_OWNER_LIFETIME_SECONDS: '120',
     }),
     {
       root: '/coordination',
@@ -62,6 +65,8 @@ test('configuration rejects ambiguous capacity inputs and accepts environment co
       leaseWeight: 3,
       timeoutMs: 0,
       pollIntervalMs: 25,
+      ownerLifetimeSeconds: 120,
+      ownerLifetimeMs: 120_000,
     },
   );
   assert.deepEqual(
@@ -72,6 +77,7 @@ test('configuration rejects ambiguous capacity inputs and accepts environment co
       'INPUT_LEASE-WEIGHT': '3',
       'INPUT_TIMEOUT-SECONDS': '0',
       'INPUT_POLL-INTERVAL-MS': '25',
+      'INPUT_OWNER-LIFETIME-SECONDS': '120',
     }),
     {
       root: '/coordination',
@@ -80,6 +86,8 @@ test('configuration rejects ambiguous capacity inputs and accepts environment co
       leaseWeight: 3,
       timeoutMs: 0,
       pollIntervalMs: 25,
+      ownerLifetimeSeconds: 120,
+      ownerLifetimeMs: 120_000,
     },
   );
   assert.throws(
@@ -132,18 +140,50 @@ test('concurrent acquisitions never exceed the weighted capacity', async () => {
   });
 });
 
-test('an abandoned lease fails closed until an operator removes the confirmed record', async () => {
+test('an orphaned lease is reclaimed only after its declared owner lifetime expires', async () => {
   await withRoot(async (root) => {
-    const recoveryConfig = config(root, { capacityUnits: 3, leaseWeight: 3 });
+    const recoveryConfig = config(root, { capacityUnits: 3, leaseWeight: 3, ownerLifetimeSeconds: 5, ownerLifetimeMs: 5_000 });
     await provisionHost(recoveryConfig);
-    const leases = join(root, '.kontour-physical-host-capacity', 'leases');
-    const stalePath = join(leases, `${OWNER_A}.json`);
-    await writeFile(stalePath, JSON.stringify({ ownerToken: OWNER_A, weight: 3, acquiredAt: '2020-01-01T00:00:00.000Z' }));
-    await assert.rejects(acquireLease(recoveryConfig, { ownerToken: OWNER_B }), /used=3\/3/);
-    await access(stalePath);
-    await rm(stalePath); // manual recovery only after the operator has drained runners and checked the owner
-    const acquired = await acquireLease(recoveryConfig, { ownerToken: OWNER_B });
+    let now = 0;
+    await acquireLease(recoveryConfig, { ownerToken: OWNER_A, now: () => now });
+    now = 4_999;
+    await assert.rejects(acquireLease(recoveryConfig, { ownerToken: OWNER_B, now: () => now }), /used=3\/3/);
+    now = 5_001; // runner A has exceeded its declared maximum lifetime
+    const acquired = await acquireLease(recoveryConfig, { ownerToken: OWNER_B, now: () => now });
     assert.equal(await releaseLease(recoveryConfig, OWNER_B), true);
+  }, { provision: false });
+});
+
+test('an orphaned FIFO head ticket is reclaimed so a later live waiter can enter', async () => {
+  await withRoot(async (root) => {
+    const orphanConfig = config(root, { capacityUnits: 1, leaseWeight: 1, ownerLifetimeSeconds: 5, ownerLifetimeMs: 5_000 });
+    await provisionHost(orphanConfig);
+    const tickets = join(root, '.kontour-physical-host-capacity', 'tickets');
+    // This simulates a runner dying after it published the head ticket but
+    // before it could acquire capacity. Its sequence is older than B's.
+    await writeFile(join(tickets, `${OWNER_A}.json`), JSON.stringify({ ownerToken: OWNER_A, weight: 1, sequence: 1, acquiredAt: new Date(0).toISOString(), expiresAt: new Date(5_000).toISOString() }));
+    let now = 5_001;
+    const acquired = await acquireLease(orphanConfig, { ownerToken: OWNER_B, now: () => now });
+    assert.equal(acquired.ownerToken, OWNER_B);
+    assert.equal(await releaseLease(orphanConfig, OWNER_B, { now: () => now }), true);
+  }, { provision: false });
+});
+
+test('a v6 root honors the 90-minute migration floor before recovering stranded records', async () => {
+  await withRoot(async (root) => {
+    const legacyConfig = config(root, { capacityUnits: 1, leaseWeight: 1, ownerLifetimeSeconds: 5, ownerLifetimeMs: 5_000 });
+    await provisionHost(legacyConfig);
+    const state = join(root, '.kontour-physical-host-capacity');
+    await writeFile(join(state, 'host-manifest.json'), JSON.stringify({ schemaVersion: 6, hostId: 'desktop-win-01', capacityUnits: 1, recoveryStrategy: 'explicit-quiesced-recovery-v1' }));
+    const leases = join(state, 'leases');
+    const tickets = join(state, 'tickets');
+    await writeFile(join(leases, `${OWNER_A}.json`), JSON.stringify({ ownerToken: OWNER_A, weight: 1, acquiredAt: new Date().toISOString() }));
+    await writeFile(join(tickets, `${OWNER_B}.json`), JSON.stringify({ ownerToken: OWNER_B, weight: 1, sequence: 1 }));
+    const tooEarly = Date.now() + 5_001;
+    await assert.rejects(acquireLease(legacyConfig, { ownerToken: OWNER_C, now: () => tooEarly }), /used=1\/1/);
+    const now = Date.now() + 6_000_001;
+    const acquired = await acquireLease(legacyConfig, { ownerToken: OWNER_C, now: () => now });
+    assert.equal(acquired.ownerToken, OWNER_C);
   }, { provision: false });
 });
 
@@ -155,7 +195,7 @@ test('explicit recovery requires a distinct, regular quiescence marker and remov
     const markerPath = join(root, '.kontour-physical-host-quiesced');
     const permanentMarker = join(root, '.kontour-physical-host-id');
     await writeFile(leasePath, JSON.stringify({ ownerToken: OWNER_A, weight: 3, acquiredAt: '2020-01-01T00:00:00.000Z' }));
-    const args = ['--root', root, '--host-id', 'desktop-win-01', '--capacity-units', '3', '--recover', `lease:${OWNER_A}`];
+    const args = ['--root', root, '--host-id', 'desktop-win-01', '--capacity-units', '3', '--owner-lifetime-seconds', '60', '--recover', `lease:${OWNER_A}`];
     await assert.rejects(execFile(process.execPath, [recoverScript, ...args]), /ENOENT/);
     await access(leasePath);
     await access(permanentMarker); // identity is permanent, but is never recovery proof
@@ -198,6 +238,29 @@ test('a zero-timeout contender cleans up its durable ticket with an independent 
   });
 });
 
+test('post release removes a waiting owner ticket after cancellation before lease admission', async () => {
+  await withRoot(async (root) => {
+    const waitingConfig = config(root, { capacityUnits: 1, leaseWeight: 1, timeoutMs: 5_000, pollIntervalMs: 2 });
+    await provisionHost(waitingConfig);
+    await acquireLease(waitingConfig, { ownerToken: OWNER_A });
+    const waiting = acquireLease(waitingConfig, { ownerToken: OWNER_B });
+    const ticketPath = join(root, '.kontour-physical-host-capacity', 'tickets', `${OWNER_B}.json`);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        await access(ticketPath);
+        break;
+      } catch {
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 2));
+      }
+    }
+    await access(ticketPath);
+    assert.equal(await releaseLease(waitingConfig, OWNER_B), false);
+    await assert.rejects(waiting, /queue ticket disappeared/);
+    assert.deepEqual(await readdir(join(root, '.kontour-physical-host-capacity', 'tickets')), []);
+    await releaseLease(waitingConfig, OWNER_A);
+  }, { provision: false });
+});
+
 test('control candidates publish atomically and a held candidate cannot be stolen', async () => {
   await withRoot(async (root) => {
     const controls = join(root, '.kontour-physical-host-capacity', 'control-tickets');
@@ -227,7 +290,7 @@ test('contention diagnostics are capped and report omitted records', async () =>
     const leases = join(root, '.kontour-physical-host-capacity', 'leases');
     for (let index = 0; index < 8; index += 1) {
       const token = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
-      await writeFile(join(leases, `${token}.json`), JSON.stringify({ ownerToken: token, weight: 1, acquiredAt: new Date().toISOString() }));
+      await writeFile(join(leases, `${token}.json`), JSON.stringify({ ownerToken: token, weight: 1, acquiredAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() }));
     }
     await assert.rejects(acquireLease(diagnosticConfig, { ownerToken: OWNER_A }), /leases=.*omitted=2/);
   }, { provision: false });
@@ -248,7 +311,7 @@ test('partial sequence, ticket, and lease records fail closed, then targeted rec
     const tickets = join(state, 'tickets');
     const leases = join(state, 'leases');
     const marker = join(root, '.kontour-physical-host-quiesced');
-    const args = (target) => ['--root', root, '--host-id', 'desktop-win-01', '--capacity-units', '3', '--recover', target];
+    const args = (target) => ['--root', root, '--host-id', 'desktop-win-01', '--capacity-units', '3', '--owner-lifetime-seconds', '60', '--recover', target];
 
     await writeFile(join(sequences, '00000000000000000001'), 'partial');
     await assert.rejects(acquireLease(config(root), { ownerToken: OWNER_A }), /Invalid queue-sequence entry/);
@@ -396,6 +459,7 @@ test('action entrypoints persist state and release the acquired lease in the pos
       INPUT_LEASE_WEIGHT: '1',
       INPUT_TIMEOUT_SECONDS: '0',
       INPUT_POLL_INTERVAL_MS: '1',
+      INPUT_OWNER_LIFETIME_SECONDS: '60',
       GITHUB_OUTPUT: output,
       GITHUB_ENV: environment,
       GITHUB_STATE: state,

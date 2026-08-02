@@ -10,8 +10,11 @@ const QUEUE_SEQUENCE_DIRECTORY = 'queue-sequences';
 const STAGING_DIRECTORY = 'staging';
 const MANIFEST_FILE = 'host-manifest.json';
 const HOST_MARKER_FILE = '.kontour-physical-host-id';
-const MANIFEST_SCHEMA_VERSION = 6;
-const RECOVERY_STRATEGY = 'explicit-quiesced-recovery-v1';
+const MANIFEST_SCHEMA_VERSION = 7;
+const RECOVERY_STRATEGY = 'bounded-owner-deadline-v1';
+const LEGACY_MANIFEST_SCHEMA_VERSION = 6;
+const LEGACY_RECOVERY_STRATEGY = 'explicit-quiesced-recovery-v1';
+const LEGACY_OWNER_LIFETIME_FLOOR_MS = 6_000_000;
 const CLEANUP_RETRY_MS = 5_000;
 const MAX_DIAGNOSTIC_ENTRIES = 6;
 
@@ -87,11 +90,13 @@ export function parseConfig(env = process.env) {
   const leaseWeight = positiveInteger(input(env, 'lease-weight') ?? env.PHYSICAL_HOST_CAPACITY_WEIGHT ?? '1', 'lease-weight');
   const timeoutMs = durationMilliseconds(input(env, 'timeout-seconds') ?? env.PHYSICAL_HOST_CAPACITY_TIMEOUT_SECONDS ?? '300', 'timeout-seconds', { allowZero: true }).milliseconds;
   const pollIntervalMs = positiveInteger(input(env, 'poll-interval-ms') ?? env.PHYSICAL_HOST_CAPACITY_POLL_INTERVAL_MS ?? '1000', 'poll-interval-ms');
+  const ownerLifetime = durationMilliseconds(input(env, 'owner-lifetime-seconds') ?? env.PHYSICAL_HOST_CAPACITY_OWNER_LIFETIME_SECONDS ?? '6000', 'owner-lifetime-seconds');
 
   if (leaseWeight > capacityUnits) throw new CapacityCoordinationError(`lease-weight (${leaseWeight}) cannot exceed capacity-units (${capacityUnits}).`);
 
   return {
     root, hostId, capacityUnits, leaseWeight, timeoutMs, pollIntervalMs,
+    ownerLifetimeSeconds: ownerLifetime.seconds, ownerLifetimeMs: ownerLifetime.milliseconds,
   };
 }
 
@@ -209,12 +214,22 @@ function manifestFor(config) {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
     hostId: config.hostId,
     capacityUnits: config.capacityUnits,
+    ownerLifetimeSeconds: config.ownerLifetimeSeconds,
     recoveryStrategy: RECOVERY_STRATEGY,
   };
 }
 
 function validManifest(manifest, path) {
-  const expectedKeys = ['capacityUnits', 'hostId', 'recoveryStrategy', 'schemaVersion'];
+  const expectedKeys = ['capacityUnits', 'hostId', 'ownerLifetimeSeconds', 'recoveryStrategy', 'schemaVersion'];
+  const legacyKeys = ['capacityUnits', 'hostId', 'recoveryStrategy', 'schemaVersion'];
+  if (
+    manifest && typeof manifest === 'object' && !Array.isArray(manifest) &&
+    Object.keys(manifest).sort().join(',') === legacyKeys.join(',') &&
+    manifest.schemaVersion === LEGACY_MANIFEST_SCHEMA_VERSION &&
+    /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(manifest.hostId) &&
+    Number.isSafeInteger(manifest.capacityUnits) && manifest.capacityUnits >= 1 &&
+    manifest.recoveryStrategy === LEGACY_RECOVERY_STRATEGY
+  ) return { ...manifest, legacy: true };
   if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest) || Object.keys(manifest).sort().join(',') !== expectedKeys.join(',')) {
     throw new CapacityCoordinationError(`Invalid host manifest at ${path}; refusing to guess capacity configuration.`);
   }
@@ -222,12 +237,19 @@ function validManifest(manifest, path) {
     manifest.schemaVersion !== MANIFEST_SCHEMA_VERSION ||
     !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(manifest.hostId) ||
     !Number.isSafeInteger(manifest.capacityUnits) || manifest.capacityUnits < 1 ||
+    !Number.isSafeInteger(manifest.ownerLifetimeSeconds) || manifest.ownerLifetimeSeconds < 1 ||
     manifest.recoveryStrategy !== RECOVERY_STRATEGY
   ) throw new CapacityCoordinationError(`Invalid host manifest at ${path}; refusing to guess capacity configuration.`);
   return manifest;
 }
 
 function assertManifestMatches(manifest, config, path) {
+  if (manifest.legacy) {
+    if (manifest.hostId !== config.hostId || manifest.capacityUnits !== config.capacityUnits) {
+      throw new CapacityCoordinationError(`Host manifest mismatch at ${path}: legacy host identity or capacity differs from this job. Coordination cannot continue.`);
+    }
+    return;
+  }
   const expected = manifestFor(config);
   for (const key of Object.keys(expected)) {
     if (manifest[key] !== expected[key]) {
@@ -328,20 +350,20 @@ async function withControlLock(root, { timeoutMs, pollIntervalMs, now, sleep }, 
 }
 
 function validLease(record, path) {
-  if (!record || !/^[a-f0-9-]{36}$/i.test(record.ownerToken) || !Number.isSafeInteger(record.weight) || record.weight < 1 || typeof record.acquiredAt !== 'string') {
+  if (!record || !/^[a-f0-9-]{36}$/i.test(record.ownerToken) || !Number.isSafeInteger(record.weight) || record.weight < 1 || typeof record.acquiredAt !== 'string' || (record.expiresAt !== undefined && Number.isNaN(Date.parse(record.expiresAt)))) {
     throw new CapacityCoordinationError(`Invalid lease record at ${path}; refusing to guess capacity state.`);
   }
   return record;
 }
 
 function validTicket(record, path) {
-  if (!record || !/^[a-f0-9-]{36}$/i.test(record.ownerToken) || !Number.isSafeInteger(record.weight) || record.weight < 1 || !Number.isSafeInteger(record.sequence) || record.sequence < 1) {
+  if (!record || !/^[a-f0-9-]{36}$/i.test(record.ownerToken) || !Number.isSafeInteger(record.weight) || record.weight < 1 || !Number.isSafeInteger(record.sequence) || record.sequence < 1 || (record.expiresAt !== undefined && Number.isNaN(Date.parse(record.expiresAt)))) {
     throw new CapacityCoordinationError(`Invalid queue ticket at ${path}; refusing to guess capacity state.`);
   }
   return record;
 }
 
-async function listRecords(directory, label, validate) {
+async function listRecords(directory, label, validate, config, now) {
   const entries = await readdir(directory, { withFileTypes: true });
   const active = [];
   for (const entry of entries) {
@@ -349,7 +371,16 @@ async function listRecords(directory, label, validate) {
     if (!entry.isFile() || !entry.name.endsWith('.json')) throw new CapacityCoordinationError(`Unexpected ${label} entry at ${path}; refusing to guess capacity state.`);
     const info = await lstat(path);
     if (info.isSymbolicLink() || !info.isFile()) throw new CapacityCoordinationError(`Unexpected ${label} entry at ${path}; refusing to follow a symlink or junction.`);
-    active.push({ ...validate(await readJson(path, label), path), path });
+    const record = validate(await readJson(path, label), path);
+    // v6 did not persist an owner deadline. Its mtime fallback therefore uses
+    // the Station-wide 90-minute timeout plus margin floor, even when a caller
+    // supplies a shorter value during migration.
+    const expiry = record.expiresAt ? Date.parse(record.expiresAt) : info.mtimeMs + Math.max(config.ownerLifetimeMs, LEGACY_OWNER_LIFETIME_FLOOR_MS);
+    if (expiry <= now()) {
+      await removeRegularRecord(path, label);
+      continue;
+    }
+    active.push({ ...record, path });
   }
   return { active };
 }
@@ -365,7 +396,7 @@ function describe(leases, tickets, capacityUnits) {
   return `used=${used}/${capacityUnits}; leases=${summarize(leases, (lease) => `${lease.ownerToken.slice(0, 8)} weight=${lease.weight}`)}; queue=${summarize(tickets, (ticket) => `${ticket.ownerToken.slice(0, 8)} weight=${ticket.weight}`)}`;
 }
 
-async function createTicket(config, ownerToken) {
+async function createTicket(config, ownerToken, now) {
   const location = paths(config.root);
   const entries = await readdir(location.queueSequences, { withFileTypes: true });
   let maximum = 0n;
@@ -383,7 +414,9 @@ async function createTicket(config, ownerToken) {
   if (sequence > BigInt(Number.MAX_SAFE_INTEGER)) throw new CapacityCoordinationError('Queue sequence has exceeded safe integer range.');
   await mkdir(join(location.queueSequences, sequence.toString().padStart(20, '0')));
   const ticketPath = join(location.tickets, `${ownerToken}.json`);
-  await publishJson(ticketPath, JSON.stringify({ ownerToken, weight: config.leaseWeight, sequence: Number(sequence) }), location.staging);
+  const acquiredAt = new Date(now()).toISOString();
+  const expiresAt = new Date(now() + config.ownerLifetimeMs).toISOString();
+  await publishJson(ticketPath, JSON.stringify({ ownerToken, weight: config.leaseWeight, sequence: Number(sequence), acquiredAt, expiresAt }), location.staging);
   return ticketPath;
 }
 
@@ -409,15 +442,15 @@ export async function acquireLease(config, { ownerToken = randomUUID(), now = re
 
   try {
     await withControlLock(config.root, { ...config, timeoutMs: config.timeoutMs, now, sleep }, async () => {
-      await createTicket(config, ownerToken);
+      await createTicket(config, ownerToken, now);
       ticketCreated = true;
     });
     while (true) {
       const remaining = Math.max(0, deadline - now());
       const result = await withControlLock(config.root, { ...config, timeoutMs: remaining, now, sleep }, async () => {
         const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
-        const leaseRecords = await listRecords(paths(config.root).leases, 'lease record', validLease);
-        const ticketRecords = await listRecords(paths(config.root).tickets, 'queue ticket', validTicket);
+        const leaseRecords = await listRecords(paths(config.root).leases, 'lease record', validLease, config, now);
+        const ticketRecords = await listRecords(paths(config.root).tickets, 'queue ticket', validTicket, config, now);
         const tickets = ticketRecords.active.sort((a, b) => a.sequence - b.sequence);
         lastDescription = describe(leaseRecords.active, tickets, config.capacityUnits);
         const position = tickets.findIndex((ticket) => ticket.ownerToken === ownerToken);
@@ -426,7 +459,9 @@ export async function acquireLease(config, { ownerToken = randomUUID(), now = re
         if (position !== 0 || used + config.leaseWeight > config.capacityUnits) return null;
 
         const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
-        await publishJson(leasePath, JSON.stringify({ ...metadata, ownerToken, weight: config.leaseWeight, acquiredAt: new Date(now()).toISOString() }), paths(config.root).staging);
+        const acquiredAt = new Date(now()).toISOString();
+        const expiresAt = new Date(now() + config.ownerLifetimeMs).toISOString();
+        await publishJson(leasePath, JSON.stringify({ ...metadata, ownerToken, weight: config.leaseWeight, acquiredAt, expiresAt }), paths(config.root).staging);
         await removeRegularRecord(ticketPath, 'queue ticket');
         return { leasePath };
       });
@@ -452,15 +487,24 @@ export async function releaseLease(config, ownerToken, { now = realClock.now, sl
   const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
   return withControlLock(config.root, cleanup, async () => {
     const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
+    const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
+    let releasedLease = false;
     try {
       const lease = validLease(await readJson(leasePath, 'lease record'), leasePath);
       if (lease.ownerToken !== ownerToken) throw new CapacityCoordinationError(`Lease ownership mismatch at ${leasePath}; refusing to release another job's capacity.`);
       await removeRegularRecord(leasePath, 'lease record');
-      return true;
+      releasedLease = true;
     } catch (error) {
-      if (error.code === 'ENOENT') return false;
-      throw error;
+      if (error.code !== 'ENOENT') throw error;
     }
+    // The post step also runs when acquire.mjs was interrupted while waiting.
+    // Its UUID-targeted ticket is safe to remove even though no lease exists.
+    try {
+      await removeRegularRecord(ticketPath, 'queue ticket');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+    return releasedLease;
   });
 }
 
