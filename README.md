@@ -214,6 +214,9 @@ Control ownership uses a fully-synced candidate JSON file with an immutable
 owner token, instance token, and bounded repository/run/workflow/job/runner
 metadata. It atomically hard-links that file to `control-tickets/active`, so
 Windows and WSL observe one immutable active record with no empty-lock window.
+Native NTFS can transiently deny a just-published `active` read while another
+handle is closing; those reads retry only within the existing control deadline
+and must eventually validate a complete owner record or fail closed.
 The normal post step may reclaim an active lock only when its persisted owner
 token exactly matches that same job's token—for example, when GitHub cancelled
 its `acquire` process while it held control. Cleanup first hard-links the exact

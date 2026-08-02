@@ -402,6 +402,52 @@ test('native Windows-style EPERM contention is accepted only after a valid activ
   });
 });
 
+test('native Windows-style EPERM while reading active is retried, then fails closed at deadline', async () => {
+  await withRoot(async (root) => {
+    const active = join(root, '.kontour-physical-host-capacity', 'control-tickets', 'active');
+    let remainingFailures = 1;
+    const transientRead = async (path, encoding) => {
+      if (path === active && remainingFailures > 0) {
+        remainingFailures -= 1;
+        const error = new Error('EPERM native sharing read');
+        error.code = 'EPERM';
+        throw error;
+      }
+      return readFile(path, encoding);
+    };
+    const acquired = await acquireLease(config(root, { timeoutMs: 100 }), {
+      ownerToken: OWNER_A,
+      controlReadOperation: transientRead,
+    });
+    assert.equal(acquired.ownerToken, OWNER_A);
+    await releaseLease(config(root, { timeoutMs: 100 }), OWNER_A, { controlReadOperation: transientRead });
+  });
+
+  await withRoot(async (root) => {
+    const active = join(root, '.kontour-physical-host-capacity', 'control-tickets', 'active');
+    let now = 0;
+    const deniedRead = async (path, encoding) => {
+      if (path === active) {
+        const error = new Error('EPERM persistent native sharing read');
+        error.code = 'EPERM';
+        throw error;
+      }
+      return readFile(path, encoding);
+    };
+    await assert.rejects(
+      acquireLease(config(root, { timeoutMs: 10, pollIntervalMs: 1 }), {
+        ownerToken: OWNER_A,
+        now: () => now,
+        sleep: async () => { now += 10; },
+        controlReadOperation: deniedRead,
+      }),
+      /Timed out waiting to inspect active control ticket/,
+    );
+    assert.equal(existsSync(active), true);
+    await releaseLease(config(root), OWNER_A);
+  });
+});
+
 test('protected operation errors are not reclassified as contention or replayed', async () => {
   await withRoot(async (root) => {
     let invocations = 0;

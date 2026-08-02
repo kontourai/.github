@@ -349,16 +349,50 @@ function validControlOwner(record, path) {
   return record;
 }
 
-async function readControlOwnerRecord(controlPath) {
-  return validControlOwner(await readJson(controlPath, 'active control ticket'), controlPath);
+async function readControlOwnerRecord(controlPath, { readOperation = readFile } = {}) {
+  await assertRegularFile(controlPath, 'active control ticket');
+  let raw;
+  try {
+    raw = await readOperation(controlPath, 'utf8');
+  } catch (error) {
+    const wrapped = new CapacityCoordinationError(`Unable to read active control ticket at ${controlPath}: ${error.message}`, error);
+    wrapped.code = error.code;
+    throw wrapped;
+  }
+  try {
+    return validControlOwner(JSON.parse(raw), controlPath);
+  } catch (error) {
+    if (error instanceof CapacityCoordinationError) throw error;
+    throw new CapacityCoordinationError(`Invalid active control ticket at ${controlPath}; refusing to guess or steal control ownership.`, error);
+  }
 }
 
-async function readActiveControlOwner(controlPath) {
-  return readControlOwnerRecord(controlPath);
+async function readActiveControlOwner(controlPath, options) {
+  return readControlOwnerRecord(controlPath, options);
 }
 
 function errorCode(error) {
   return error?.code ?? error?.cause?.code;
+}
+
+async function readActiveControlOwnerWithRetry(controlPath, {
+  deadline,
+  now,
+  sleep,
+  pollIntervalMs,
+  readOperation,
+} = {}) {
+  while (true) {
+    try {
+      return await readActiveControlOwner(controlPath, { readOperation });
+    } catch (error) {
+      if (!['EPERM', 'EACCES'].includes(errorCode(error))) throw error;
+      if (now() >= deadline) {
+        throw new CapacityCoordinationError(`Timed out waiting to inspect active control ticket at ${controlPath}; transient sharing contention never produced a valid owner record.`, error);
+      }
+      await sleep(Math.min(pollIntervalMs, Math.max(1, deadline - now())));
+    }
+  }
 }
 
 async function publishControlLock(controlTickets, ownerToken, metadata, { linkOperation = link } = {}) {
@@ -377,15 +411,7 @@ async function publishControlLock(controlTickets, ownerToken, metadata, { linkOp
       return { candidatePath, record };
     } catch (error) {
       if (['EEXIST', 'ENOTEMPTY'].includes(error.code)) return false;
-      if (['EPERM', 'EACCES'].includes(error.code)) {
-        try {
-          await readActiveControlOwner(controlPath);
-          return false;
-        } catch (inspectionError) {
-          if (errorCode(inspectionError) === 'ENOENT') throw error;
-          throw inspectionError;
-        }
-      }
+      if (['EPERM', 'EACCES'].includes(error.code)) return false;
       throw error;
     }
   } finally {
@@ -408,13 +434,16 @@ function retiredControlPath(controlTickets, ownerToken) {
   return join(controlTickets, `.retired-${ownerToken}.json`);
 }
 
-async function assertActiveControlLockInstance(controlPath, candidatePath, expectedOwner) {
+async function assertActiveControlLockInstance(controlPath, candidatePath, expectedOwner, {
+  readOperation = readFile,
+  readOwner = (path) => readActiveControlOwner(path, { readOperation }),
+} = {}) {
   let activeOwner;
   let activeInfo;
   let candidateInfo;
   try {
     [activeOwner, activeInfo, candidateInfo] = await Promise.all([
-      readActiveControlOwner(controlPath),
+      readOwner(controlPath),
       stat(controlPath),
       stat(candidatePath),
     ]);
@@ -433,7 +462,12 @@ async function assertActiveControlLockInstance(controlPath, candidatePath, expec
   return activeOwner;
 }
 
-async function retireActiveControlLock(controlTickets, expectedOwner, { controlHooks = {}, candidatePath } = {}) {
+async function retireActiveControlLock(controlTickets, expectedOwner, {
+  controlHooks = {},
+  candidatePath,
+  readOperation = readFile,
+  inspectActive = readActiveControlOwner,
+} = {}) {
   const controlPath = join(controlTickets, 'active');
   const retiredPath = retiredControlPath(controlTickets, expectedOwner.ownerToken);
   let claimed = false;
@@ -455,10 +489,10 @@ async function retireActiveControlLock(controlTickets, expectedOwner, { controlH
       if (candidatePath) {
         // First retain the claim proof, then re-read the current directory
         // entry. A replacement between those checks must survive untouched.
-        await assertActiveControlLockInstance(retiredPath, candidatePath, expectedOwner);
-        await assertActiveControlLockInstance(controlPath, candidatePath, expectedOwner);
+        await assertActiveControlLockInstance(retiredPath, candidatePath, expectedOwner, { readOperation });
+        await assertActiveControlLockInstance(controlPath, candidatePath, expectedOwner, { readOperation, readOwner: inspectActive });
       } else {
-        await assertActiveControlLockInstance(controlPath, retiredPath, expectedOwner);
+        await assertActiveControlLockInstance(controlPath, retiredPath, expectedOwner, { readOperation, readOwner: inspectActive });
       }
       await unlink(controlPath);
     } catch (error) {
@@ -531,6 +565,7 @@ async function withControlLock(root, {
   ownerToken,
   metadata = {},
   linkOperation = link,
+  readOperation = readFile,
   controlHooks,
 }, operation) {
   // A fully synced candidate file is atomically hard-linked to `active`. A
@@ -539,6 +574,9 @@ async function withControlLock(root, {
   const controlTickets = paths(root).controlTickets;
   const controlPath = join(controlTickets, 'active');
   const deadline = now() + timeoutMs;
+  const inspectActive = (path = controlPath) => readActiveControlOwnerWithRetry(path, {
+    deadline, now, sleep, pollIntervalMs, readOperation,
+  });
   while (true) {
     await consumeDetachedRetirementBeforePublish(controlTickets, ownerToken);
     const published = await publishControlLock(controlTickets, ownerToken, metadata, { linkOperation });
@@ -548,7 +586,7 @@ async function withControlLock(root, {
       let retired = false;
       let operationError;
       try {
-        await assertActiveControlLockInstance(controlPath, published.candidatePath, heldOwner);
+        await assertActiveControlLockInstance(controlPath, published.candidatePath, heldOwner, { readOperation, readOwner: inspectActive });
         await controlHooks?.beforeControlOperation?.(heldOwner, controlPath, published.candidatePath);
         return await operation();
       } catch (error) {
@@ -556,7 +594,12 @@ async function withControlLock(root, {
         throw error;
       } finally {
         try {
-          retired = await retireActiveControlLock(controlTickets, heldOwner, { controlHooks, candidatePath: published.candidatePath });
+          retired = await retireActiveControlLock(controlTickets, heldOwner, {
+            controlHooks,
+            candidatePath: published.candidatePath,
+            readOperation,
+            inspectActive,
+          });
           if (!retired) throw new CapacityCoordinationError(`Active control ticket at ${controlPath} changed before its owner could release it; refusing to remove another owner's lock.`);
         } catch (cleanupError) {
           // Preserve the original proof/operation failure. A replacement lock
@@ -571,7 +614,7 @@ async function withControlLock(root, {
     }
     let owner;
     try {
-      owner = await readActiveControlOwner(controlPath);
+      owner = await inspectActive(controlPath);
     } catch (inspectionError) {
       // The owner can release between a failed publish and inspection. That
       // is a normal handoff; malformed or redirected locks fail closed.
@@ -579,7 +622,7 @@ async function withControlLock(root, {
       throw inspectionError;
     }
     if (owner.ownerToken === ownerToken) {
-      const retired = await retireActiveControlLock(controlTickets, owner, { controlHooks });
+      const retired = await retireActiveControlLock(controlTickets, owner, { controlHooks, readOperation, inspectActive });
       if (retired) {
         await removeExactControlRecord(candidateControlPath(controlTickets, owner), owner);
         await removeExactControlRecord(retiredControlPath(controlTickets, owner.ownerToken), owner);
@@ -696,10 +739,11 @@ async function removeTicket(config, ownerToken, {
   sleep = realClock.sleep,
   metadata = {},
   linkOperation = link,
+  controlReadOperation = readFile,
   controlHooks,
 } = {}) {
   const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
-  return withControlLock(config.root, { ...cleanup, ownerToken, metadata, linkOperation, controlHooks }, async () => {
+  return withControlLock(config.root, { ...cleanup, ownerToken, metadata, linkOperation, readOperation: controlReadOperation, controlHooks }, async () => {
     try {
       await removeRegularRecord(join(paths(config.root).tickets, `${ownerToken}.json`), 'queue ticket');
       return true;
@@ -716,6 +760,7 @@ export async function acquireLease(config, {
   sleep = realClock.sleep,
   metadata = {},
   controlLinkOperation = link,
+  controlReadOperation = readFile,
   controlHooks,
 } = {}) {
   assertOwnerToken(ownerToken);
@@ -725,13 +770,13 @@ export async function acquireLease(config, {
   let ticketCreated = false;
 
   try {
-    await withControlLock(config.root, { ...config, timeoutMs: config.timeoutMs, now, sleep, ownerToken, metadata, linkOperation: controlLinkOperation, controlHooks }, async () => {
+    await withControlLock(config.root, { ...config, timeoutMs: config.timeoutMs, now, sleep, ownerToken, metadata, linkOperation: controlLinkOperation, readOperation: controlReadOperation, controlHooks }, async () => {
       await createTicket(config, ownerToken, now, metadata);
       ticketCreated = true;
     });
     while (true) {
       const remaining = Math.max(0, deadline - now());
-      const result = await withControlLock(config.root, { ...config, timeoutMs: remaining, now, sleep, ownerToken, metadata, linkOperation: controlLinkOperation, controlHooks }, async () => {
+      const result = await withControlLock(config.root, { ...config, timeoutMs: remaining, now, sleep, ownerToken, metadata, linkOperation: controlLinkOperation, readOperation: controlReadOperation, controlHooks }, async () => {
         const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
         const leaseRecords = await listRecords(paths(config.root).leases, 'lease record', validLease, config, now);
         const ticketRecords = await listRecords(paths(config.root).tickets, 'queue ticket', validTicket, config, now);
@@ -765,7 +810,7 @@ export async function acquireLease(config, {
   } catch (error) {
     if (ticketCreated) {
       try {
-        await removeTicket(config, ownerToken, { now, sleep, metadata, linkOperation: controlLinkOperation, controlHooks });
+        await removeTicket(config, ownerToken, { now, sleep, metadata, linkOperation: controlLinkOperation, controlReadOperation, controlHooks });
       } catch (cleanupError) {
         throw new CapacityCoordinationError(`${error.message} Queue ticket cleanup also failed: ${cleanupError.message}`, cleanupError);
       }
@@ -779,12 +824,13 @@ export async function releaseLease(config, ownerToken, {
   sleep = realClock.sleep,
   metadata = {},
   controlLinkOperation = link,
+  controlReadOperation = readFile,
   controlHooks,
 } = {}) {
   assertOwnerToken(ownerToken);
   await ensureProvisioned(config);
   const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
-  return withControlLock(config.root, { ...cleanup, ownerToken, metadata, linkOperation: controlLinkOperation, controlHooks }, async () => {
+  return withControlLock(config.root, { ...cleanup, ownerToken, metadata, linkOperation: controlLinkOperation, readOperation: controlReadOperation, controlHooks }, async () => {
       const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
       const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
       let releasedLease = false;
