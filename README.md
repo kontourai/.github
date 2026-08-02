@@ -84,6 +84,11 @@ dependency caches to the owning workflow. Each runner accepts one job at a
 time; horizontal capacity comes from registering more runners with the same
 capability labels.
 
+For a Windows host whose WSL distribution needs an SSD-backed runner workspace,
+use the generic [Windows + WSL runner workspace kit](runner-host/README.md).
+It attaches a parameterized VHD at boot and mounts it by ext4 UUID before
+runner services start; it does not modify a live host from this repository.
+
 ### Shared physical-host capacity
 
 Windows-native and WSL/Linux runners can still compete for CPU, RAM, disk, or a
