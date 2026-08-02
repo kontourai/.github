@@ -165,8 +165,11 @@ re-provisioning it.
 The action never starts a detached process. Its post step releases the lease on
 normal failure or cancellation. If GitHub removes a command file after the
 lease is acquired, the main step releases its own lease immediately; the post
-step remains an idempotent fallback. Lease records include repository, run,
-workflow, job, and runner metadata to make contention diagnostics actionable.
+step remains an idempotent fallback. Both lease and FIFO ticket records include
+repository, run/attempt, workflow, job, and runner metadata to make contention
+diagnostics actionable while a job is still waiting. The coordinator owns each
+record's token, weight, sequence (tickets), and timestamps; caller metadata
+cannot replace those fields.
 If the runner is lost before either cleanup path can run, a later participant
 reclaims its lease or queue ticket only after the recorded owner lifetime
 expires. Set `owner-lifetime-seconds` to at least the workflow job's
@@ -195,17 +198,47 @@ an older larger job. The action deliberately does not backfill a smaller ticket
 around an oversized head: without a separate bounded-bypass and aging policy,
 that optimization can starve the head indefinitely. Timeout cleanup retries independently for up to five
 seconds even when the acquisition timeout is zero.
-Contention diagnostics are capped and include an omitted-entry count.
+Contention diagnostics are capped and include an omitted-entry count. Each
+shown lease or ticket identifies its repository, run/attempt, workflow, job,
+and runner; individual metadata values are length-bounded. Older records that
+predate this metadata remain valid and are reported as `unknown`, rather than
+being treated as corrupt. Use the ticket UUID in the diagnostic with the
+recovery command only after the documented quiescence check.
 
 Sequence values are append-only directory markers, so a crash can leave a gap
 but cannot truncate or reorder an assigned value. Lease and ticket JSON is
 written and fsynced in the private `staging/` directory before an atomic rename
 publishes the final record.
 
-Control ownership uses an atomically created `control-tickets/active` directory;
-there is no shared empty-lock publication window. It has no
-automatic stale stealing. A wedged control ticket fails closed with a typed
-diagnostic. After draining the runners and confirming no owner job is live, an
+Control ownership uses a fully-synced candidate JSON file with an immutable
+owner token, instance token, and bounded repository/run/workflow/job/runner
+metadata. It atomically hard-links that file to `control-tickets/active`, so
+Windows and WSL observe one immutable active record with no empty-lock window.
+Native NTFS can transiently deny a just-published `active` read while another
+handle is closing; those reads retry only within the existing control deadline
+and must eventually validate a complete owner record or fail closed.
+The same deadline applies when NTFS denies publication itself and no active
+owner record appears, preventing an unbounded contention loop.
+The normal post step may reclaim an active lock only when its persisted owner
+token exactly matches that same job's token—for example, when GitHub cancelled
+its `acquire` process while it held control. Cleanup first hard-links the exact
+active instance to a deterministic private retirement claim; only the cleaner
+that created that claim may unlink `active`. A second same-owner cleanup never
+deletes a later foreign active record. The live candidate remains an inode
+witness until protected work exits: immediately before entering that work,
+`active` must still name the exact owner/instance and inode, never merely the
+same owner token.
+
+Candidate and retired artifacts are cleaned only when their filename and
+owner token exactly match the post step. A retirement claim whose active link
+still exists is intentionally fail-closed: it means a cleaner may have died
+between claiming and unlinking, so it requires the documented quiesced manual
+recovery rather than automatic stealing. If `active` is already absent, a
+later invocation with that exact owner token consumes only its deterministic
+detached candidate and retirement paths before it publishes a new lock; it
+never scans or removes other owners' artifacts. Different owners never steal
+automatically, and incomplete, malformed, or redirected active records fail
+closed. After draining the runners and confirming no owner job is live, an
 operator must create the distinct regular
 `.kontour-physical-host-quiesced` file (never the permanent identity marker)
 containing exactly the host ID after draining the runners, then run the
@@ -223,7 +256,7 @@ node scripts/recover-physical-host-capacity.mjs \
 
 Use `--recover ticket:<owner-uuid>` for a confirmed-abandoned queue ticket,
 `--recover sequence:<20-digit-marker>` only for a malformed regular sequence
-entry, or `--recover control:active` for a wedged control directory. The command never
+entry, or `--recover control:active` for a wedged control record. The command never
 accepts a broad clear operation. Never delete the external marker, manifest,
 queue-sequence directory, staging directory, or an unreviewed record. On success it removes the
 quiescence marker; on failure, inspect it before removing it when the root is
