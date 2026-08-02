@@ -114,7 +114,7 @@ jobs:
           capacity-units: '8'
           lease-weight: '5'
           timeout-seconds: '240'
-          owner-lifetime-seconds: '2100' # job timeout (1800s) plus recovery margin
+          owner-lifetime-seconds: '6000' # shared 90-minute maximum plus 10-minute margin
       - shell: pwsh
         run: npm test
 
@@ -132,7 +132,7 @@ jobs:
           capacity-units: '8'
           lease-weight: '3'
           timeout-seconds: '240'
-          owner-lifetime-seconds: '2100' # job timeout (1800s) plus recovery margin
+          owner-lifetime-seconds: '6000' # shared 90-minute maximum plus 10-minute margin
       - run: npm test
 ```
 
@@ -147,7 +147,7 @@ node scripts/provision-physical-host-capacity.mjs \
   --root /mnt/d/kontour-runner-capacity \
   --host-id desktop-win-01 \
   --capacity-units 8 \
-  --owner-lifetime-seconds 2100
+  --owner-lifetime-seconds 6000
 ```
 
 Provisioning writes an externally located `.kontour-physical-host-id` marker
@@ -167,20 +167,24 @@ for a root must use the same value.
 This is the action's liveness boundary without a GitHub token or API: expiry
 does not probe GitHub or prove a process died. It is safe only because the
 workflow contract guarantees the owner cannot still run beyond its declared job
-timeout. Do not set a lifetime below that timeout. The default 2100 seconds is
-for the documented 30-minute jobs plus five minutes of margin.
+timeout. Do not set a lifetime below that timeout. The shared default is 6000
+seconds: Station's 90-minute maximum job timeout plus ten minutes of margin.
 
 Roots provisioned by schema v6 are read in compatibility mode so the first
 updated participant can clear the stranded records from a killed runner. Those
-legacy records have no deadline, so their shared-file timestamp is used only
-with the configured owner lifetime; drain and re-provision the root afterward
-to make the v7 deadline contract authoritative.
+legacy records have no deadline, so their shared-file timestamp uses at least
+the 6000-second shared safety floor even if a caller supplies a shorter value.
+Drain and re-provision the root afterward to make the v7 deadline contract
+authoritative. Do not change a v7 root's shared lifetime while live records
+exist: drain it first, then re-provision every caller with the same value.
 
 Waiting jobs create durable weighted FIFO tickets. Their order comes from a
 shared monotonic sequence assigned under the control protocol—not process
 clock time—so Windows/WSL wall-clock skew cannot reorder waiters. Only the
 oldest ticket may claim available capacity, so later small jobs cannot starve
-an older larger job. Timeout cleanup retries independently for up to five
+an older larger job. The action deliberately does not backfill a smaller ticket
+around an oversized head: without a separate bounded-bypass and aging policy,
+that optimization can starve the head indefinitely. Timeout cleanup retries independently for up to five
 seconds even when the acquisition timeout is zero.
 Contention diagnostics are capped and include an omitted-entry count.
 
@@ -204,7 +208,7 @@ node scripts/recover-physical-host-capacity.mjs \
   --root /mnt/d/kontour-runner-capacity \
   --host-id desktop-win-01 \
   --capacity-units 8 \
-  --owner-lifetime-seconds 2100 \
+  --owner-lifetime-seconds 6000 \
   --recover lease:<owner-uuid>
 ```
 

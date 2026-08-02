@@ -27,7 +27,7 @@ inputs:
   owner-lifetime-seconds:
     description: Maximum lifetime of one job after capacity acquisition. It must be at least the job timeout plus recovery margin; expired records are reclaimed.
     required: false
-    default: "2100"
+    default: "6000"
 
 outputs:
   owner-token:

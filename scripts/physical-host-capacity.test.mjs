@@ -169,7 +169,7 @@ test('an orphaned FIFO head ticket is reclaimed so a later live waiter can enter
   }, { provision: false });
 });
 
-test('a v6 root recovers stranded lease and head ticket records after the configured deadline', async () => {
+test('a v6 root honors the 90-minute migration floor before recovering stranded records', async () => {
   await withRoot(async (root) => {
     const legacyConfig = config(root, { capacityUnits: 1, leaseWeight: 1, ownerLifetimeSeconds: 5, ownerLifetimeMs: 5_000 });
     await provisionHost(legacyConfig);
@@ -179,7 +179,9 @@ test('a v6 root recovers stranded lease and head ticket records after the config
     const tickets = join(state, 'tickets');
     await writeFile(join(leases, `${OWNER_A}.json`), JSON.stringify({ ownerToken: OWNER_A, weight: 1, acquiredAt: new Date().toISOString() }));
     await writeFile(join(tickets, `${OWNER_B}.json`), JSON.stringify({ ownerToken: OWNER_B, weight: 1, sequence: 1 }));
-    const now = Date.now() + 5_001;
+    const tooEarly = Date.now() + 5_001;
+    await assert.rejects(acquireLease(legacyConfig, { ownerToken: OWNER_C, now: () => tooEarly }), /used=1\/1/);
+    const now = Date.now() + 6_000_001;
     const acquired = await acquireLease(legacyConfig, { ownerToken: OWNER_C, now: () => now });
     assert.equal(acquired.ownerToken, OWNER_C);
   }, { provision: false });
@@ -234,6 +236,29 @@ test('a zero-timeout contender cleans up its durable ticket with an independent 
     await assert.rejects(acquireLease(config(root), { ownerToken: OWNER_B }), /Timed out after 0s/);
     assert.deepEqual(await readdir(join(root, '.kontour-physical-host-capacity', 'tickets')), []);
   });
+});
+
+test('post release removes a waiting owner ticket after cancellation before lease admission', async () => {
+  await withRoot(async (root) => {
+    const waitingConfig = config(root, { capacityUnits: 1, leaseWeight: 1, timeoutMs: 5_000, pollIntervalMs: 2 });
+    await provisionHost(waitingConfig);
+    await acquireLease(waitingConfig, { ownerToken: OWNER_A });
+    const waiting = acquireLease(waitingConfig, { ownerToken: OWNER_B });
+    const ticketPath = join(root, '.kontour-physical-host-capacity', 'tickets', `${OWNER_B}.json`);
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        await access(ticketPath);
+        break;
+      } catch {
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 2));
+      }
+    }
+    await access(ticketPath);
+    assert.equal(await releaseLease(waitingConfig, OWNER_B), false);
+    await assert.rejects(waiting, /queue ticket disappeared/);
+    assert.deepEqual(await readdir(join(root, '.kontour-physical-host-capacity', 'tickets')), []);
+    await releaseLease(waitingConfig, OWNER_A);
+  }, { provision: false });
 });
 
 test('control candidates publish atomically and a held candidate cannot be stolen', async () => {
