@@ -17,6 +17,7 @@ const LEGACY_RECOVERY_STRATEGY = 'explicit-quiesced-recovery-v1';
 const LEGACY_OWNER_LIFETIME_FLOOR_MS = 6_000_000;
 const CLEANUP_RETRY_MS = 5_000;
 const MAX_DIAGNOSTIC_ENTRIES = 6;
+const MAX_DIAGNOSTIC_VALUE_LENGTH = 120;
 
 export class CapacityCoordinationError extends Error {
   constructor(message, cause) {
@@ -391,12 +392,28 @@ function summarize(records, format) {
   return `${shown.join('; ') || 'none'}${omitted > 0 ? `; omitted=${omitted}` : ''}`;
 }
 
-function describe(leases, tickets, capacityUnits) {
-  const used = leases.reduce((total, lease) => total + lease.weight, 0);
-  return `used=${used}/${capacityUnits}; leases=${summarize(leases, (lease) => `${lease.ownerToken.slice(0, 8)} weight=${lease.weight}`)}; queue=${summarize(tickets, (ticket) => `${ticket.ownerToken.slice(0, 8)} weight=${ticket.weight}`)}`;
+function diagnosticValue(value) {
+  if (typeof value !== 'string' || value.trim() === '') return 'unknown';
+  const normalized = value.trim();
+  if (normalized.length <= MAX_DIAGNOSTIC_VALUE_LENGTH) return normalized;
+  return `${normalized.slice(0, MAX_DIAGNOSTIC_VALUE_LENGTH - 3)}...`;
 }
 
-async function createTicket(config, ownerToken, now) {
+function diagnosticIdentity(record) {
+  const value = (name) => JSON.stringify(diagnosticValue(record[name]));
+  return `repo=${value('repository')} run=${value('runId')}/${value('runAttempt')} workflow=${value('workflow')} job=${value('job')} runner=${value('runnerName')}`;
+}
+
+function describe(leases, tickets, capacityUnits) {
+  const used = leases.reduce((total, lease) => total + lease.weight, 0);
+  return `used=${used}/${capacityUnits}; leases=${summarize(leases, (lease) => `${lease.ownerToken.slice(0, 8)} weight=${lease.weight} ${diagnosticIdentity(lease)}`)}; queue=${summarize(tickets, (ticket) => `${ticket.ownerToken.slice(0, 8)} weight=${ticket.weight} sequence=${ticket.sequence} ${diagnosticIdentity(ticket)}`)}`;
+}
+
+function recordWithMetadata(metadata, authoritativeFields) {
+  return { ...metadata, ...authoritativeFields };
+}
+
+async function createTicket(config, ownerToken, now, metadata) {
   const location = paths(config.root);
   const entries = await readdir(location.queueSequences, { withFileTypes: true });
   let maximum = 0n;
@@ -416,7 +433,17 @@ async function createTicket(config, ownerToken, now) {
   const ticketPath = join(location.tickets, `${ownerToken}.json`);
   const acquiredAt = new Date(now()).toISOString();
   const expiresAt = new Date(now() + config.ownerLifetimeMs).toISOString();
-  await publishJson(ticketPath, JSON.stringify({ ownerToken, weight: config.leaseWeight, sequence: Number(sequence), acquiredAt, expiresAt }), location.staging);
+  await publishJson(
+    ticketPath,
+    JSON.stringify(recordWithMetadata(metadata, {
+      ownerToken,
+      weight: config.leaseWeight,
+      sequence: Number(sequence),
+      acquiredAt,
+      expiresAt,
+    })),
+    location.staging,
+  );
   return ticketPath;
 }
 
@@ -442,7 +469,7 @@ export async function acquireLease(config, { ownerToken = randomUUID(), now = re
 
   try {
     await withControlLock(config.root, { ...config, timeoutMs: config.timeoutMs, now, sleep }, async () => {
-      await createTicket(config, ownerToken, now);
+      await createTicket(config, ownerToken, now, metadata);
       ticketCreated = true;
     });
     while (true) {
@@ -461,7 +488,16 @@ export async function acquireLease(config, { ownerToken = randomUUID(), now = re
         const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
         const acquiredAt = new Date(now()).toISOString();
         const expiresAt = new Date(now() + config.ownerLifetimeMs).toISOString();
-        await publishJson(leasePath, JSON.stringify({ ...metadata, ownerToken, weight: config.leaseWeight, acquiredAt, expiresAt }), paths(config.root).staging);
+        await publishJson(
+          leasePath,
+          JSON.stringify(recordWithMetadata(metadata, {
+            ownerToken,
+            weight: config.leaseWeight,
+            acquiredAt,
+            expiresAt,
+          })),
+          paths(config.root).staging,
+        );
         await removeRegularRecord(ticketPath, 'queue ticket');
         return { leasePath };
       });

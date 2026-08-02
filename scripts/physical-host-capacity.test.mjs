@@ -297,6 +297,46 @@ test('contention diagnostics are capped and report omitted records', async () =>
   }, { provision: false });
 });
 
+test('bounded contention diagnostics identify queue tickets without exposing unbounded metadata', async () => {
+  await withRoot(async (root) => {
+    const diagnosticConfig = config(root, { capacityUnits: 8, leaseWeight: 1 });
+    await provisionHost(diagnosticConfig);
+    const state = join(root, '.kontour-physical-host-capacity');
+    const tickets = join(state, 'tickets');
+    const overlongRunnerName = `desktop-win-linux-0-${'x'.repeat(200)}`;
+    for (let index = 0; index < 8; index += 1) {
+      const token = `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
+      const sequence = String(index + 1).padStart(20, '0');
+      await mkdir(join(state, 'queue-sequences', sequence));
+      await writeFile(join(tickets, `${token}.json`), JSON.stringify({
+        ownerToken: token,
+        weight: 1,
+        sequence: index + 1,
+        acquiredAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        repository: `kontourai/ticket-${index}`,
+        runId: String(30_770_000_000 + index),
+        runAttempt: '1',
+        workflow: 'CI Extended',
+        job: 'playwright',
+        runnerName: index === 0 ? overlongRunnerName : `desktop-win-linux-${index}`,
+      }));
+    }
+
+    let diagnostic;
+    await assert.rejects(
+      acquireLease(diagnosticConfig, { ownerToken: OWNER_A }),
+      (error) => {
+        diagnostic = error;
+        return error instanceof CapacityCoordinationError && /queue=.*omitted=3/.test(error.message);
+      },
+    );
+    assert.match(diagnostic.message, /repo="kontourai\/ticket-0" run="30770000000"\/"1" workflow="CI Extended" job="playwright" runner="desktop-win-linux-0-/);
+    assert.doesNotMatch(diagnostic.message, new RegExp('x'.repeat(121)));
+    assert.doesNotMatch(diagnostic.message, /kontourai\/ticket-6/);
+  }, { provision: false });
+});
+
 test('a partially published ticket fails closed and cannot be admitted', async () => {
   await withRoot(async (root) => {
     const tickets = join(root, '.kontour-physical-host-capacity', 'tickets');
@@ -443,6 +483,91 @@ test('metadata cannot override a lease owner, weight, or acquisition time', asyn
     assert.notEqual(lease.acquiredAt, '2020-01-01T00:00:00.000Z');
     assert.equal(lease.repository, 'example');
   });
+});
+
+test('ticket metadata is observable and cannot override FIFO ownership fields', async () => {
+  await withRoot(async (root) => {
+    const waitingConfig = config(root, { capacityUnits: 1, leaseWeight: 1, timeoutMs: 5_000, pollIntervalMs: 2 });
+    await provisionHost(waitingConfig);
+    await acquireLease(waitingConfig, { ownerToken: OWNER_A });
+    const ticketPath = join(root, '.kontour-physical-host-capacity', 'tickets', `${OWNER_B}.json`);
+    const waiting = acquireLease(waitingConfig, {
+      ownerToken: OWNER_B,
+      metadata: {
+        ownerToken: OWNER_C,
+        weight: 99,
+        sequence: 99,
+        acquiredAt: '2020-01-01T00:00:00.000Z',
+        expiresAt: '2020-01-01T00:01:00.000Z',
+        repository: 'kontourai/station',
+        runId: '30770000000',
+        runAttempt: '2',
+        workflow: 'CI Extended',
+        job: 'playwright',
+        runnerName: 'desktop-win-linux',
+      },
+    });
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      try {
+        await access(ticketPath);
+        break;
+      } catch {
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 2));
+      }
+    }
+    const ticket = JSON.parse(await readFile(ticketPath, 'utf8'));
+    assert.equal(ticket.ownerToken, OWNER_B);
+    assert.equal(ticket.weight, 1);
+    assert.equal(ticket.sequence, 2);
+    assert.notEqual(ticket.acquiredAt, '2020-01-01T00:00:00.000Z');
+    assert.notEqual(ticket.expiresAt, '2020-01-01T00:01:00.000Z');
+    assert.deepEqual(
+      {
+        repository: ticket.repository,
+        runId: ticket.runId,
+        runAttempt: ticket.runAttempt,
+        workflow: ticket.workflow,
+        job: ticket.job,
+        runnerName: ticket.runnerName,
+      },
+      {
+        repository: 'kontourai/station',
+        runId: '30770000000',
+        runAttempt: '2',
+        workflow: 'CI Extended',
+        job: 'playwright',
+        runnerName: 'desktop-win-linux',
+      },
+    );
+    await releaseLease(waitingConfig, OWNER_A);
+    const acquired = await waiting;
+    await releaseLease(waitingConfig, acquired.ownerToken);
+  }, { provision: false });
+});
+
+test('legacy tickets without metadata remain valid and use safe diagnostic fallbacks', async () => {
+  await withRoot(async (root) => {
+    const legacyTicketConfig = config(root, { capacityUnits: 1, leaseWeight: 1 });
+    await provisionHost(legacyTicketConfig);
+    const state = join(root, '.kontour-physical-host-capacity');
+    await mkdir(join(state, 'queue-sequences', '00000000000000000001'));
+    await writeFile(
+      join(state, 'tickets', `${OWNER_A}.json`),
+      JSON.stringify({
+        ownerToken: OWNER_A,
+        weight: 1,
+        sequence: 1,
+        acquiredAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      }),
+    );
+
+    await assert.rejects(
+      acquireLease(legacyTicketConfig, { ownerToken: OWNER_B }),
+      (error) => error instanceof CapacityCoordinationError
+        && /queue=11111111 weight=1 sequence=1 repo="unknown" run="unknown"\/"unknown" workflow="unknown" job="unknown" runner="unknown"/.test(error.message),
+    );
+  }, { provision: false });
 });
 
 test('action entrypoints persist state and release the acquired lease in the post step', async () => {

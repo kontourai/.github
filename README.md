@@ -165,8 +165,11 @@ re-provisioning it.
 The action never starts a detached process. Its post step releases the lease on
 normal failure or cancellation. If GitHub removes a command file after the
 lease is acquired, the main step releases its own lease immediately; the post
-step remains an idempotent fallback. Lease records include repository, run,
-workflow, job, and runner metadata to make contention diagnostics actionable.
+step remains an idempotent fallback. Both lease and FIFO ticket records include
+repository, run/attempt, workflow, job, and runner metadata to make contention
+diagnostics actionable while a job is still waiting. The coordinator owns each
+record's token, weight, sequence (tickets), and timestamps; caller metadata
+cannot replace those fields.
 If the runner is lost before either cleanup path can run, a later participant
 reclaims its lease or queue ticket only after the recorded owner lifetime
 expires. Set `owner-lifetime-seconds` to at least the workflow job's
@@ -195,7 +198,12 @@ an older larger job. The action deliberately does not backfill a smaller ticket
 around an oversized head: without a separate bounded-bypass and aging policy,
 that optimization can starve the head indefinitely. Timeout cleanup retries independently for up to five
 seconds even when the acquisition timeout is zero.
-Contention diagnostics are capped and include an omitted-entry count.
+Contention diagnostics are capped and include an omitted-entry count. Each
+shown lease or ticket identifies its repository, run/attempt, workflow, job,
+and runner; individual metadata values are length-bounded. Older records that
+predate this metadata remain valid and are reported as `unknown`, rather than
+being treated as corrupt. Use the ticket UUID in the diagnostic with the
+recovery command only after the documented quiescence check.
 
 Sequence values are append-only directory markers, so a crash can leave a gap
 but cannot truncate or reorder an assigned value. Lease and ticket JSON is
