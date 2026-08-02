@@ -17,9 +17,25 @@ param(
   [ValidateNotNullOrEmpty()]
   [string]$WslWindowsUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name,
 
-  [string]$WslBootstrapCommand,
+  [string]$WslBootstrapScript,
 
-  [string]$WslHealthCommand,
+  [string]$WslHealthScript,
+
+  [string]$WslUuid,
+
+  [string]$WslMountRoot,
+
+  [string[]]$WslBind = @(),
+
+  [string]$WslHealthIncidentPath,
+
+  [ValidateRange(1, 86400)]
+  [int]$WslHealthTimeoutSeconds = 30,
+
+  [ValidateRange(1, 86400)]
+  [int]$WslHealthIntervalSeconds = 60,
+
+  [string[]]$RunnerService = @(),
 
   [ValidateNotNullOrEmpty()]
   [string]$BootTaskName = 'Kontour WSL runner workspace VHD attach',
@@ -70,24 +86,87 @@ function Attach-WorkspaceVhd {
   return $true
 }
 
-function Invoke-WslBootstrap {
-  if ([string]::IsNullOrWhiteSpace($WslBootstrapCommand) -or $WslBootstrapCommand.Contains("`n") -or $WslBootstrapCommand.Contains("`r") -or $WslBootstrapCommand -notmatch '--uuid\s+[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}') {
-    throw 'AttachAndBootstrap requires a single-line WslBootstrapCommand that mounts by UUID, binds runner paths, and starts services.'
+function Assert-WslCanonicalPath {
+  param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$Description)
+  if ([string]::IsNullOrWhiteSpace($Path) -or $Path -notmatch '^/' -or $Path.Contains("`n") -or $Path.Contains("`r") -or ($Path.Split('/') | Where-Object { $_ -in @('.', '..') })) {
+    throw "$Description must be a canonical absolute Linux path without traversal."
   }
-  & wsl.exe --distribution $DistroName --user root -- bash -lc $WslBootstrapCommand
+}
+
+function Assert-WslCanonicalRootOwnedScript {
+  param([Parameter(Mandatory = $true)][string]$ScriptPath)
+  Assert-WslCanonicalPath -Path $ScriptPath -Description 'WSL script path'
+  $resolvedPath = (& wsl.exe --distribution $DistroName --user root --exec /usr/bin/readlink -f -- $ScriptPath | Select-Object -First 1).Trim()
+  if ($LASTEXITCODE -ne 0 -or $resolvedPath -ne $ScriptPath) {
+    throw "WSL script path is not canonical or resolves through a link: $ScriptPath"
+  }
+  $currentPath = $ScriptPath
+  while ($true) {
+    $metadata = (& wsl.exe --distribution $DistroName --user root --exec /usr/bin/stat "--format=%U|%a|%F" -- $currentPath | Select-Object -First 1).Trim()
+    if ($LASTEXITCODE -ne 0 -or $metadata -notmatch '^(?<owner>[^|]+)\|(?<mode>[0-7]+)\|(?<kind>.+)$') {
+      throw "Could not verify WSL script metadata: $currentPath"
+    }
+    $mode = [Convert]::ToInt32($Matches.mode, 8)
+    if ($Matches.owner -ne 'root' -or ($mode -band 18) -ne 0) {
+      throw "WSL script ancestry must be root-owned and not group- or world-writable: $currentPath"
+    }
+    if ($currentPath -eq $ScriptPath -and ($Matches.kind -ne 'regular file' -or ($mode -band 64) -eq 0)) {
+      throw "WSL script must be a root-owned, executable regular file: $ScriptPath"
+    }
+    if ($currentPath -eq '/') { break }
+    $lastSlash = $currentPath.LastIndexOf('/')
+    $currentPath = if ($lastSlash -eq 0) { '/' } else { $currentPath.Substring(0, $lastSlash) }
+  }
+}
+
+function Assert-WslOperationalConfiguration {
+  if ([string]::IsNullOrWhiteSpace($WslUuid) -or $WslUuid -notmatch '^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$') {
+    throw 'Runner startup requires WslUuid in canonical UUID form.'
+  }
+  Assert-WslCanonicalPath -Path $WslMountRoot -Description 'WslMountRoot'
+  Assert-WslCanonicalPath -Path $WslHealthIncidentPath -Description 'WslHealthIncidentPath'
+  if ($WslBind.Count -eq 0 -or $RunnerService.Count -eq 0) {
+    throw 'Runner startup requires at least one WslBind and RunnerService.'
+  }
+  foreach ($binding in $WslBind) {
+    if ($binding -notmatch '^(?<source>/[^:]+):(?<target>/[^:]+)$') { throw "WslBind must be canonical absolute SOURCE:TARGET: $binding" }
+    Assert-WslCanonicalPath -Path $Matches.source -Description 'WslBind source'
+    Assert-WslCanonicalPath -Path $Matches.target -Description 'WslBind target'
+  }
+  foreach ($service in $RunnerService) {
+    if ($service -notmatch '^[A-Za-z0-9@_.:-]+\.service$') { throw "RunnerService must be a simple .service unit name: $service" }
+  }
+  Assert-WslCanonicalRootOwnedScript -ScriptPath $WslBootstrapScript
+  Assert-WslCanonicalRootOwnedScript -ScriptPath $WslHealthScript
+}
+
+function Invoke-WslBootstrap {
+  $arguments = @('--distribution', $DistroName, '--user', 'root', '--exec', $WslBootstrapScript, '--uuid', $WslUuid, '--mount-root', $WslMountRoot)
+  foreach ($binding in $WslBind) { $arguments += @('--bind', $binding) }
+  $arguments += @('--health-script', $WslHealthScript, '--health-incident-path', $WslHealthIncidentPath, '--health-timeout-seconds', "$WslHealthTimeoutSeconds")
+  foreach ($service in $RunnerService) { $arguments += @('--service', $service) }
+  & wsl.exe @arguments
   if ($LASTEXITCODE -ne 0) {
     throw "WSL bootstrap failed for distribution $DistroName. Runner services were not started."
   }
 }
 
+function Invoke-WslContainment {
+  $arguments = @('--distribution', $DistroName, '--user', 'root', '--exec', $WslHealthScript, 'contain', '--probe-path', $WslMountRoot, '--incident-path', $WslHealthIncidentPath, '--timeout-seconds', "$WslHealthTimeoutSeconds")
+  foreach ($service in $RunnerService) { $arguments += @('--service', $service) }
+  & wsl.exe @arguments
+  return $LASTEXITCODE -eq 0
+}
+
 function Invoke-WslKeepAlive {
-  if ([string]::IsNullOrWhiteSpace($WslHealthCommand) -or $WslHealthCommand.Contains("`n") -or $WslHealthCommand.Contains("`r") -or $WslHealthCommand -notmatch 'runner-storage-health\.sh\s+watch' -or $WslHealthCommand -notmatch '--probe-path\s+' -or $WslHealthCommand -notmatch '--incident-path\s+' -or $WslHealthCommand -notmatch '--service\s+') {
-    throw 'AttachBootstrapAndKeepAlive requires a single-line WslHealthCommand that runs runner-storage-health.sh watch with probe, incident, and service arguments.'
+  $arguments = @('--distribution', $DistroName, '--user', 'root', '--exec', $WslHealthScript, 'watch', '--probe-path', $WslMountRoot, '--incident-path', $WslHealthIncidentPath, '--timeout-seconds', "$WslHealthTimeoutSeconds", '--interval-seconds', "$WslHealthIntervalSeconds")
+  foreach ($service in $RunnerService) { $arguments += @('--service', $service) }
+  & wsl.exe @arguments
+  $watchExitCode = $LASTEXITCODE
+  if (-not (Invoke-WslContainment)) {
+    throw "CRITICAL: WSL health watcher returned unexpectedly for distribution $DistroName with exit code $watchExitCode, and trusted stop-and-mask containment also failed. Do not start runners or re-enable the scheduled task."
   }
-  # `tail -f /dev/null` is intentionally blocking: Scheduled Tasks owns this
-  # process while the health watcher continuously probes runner storage.
-  & wsl.exe --distribution $DistroName --user root -- bash -lc $WslHealthCommand
-  throw "WSL keepalive returned unexpectedly for distribution $DistroName with exit code $LASTEXITCODE."
+  throw "WSL health watcher returned unexpectedly for distribution $DistroName with exit code $watchExitCode; trusted stop-and-mask containment was invoked."
 }
 
 function Set-AndAssertProtectedAcl {
@@ -182,6 +261,7 @@ switch ($Mode) {
     Attach-WorkspaceVhd
   }
   'AttachAndBootstrap' {
+    Assert-WslOperationalConfiguration
     $newAttachment = Attach-WorkspaceVhd -AllowAlreadyAttached
     Invoke-WslBootstrap
     if (-not $newAttachment) {
@@ -189,6 +269,7 @@ switch ($Mode) {
     }
   }
   'AttachBootstrapAndKeepAlive' {
+    Assert-WslOperationalConfiguration
     $newAttachment = Attach-WorkspaceVhd -AllowAlreadyAttached
     Invoke-WslBootstrap
     if (-not $newAttachment) {
@@ -200,12 +281,7 @@ switch ($Mode) {
     if (-not (Test-Path -LiteralPath $VhdPath -PathType Leaf)) {
       throw "VHD does not exist: $VhdPath"
     }
-    if ([string]::IsNullOrWhiteSpace($WslBootstrapCommand)) {
-      throw 'InstallBootTask requires WslBootstrapCommand so every boot mounts by UUID and starts runner services.'
-    }
-    if ([string]::IsNullOrWhiteSpace($WslHealthCommand)) {
-      throw 'InstallBootTask requires WslHealthCommand so the blocking WSL process periodically probes storage and fails closed.'
-    }
+    Assert-WslOperationalConfiguration
     $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     if ($WslWindowsUser -ne $currentUser) {
       throw "Run InstallBootTask elevated as the WSL-owning user $WslWindowsUser; the current user $currentUser cannot safely validate another user's distro registration."
@@ -220,9 +296,15 @@ switch ($Mode) {
     $quotedVhd = & $quote $VhdPath
     $quotedDistro = & $quote $DistroName
     $quotedUser = & $quote $WslWindowsUser
-    $quotedBootstrap = & $quote $WslBootstrapCommand
-    $quotedHealth = & $quote $WslHealthCommand
-    $command = "& $quotedScript -Mode AttachBootstrapAndKeepAlive -VhdPath $quotedVhd -DistroName $quotedDistro -WslWindowsUser $quotedUser -WslBootstrapCommand $quotedBootstrap -WslHealthCommand $quotedHealth"
+    $quotedBootstrapScript = & $quote $WslBootstrapScript
+    $quotedHealthScript = & $quote $WslHealthScript
+    $quotedUuid = & $quote $WslUuid
+    $quotedMountRoot = & $quote $WslMountRoot
+    $quotedIncidentPath = & $quote $WslHealthIncidentPath
+    $commandParts = @("& $quotedScript", '-Mode AttachBootstrapAndKeepAlive', "-VhdPath $quotedVhd", "-DistroName $quotedDistro", "-WslWindowsUser $quotedUser", "-WslBootstrapScript $quotedBootstrapScript", "-WslHealthScript $quotedHealthScript", "-WslUuid $quotedUuid", "-WslMountRoot $quotedMountRoot", "-WslHealthIncidentPath $quotedIncidentPath", "-WslHealthTimeoutSeconds $WslHealthTimeoutSeconds", "-WslHealthIntervalSeconds $WslHealthIntervalSeconds")
+    foreach ($binding in $WslBind) { $commandParts += "-WslBind $(& $quote $binding)" }
+    foreach ($service in $RunnerService) { $commandParts += "-RunnerService $(& $quote $service)" }
+    $command = $commandParts -join ' '
     $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
     $action = New-ScheduledTaskAction -Execute 'PowerShell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
     $bootTrigger = New-ScheduledTaskTrigger -AtStartup

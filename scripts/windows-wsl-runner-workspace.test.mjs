@@ -27,17 +27,25 @@ test('Windows VHD helper is parameterized, elevated, and refuses overwrite', asy
   assert.match(script, /Assert-Administrator/);
   assert.match(script, /Refusing to overwrite existing VHD/);
   assert.match(script, /wsl\.exe --mount \$VhdPath --vhd --bare/);
-  assert.match(script, /wsl\.exe --distribution \$DistroName --user root -- bash -lc \$WslBootstrapCommand/);
-  assert.match(script, /InstallBootTask requires WslBootstrapCommand/);
+  assert.match(script, /WslBootstrapScript/);
+  assert.match(script, /WslHealthScript/);
+  assert.match(script, /WslUuid/);
+  assert.match(script, /WslMountRoot/);
+  assert.match(script, /WslBind/);
+  assert.match(script, /RunnerService/);
+  assert.match(script, /Assert-WslCanonicalRootOwnedScript/);
+  assert.match(script, /\/usr\/bin\/readlink -f/);
+  assert.match(script, /\/usr\/bin\/stat/);
+  assert.match(script, /root-owned and not group- or world-writable/);
+  assert.match(script, /--exec/);
+  assert.doesNotMatch(script, /bash -lc/);
   assert.match(script, /'AttachAndBootstrap'/);
   assert.match(script, /AttachBootstrapAndKeepAlive/);
   assert.match(script, /Attach-WorkspaceVhd -AllowAlreadyAttached/);
   assert.match(script, /UUID bootstrap validated it before services were started/);
-  assert.match(script, /WslHealthCommand/);
-  assert.match(script, /requires WslHealthCommand/);
-  assert.match(script, /runner-storage-health\\\.sh\\s\+watch/);
-  assert.match(script, /--service\\s\+/);
-  assert.match(script, /WSL keepalive returned unexpectedly[\s\S]*exit code \$LASTEXITCODE/);
+  assert.match(script, /Invoke-WslContainment/);
+  assert.match(script, /trusted stop-and-mask containment/);
+  assert.match(script, /WSL health watcher returned unexpectedly[\s\S]*exit code \$watchExitCode/);
   assert.match(script, /New-ScheduledTaskSettingsSet -ExecutionTimeLimit \(New-TimeSpan -Seconds 0\) -RestartCount 3 -RestartInterval \(New-TimeSpan -Minutes 1\) -MultipleInstances IgnoreNew/);
   assert.match(script, /Install-ProtectedTaskEntrypoint/);
   assert.match(script, /TaskEntrypointPath = "\$env:ProgramData\\Kontour\\runner-host\\windows-wsl-runner-workspace\.ps1"/);
@@ -68,28 +76,45 @@ test('storage health probe fails closed and clears only after a passing recovery
   assert.match(healthScript, /timeout --foreground --kill-after=2s/);
   assert.match(healthScript, /conv=fsync/);
   assert.match(healthScript, /Runner storage incident marker exists/);
-  assert.match(healthScript, /mask_services/);
+  assert.match(healthScript, /contain_services/);
+  assert.match(healthScript, /is-active --quiet/);
+  assert.match(healthScript, /UnitFileState/);
+  assert.match(healthScript, /health incident marker does not exactly match/);
   assert.match(healthScript, /Storage recovery probe passed and incident marker cleared/);
   const fixtureRoot = await mkdtemp(join(tmpdir(), 'kontour-storage-health-'));
   const bin = join(fixtureRoot, 'bin');
   const probePath = join(fixtureRoot, 'probe');
+  const otherProbePath = join(fixtureRoot, 'other-probe');
   const stateRoot = join(fixtureRoot, 'state');
   const incidentPath = join(fixtureRoot, 'incidents', 'runner.incident');
-  await Promise.all([mkdir(bin, { recursive: true }), mkdir(probePath, { recursive: true }), mkdir(stateRoot, { recursive: true })]);
+  await Promise.all([mkdir(bin, { recursive: true }), mkdir(probePath, { recursive: true }), mkdir(otherProbePath, { recursive: true }), mkdir(stateRoot, { recursive: true })]);
   const writeExecutable = async (name, contents) => {
     const path = join(bin, name);
     await writeFile(path, contents);
     await chmod(path, 0o755);
   };
   await writeExecutable('realpath', '#!/usr/bin/env bash\n[[ $1 == -m || $1 == -e ]] && shift\n[[ $1 == -- ]] && shift\nprintf "%s\\n" "$1"\n');
-  await writeExecutable('findmnt', '#!/usr/bin/env bash\ncase "$2" in UUID) printf "22222222-2222-2222-2222-222222222222\\n" ;; FSROOT) printf "/\\n" ;; esac\n');
+  await writeExecutable('findmnt', '#!/usr/bin/env bash\ncase "$2" in UUID) printf "%s\\n" "${FAKE_HEALTH_UUID:-22222222-2222-2222-2222-222222222222}" ;; FSROOT) printf "%s\\n" "${FAKE_HEALTH_FSROOT:-/}" ;; esac\n');
   await writeExecutable('timeout', '#!/usr/bin/env bash\ncase "${FAKE_HEALTH_RESULT:-healthy}" in healthy) exit 0 ;; timeout) exit 124 ;; *) exit 1 ;; esac\n');
   await writeExecutable('systemctl', `#!/usr/bin/env bash
 set -euo pipefail
 service="\${!#}"
 case "$1" in
-  stop) : > "$FAKE_HEALTH_STATE/stopped-$service" ;;
-  mask) : > "$FAKE_HEALTH_STATE/masked-$service" ;;
+  stop)
+    [[ "\${FAKE_HEALTH_STOP_FAIL_SERVICE:-}" != "$service" ]] || exit 1
+    : > "$FAKE_HEALTH_STATE/stopped-$service"
+    ;;
+  is-active)
+    [[ "\${FAKE_HEALTH_ACTIVE_SERVICE:-}" == "$service" ]] && exit 0
+    exit 3
+    ;;
+  mask)
+    [[ "\${FAKE_HEALTH_MASK_FAIL_SERVICE:-}" != "$service" ]] || exit 1
+    : > "$FAKE_HEALTH_STATE/masked-$service"
+    ;;
+  show)
+    [[ -f "$FAKE_HEALTH_STATE/masked-$service" ]] && printf 'masked\\n' || printf 'disabled\\n'
+    ;;
   unmask) rm -f "$FAKE_HEALTH_STATE/masked-$service" ;;
 esac
 `);
@@ -105,6 +130,7 @@ esac
     assert.match(incident, /reason=timeout/);
     assert.match(incident, new RegExp(`probe_path=${probePath}`));
     assert.match(incident, /filesystem_uuid=22222222-2222-2222-2222-222222222222/);
+    await assert.doesNotReject(() => accessFile(join(stateRoot, 'stopped-fixture.service')));
     await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked-fixture.service')));
 
     let markerRefusal;
@@ -122,6 +148,64 @@ esac
     await execFile(storageHealth, ['clear', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } });
     await assert.rejects(() => accessFile(incidentPath));
     await assert.rejects(() => accessFile(join(stateRoot, 'masked-fixture.service')));
+
+    await assert.rejects(
+      () => execFile(storageHealth, ['probe', ...args], {
+        env: { ...env, FAKE_HEALTH_RESULT: 'timeout', FAKE_HEALTH_MASK_FAIL_SERVICE: 'fixture.service' }
+      }),
+      /containment is incomplete/
+    );
+    await assert.doesNotReject(() => accessFile(incidentPath));
+    await assert.doesNotReject(() => accessFile(join(stateRoot, 'stopped-fixture.service')));
+    await assert.rejects(() => accessFile(join(stateRoot, 'masked-fixture.service')));
+
+    const mismatchedProbeArgs = [...args];
+    mismatchedProbeArgs[1] = otherProbePath;
+    await assert.rejects(
+      () => execFile(storageHealth, ['clear', ...mismatchedProbeArgs], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } }),
+      /probe path does not match/
+    );
+    await assert.doesNotReject(() => accessFile(incidentPath));
+
+    await assert.rejects(
+      () => execFile(storageHealth, ['clear', ...args], {
+        env: { ...env, FAKE_HEALTH_RESULT: 'healthy', FAKE_HEALTH_UUID: '33333333-3333-3333-3333-333333333333' }
+      }),
+      /filesystem identity does not match/
+    );
+    await assert.doesNotReject(() => accessFile(incidentPath));
+    await execFile(storageHealth, ['clear', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } });
+    await assert.rejects(() => accessFile(incidentPath));
+
+    await assert.rejects(
+      () => execFile(storageHealth, ['probe', ...args], {
+        env: { ...env, FAKE_HEALTH_RESULT: 'timeout', FAKE_HEALTH_STOP_FAIL_SERVICE: 'fixture.service' }
+      }),
+      /containment is incomplete/
+    );
+    await assert.doesNotReject(() => accessFile(incidentPath));
+    await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked-fixture.service')));
+    const mismatchedServiceArgs = [...args.slice(0, -1), 'other.service'];
+    await assert.rejects(
+      () => execFile(storageHealth, ['clear', ...mismatchedServiceArgs], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } }),
+      /services do not match/
+    );
+    await assert.doesNotReject(() => accessFile(incidentPath));
+    await execFile(storageHealth, ['clear', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } });
+    await assert.rejects(() => accessFile(incidentPath));
+
+    await mkdir(incidentPath);
+    await assert.rejects(
+      () => execFile(storageHealth, ['probe', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } }),
+      /malformed or non-regular/
+    );
+    await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked-fixture.service')));
+    await rm(incidentPath, { recursive: true });
+    await writeFile(incidentPath, 'not-a-health-marker\n');
+    await assert.rejects(
+      () => execFile(storageHealth, ['clear', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } }),
+      /does not exactly match/
+    );
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true });
   }
@@ -296,7 +380,11 @@ test('runbook preserves the Windows-path and WSL-UUID recovery boundary', async 
   assert.match(text, /refuses to overwrite/i);
   assert.match(text, /mounts by the recorded ext4 UUID/i);
   assert.match(text, /wsl\.exe --mount --vhd --bare/);
-  assert.match(text, /WslBootstrapCommand/);
+  assert.match(text, /WslBootstrapScript/);
+  assert.match(text, /WslHealthScript/);
+  assert.match(text, /wsl\.exe --exec/);
+  assert.match(text, /root-owned and must not be group- or\s+world-writable/i);
+  assert.doesNotMatch(text, /WslBootstrapCommand/);
   assert.match(text, /WSL-owning Windows user/i);
   assert.match(text, /logon trigger is authoritative/i);
   assert.match(text, /canonical, non-reparse `ProgramData` ancestry/i);

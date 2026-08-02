@@ -49,9 +49,23 @@ sudo blkid /dev/<new-disk> # record the UUID
 Install both `bootstrap-wsl-runner-workspace.sh` and
 `runner-storage-health.sh` on the distribution (for example under
 `/usr/local/sbin`) and make the bootstrap systemd unit run before the runner
-services. Supply the UUID, a mount root, and one binding for every runner work
-path. For example, the sources are directories inside the VHD mount and the
-targets are existing runner work paths:
+services. These are privileged task entrypoints: their files and every parent
+directory through `/` must be root-owned and must not be group- or
+world-writable. Install them from a trusted checkout, then verify the exact
+paths before registering the Windows task:
+
+```sh
+sudo install -o root -g root -m 0755 runner-host/bootstrap-wsl-runner-workspace.sh /usr/local/sbin/bootstrap-wsl-runner-workspace.sh
+sudo install -o root -g root -m 0755 runner-host/runner-storage-health.sh /usr/local/sbin/runner-storage-health.sh
+namei -l /usr/local/sbin/bootstrap-wsl-runner-workspace.sh
+namei -l /usr/local/sbin/runner-storage-health.sh
+```
+
+The installer rejects links, non-regular files, noncanonical paths, and any
+group- or world-writable WSL script ancestry. Supply the UUID, a mount root,
+and one binding for every runner work path. For example, the sources are
+directories inside the VHD mount and the targets are existing runner work
+paths:
 
 ```sh
 sudo /usr/local/sbin/bootstrap-wsl-runner-workspace.sh \
@@ -65,18 +79,25 @@ sudo /usr/local/sbin/bootstrap-wsl-runner-workspace.sh \
 ```
 
 Create the Windows startup task only after the VHD has been formatted and the
-WSL bootstrap has been tested manually. The task needs the exact single-line
-bootstrap command plus a health watcher command. The watcher is the blocking
-WSL process; it checks the same filesystem every 60 seconds and exits after
-masking services on any health incident:
+WSL bootstrap has been tested manually. The task takes structured WSL paths
+and arguments; it invokes the verified scripts directly with `wsl.exe --exec`,
+never through `bash -lc` or an opaque command string. The watcher is the
+blocking WSL process; it checks the same filesystem every 60 seconds and, if
+it cannot start or exits unexpectedly, the protected task invokes the trusted
+health script's stop-and-mask containment command:
 
 ```powershell
-$bootstrap = '/usr/local/sbin/bootstrap-wsl-runner-workspace.sh --uuid <ext4-uuid> --mount-root /mnt/runner-work --bind /mnt/runner-work/work:/var/lib/example-runner/work --bind /mnt/runner-work/work-2:/var/lib/example-runner/work-2 --health-script /usr/local/sbin/runner-storage-health.sh --health-incident-path /var/lib/kontour-runner-storage/runner-work.incident --health-timeout-seconds 30 --service example-runner.service'
-$health = '/usr/local/sbin/runner-storage-health.sh watch --probe-path /mnt/runner-work --incident-path /var/lib/kontour-runner-storage/runner-work.incident --timeout-seconds 30 --interval-seconds 60 --service example-runner.service'
 .\runner-host\windows-wsl-runner-workspace.ps1 -Mode InstallBootTask `
   -VhdPath 'C:\RunnerStorage\runner-work.vhdx' -DistroName 'Ubuntu' `
-  -WslWindowsUser 'EXAMPLE\runner-owner' -WslBootstrapCommand $bootstrap `
-  -WslHealthCommand $health
+  -WslWindowsUser 'EXAMPLE\runner-owner' `
+  -WslBootstrapScript '/usr/local/sbin/bootstrap-wsl-runner-workspace.sh' `
+  -WslHealthScript '/usr/local/sbin/runner-storage-health.sh' `
+  -WslUuid '<ext4-uuid>' -WslMountRoot '/mnt/runner-work' `
+  -WslBind '/mnt/runner-work/work:/var/lib/example-runner/work' `
+  -WslBind '/mnt/runner-work/work-2:/var/lib/example-runner/work-2' `
+  -WslHealthIncidentPath '/var/lib/kontour-runner-storage/runner-work.incident' `
+  -WslHealthTimeoutSeconds 30 -WslHealthIntervalSeconds 60 `
+  -RunnerService 'example-runner.service'
 ```
 
 Run that command elevated as the WSL-owning Windows user. WSL distribution
@@ -95,9 +116,9 @@ an already attached VHD is accepted only after the UUID bootstrap validates its
 filesystem and bind identity; otherwise the task fails and leaves services
 stopped.
 
-The task attaches the VHD through WSL, invokes the selected distribution as
-root, then the Linux bootstrap finds the ext4 volume by UUID, binds work paths,
-and starts services. Existing bind mounts are idempotent only when their UUID
+The task attaches the VHD through WSL, invokes verified root-owned Linux
+scripts directly as root, then the Linux bootstrap finds the ext4 volume by
+UUID, binds work paths, and starts services. Existing bind mounts are idempotent only when their UUID
 and filesystem root match the declared source. To recover, stop the runner
 services, unmount the bind targets and mount root in WSL, then detach the VHD
 in Windows only after no process has an open file on it. Keep the VHD file: it
