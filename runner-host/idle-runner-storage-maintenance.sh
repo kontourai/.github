@@ -167,8 +167,13 @@ end_drain() {
     [[ $unit_file_state != masked && $unit_file_state != masked-runtime ]] || { echo "maintenance mask remains for $service" >&2; unmask_failed=yes; }
   done
   if [[ $unmask_failed == yes ]]; then
-    remask_all_services || true
-    echo "Recovery: all declared services were re-masked. Keep the VHD attached, repair the listed systemd masks, then rerun: $0 end --confirm-drain-end --drain-state $drain_state" >&2
+    if remask_all_services; then
+      echo "Recovery: all declared services were re-masked. Keep the VHD attached, repair the listed systemd masks, then rerun: $0 end --confirm-drain-end --drain-state $drain_state" >&2
+    else
+      echo "CRITICAL recovery state: rollback re-masking is incomplete and one or more runners may be fail-open. The drain state and any storage incident marker remain in force. Do not re-enable the scheduled task or start runners. Immediately run for every declared service:" >&2
+      for service in "${services[@]}"; do printf '  systemctl stop %q && systemctl mask %q\n' "$service" "$service" >&2; done
+      echo "After every service is masked, keep $drain_state and rerun: $0 end --confirm-drain-end --drain-state $drain_state" >&2
+    fi
     exit 1
   fi
   rm -f -- "$drain_state"

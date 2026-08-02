@@ -156,6 +156,8 @@ test('storage hooks fail before job steps, retain bounded usage, and clean only 
   assert.match(idle, /systemctl mask "\$service"/);
   assert.match(idle, /systemctl unmask "\$service"/);
   assert.match(idle, /all declared services were re-masked/);
+  assert.match(idle, /rollback re-masking is incomplete/);
+  assert.match(idle, /Do not re-enable the scheduled task or start runners/);
   assert.match(idle, /Trim failed\. Keep services masked/);
   assert.match(idle, /unknown service unit/);
   assert.match(idle, /service is not explicitly inactive/);
@@ -193,8 +195,19 @@ case "$1" in
     esac
     ;;
   is-active) printf 'inactive\\n'; exit 3 ;;
-  mask) : > "$FAKE_STATE/masked-$service" ;;
-  unmask) [[ "\${FAKE_UNMASK_FAIL_SERVICE:-}" != "$service" ]] || exit 1; rm -f "$FAKE_STATE/masked-$service" ;;
+  mask)
+    if [[ "\${FAKE_REMASK_FAIL_SERVICE:-}" == "$service" && -f "$FAKE_STATE/unmask-failed-\${FAKE_UNMASK_FAIL_SERVICE:-}" ]]; then
+      exit 1
+    fi
+    : > "$FAKE_STATE/masked-$service"
+    ;;
+  unmask)
+    if [[ "\${FAKE_UNMASK_FAIL_SERVICE:-}" == "$service" ]]; then
+      : > "$FAKE_STATE/unmask-failed-$service"
+      exit 1
+    fi
+    rm -f "$FAKE_STATE/masked-$service"
+    ;;
 esac
 `);
   await writeExecutable('findmnt', '#!/usr/bin/env bash\ncase "$2" in UUID) printf "%s\\n" "$FAKE_UUID" ;; FSROOT) printf "/work\\n" ;; esac\n');
@@ -219,6 +232,31 @@ esac
     assert.match(failure.stderr, /all declared services were re-masked/);
     await assert.doesNotReject(() => accessFile(drainState));
     await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked-fixture-a.service')));
+    await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked-fixture-b.service')));
+
+    await execFile(maintenance, ['end', '--confirm-drain-end', '--drain-state', drainState], { env });
+    await assert.rejects(() => accessFile(drainState));
+    await assert.rejects(() => accessFile(join(stateRoot, 'masked-fixture-a.service')));
+    await assert.rejects(() => accessFile(join(stateRoot, 'masked-fixture-b.service')));
+
+    await execFile(maintenance, ['begin', '--confirm-idle', '--uuid', env.FAKE_UUID, '--mount-root', mountRoot, '--bind', `${sourcePath}:${targetPath}`, '--drain-state', drainState, '--service', 'fixture-a.service', '--service', 'fixture-b.service'], { env });
+    let incompleteRecovery;
+    try {
+      await execFile(maintenance, ['end', '--confirm-drain-end', '--drain-state', drainState], {
+        env: {
+          ...env,
+          FAKE_UNMASK_FAIL_SERVICE: 'fixture-b.service',
+          FAKE_REMASK_FAIL_SERVICE: 'fixture-a.service'
+        }
+      });
+    } catch (error) {
+      incompleteRecovery = error;
+    }
+    assert.ok(incompleteRecovery, 'end must fail when rollback re-masking is incomplete');
+    assert.match(incompleteRecovery.stderr, /rollback re-masking is incomplete/);
+    assert.match(incompleteRecovery.stderr, /systemctl stop fixture-a\.service && systemctl mask fixture-a\.service/);
+    await assert.doesNotReject(() => accessFile(drainState));
+    await assert.rejects(() => accessFile(join(stateRoot, 'masked-fixture-a.service')));
     await assert.doesNotReject(() => accessFile(join(stateRoot, 'masked-fixture-b.service')));
 
     await execFile(maintenance, ['end', '--confirm-drain-end', '--drain-state', drainState], { env });
