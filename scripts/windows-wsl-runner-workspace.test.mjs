@@ -15,6 +15,8 @@ const storageHook = fileURLToPath(new URL('../runner-host/runner-storage-hook.sh
 const storageHealth = fileURLToPath(new URL('../runner-host/runner-storage-health.sh', import.meta.url));
 const hookInstaller = fileURLToPath(new URL('../runner-host/install-runner-storage-hooks.sh', import.meta.url));
 const maintenance = fileURLToPath(new URL('../runner-host/idle-runner-storage-maintenance.sh', import.meta.url));
+const dockerMaintenance = fileURLToPath(new URL('../runner-host/idle-runner-docker-maintenance.sh', import.meta.url));
+const dockerMaintenanceInstaller = fileURLToPath(new URL('../runner-host/install-idle-runner-docker-maintenance.sh', import.meta.url));
 const runbook = fileURLToPath(new URL('../runner-host/README.md', import.meta.url));
 
 test('Windows VHD helper is parameterized, elevated, and refuses overwrite', async () => {
@@ -134,6 +136,7 @@ test('storage health probe fails closed and clears only after a passing recovery
   await writeExecutable('realpath', '#!/usr/bin/env bash\n[[ $1 == -m || $1 == -e ]] && shift\n[[ $1 == -- ]] && shift\nprintf "%s\\n" "$1"\n');
   await writeExecutable('findmnt', '#!/usr/bin/env bash\ncase "$2" in UUID) printf "%s\\n" "${FAKE_HEALTH_UUID:-22222222-2222-2222-2222-222222222222}" ;; FSROOT) printf "%s\\n" "${FAKE_HEALTH_FSROOT:-/}" ;; esac\n');
   await writeExecutable('timeout', '#!/usr/bin/env bash\ncase "${FAKE_HEALTH_RESULT:-healthy}" in healthy) exit 0 ;; timeout) exit 124 ;; *) exit 1 ;; esac\n');
+  await writeExecutable('flock', '#!/usr/bin/env bash\nexit 0\n');
   await writeExecutable('systemctl', `#!/usr/bin/env bash
 set -euo pipefail
 service="\${!#}"
@@ -157,7 +160,7 @@ case "$1" in
 esac
 `);
   const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, FAKE_HEALTH_STATE: stateRoot };
-  const args = ['--probe-path', probePath, '--incident-path', incidentPath, '--timeout-seconds', '30', '--service', 'fixture.service'];
+  const args = ['--probe-path', probePath, '--incident-path', incidentPath, '--timeout-seconds', '30', '--maintenance-lock', join(fixtureRoot, 'maintenance.lock'), '--service', 'fixture.service'];
 
   try {
     await execFile(storageHealth, ['probe', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } });
@@ -244,6 +247,114 @@ esac
       () => execFile(storageHealth, ['clear', ...args], { env: { ...env, FAKE_HEALTH_RESULT: 'healthy' } }),
       /does not exactly match/
     );
+  } finally {
+    await rm(fixtureRoot, { recursive: true, force: true });
+  }
+});
+
+test('Docker cache maintenance is bounded, idle-only, and coordinated with storage probes', async () => {
+  const dockerScript = await readFile(dockerMaintenance, 'utf8');
+  const installer = await readFile(dockerMaintenanceInstaller, 'utf8');
+  const healthScript = await readFile(storageHealth, 'utf8');
+  assert.match(dockerScript, /flock -n -x 9/);
+  assert.match(healthScript, /flock -s 8/);
+  assert.match(dockerScript, /docker builder prune --force --reserved-space "\$reserved_space"/);
+  assert.doesNotMatch(dockerScript, /docker (image|system|volume|container) prune/);
+  assert.match(installer, /OnCalendar=\$on_calendar/);
+  assert.match(installer, /RandomizedDelaySec=10min/);
+  assert.match(installer, /systemctl enable --now "\$\{unit_name\}\.timer"/);
+  assert.doesNotMatch(dockerScript + installer, /Station/i);
+
+  const fixtureRoot = await mkdtemp(join(tmpdir(), 'kontour-docker-maintenance-'));
+  const bin = join(fixtureRoot, 'bin');
+  const headroom = join(fixtureRoot, 'headroom');
+  const stateRoot = join(fixtureRoot, 'state');
+  const lockPath = join(fixtureRoot, 'host.lock');
+  const receiptPath = join(fixtureRoot, 'receipt');
+  const logPath = join(fixtureRoot, 'docker.log');
+  await Promise.all([mkdir(bin), mkdir(headroom), mkdir(stateRoot)]);
+  const writeExecutable = async (name, contents) => {
+    const path = join(bin, name);
+    await writeFile(path, contents);
+    await chmod(path, 0o755);
+  };
+  await writeExecutable('systemctl', `#!/usr/bin/env bash
+case "$1" in
+  show) printf '%s\n' "\${FAKE_LOAD_STATE:-loaded}" ;;
+  is-active) printf '%s\n' "\${FAKE_ACTIVE_STATE:-inactive}"; [[ "\${FAKE_ACTIVE_STATE:-inactive}" == active ]] && exit 0 || exit 3 ;;
+esac
+`);
+  await writeExecutable('pgrep', `#!/usr/bin/env bash
+[[ "\${FAKE_RUNNER_PROCESS:-no}" == yes || "\${FAKE_BUILD_CLIENT:-no}" == yes ]]
+`);
+  await writeExecutable('docker', `#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_DOCKER_CALLS"
+if [[ "$1" == ps ]]; then
+  [[ "\${FAKE_DOCKER_PS_FAIL:-no}" == yes ]] && exit 1
+  [[ "\${FAKE_RUNNING_CONTAINER:-no}" == yes ]] && printf 'container-id\n'
+  exit 0
+fi
+if [[ "$1 $2" == 'builder prune' ]]; then
+  for line in {1..250}; do printf 'docker-output-%s\n' "$line"; done
+  exit "\${FAKE_PRUNE_EXIT:-0}"
+fi
+exit 2
+`);
+  await writeExecutable('df', `#!/usr/bin/env bash
+printf 'Filesystem 1-blocks Used Available Use%% Mounted on\n'
+printf 'fixture 107374182400 96636764160 1073741824 90%% %s\n' "$FAKE_HEADROOM"
+`);
+  await writeExecutable('flock', '#!/usr/bin/env bash\n[[ "${FAKE_FLOCK_BUSY:-no}" == yes ]] && exit 1\nexit 0\n');
+
+  const dockerCalls = join(stateRoot, 'docker-calls');
+  const env = {
+    ...process.env,
+    PATH: `${bin}:${process.env.PATH}`,
+    FAKE_DOCKER_CALLS: dockerCalls,
+    FAKE_HEADROOM: headroom
+  };
+  const commonArgs = [
+    '--headroom-path', headroom,
+    '--service', 'fixture.service',
+    '--minimum-free-gb', '20',
+    '--minimum-free-percent', '15',
+    '--reserved-space', '20GB',
+    '--maintenance-lock', lockPath,
+    '--receipt-path', receiptPath,
+    '--log-path', logPath,
+    '--log-lines', '20'
+  ];
+
+  try {
+    const dryRun = await execFile(dockerMaintenance, ['dry-run', ...commonArgs], { env });
+    assert.match(dryRun.stdout, /result=would_prune/);
+    assert.doesNotMatch(await readFile(dockerCalls, 'utf8'), /builder prune/);
+
+    const busy = await execFile(dockerMaintenance, ['prune', '--confirm-idle', ...commonArgs], {
+      env: { ...env, FAKE_ACTIVE_STATE: 'active' }
+    });
+    assert.match(busy.stdout, /result=skipped_busy reason=service_not_inactive:fixture\.service:active/);
+    assert.doesNotMatch(await readFile(dockerCalls, 'utf8'), /builder prune/);
+
+    const dockerUnavailable = await execFile(dockerMaintenance, ['prune', '--confirm-idle', ...commonArgs], {
+      env: { ...env, FAKE_DOCKER_PS_FAIL: 'yes' }
+    });
+    assert.match(dockerUnavailable.stdout, /result=skipped_busy reason=docker_ps_failed/);
+    assert.doesNotMatch(await readFile(dockerCalls, 'utf8'), /builder prune/);
+
+    const pruned = await execFile(dockerMaintenance, ['prune', '--confirm-idle', ...commonArgs], { env });
+    assert.match(pruned.stdout, /result=pruned/);
+    assert.match(await readFile(dockerCalls, 'utf8'), /builder prune --force --reserved-space 20GB/);
+    const receipt = await readFile(receiptPath, 'utf8');
+    assert.match(receipt, /result=pruned/);
+    assert.match(receipt, /before_free_bytes=1073741824/);
+    assert.match(receipt, /after_free_bytes=1073741824/);
+    const boundedLog = (await readFile(logPath, 'utf8')).trim().split('\n');
+    assert.equal(boundedLog.length, 20);
+    assert.equal(boundedLog.at(-1), 'docker-output-250');
+
+    const locked = await execFile(dockerMaintenance, ['status', ...commonArgs], { env: { ...env, FAKE_FLOCK_BUSY: 'yes' } });
+    assert.match(locked.stdout, /result=skipped_busy reason=host_maintenance_lock/);
   } finally {
     await rm(fixtureRoot, { recursive: true, force: true });
   }
