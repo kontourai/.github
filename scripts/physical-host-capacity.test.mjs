@@ -466,7 +466,12 @@ test('action entrypoints persist state and release the acquired lease in the pos
       GITHUB_STATE: state,
       GITHUB_REPOSITORY: 'kontourai/example',
       GITHUB_RUN_ID: '42',
+      GITHUB_RUN_ATTEMPT: '3',
+      GITHUB_WORKFLOW: 'Capacity contract',
+      GITHUB_WORKFLOW_REF:
+        'kontourai/example/.github/workflows/capacity.yml@refs/heads/test',
       GITHUB_JOB: 'test',
+      RUNNER_NAME: 'fixture-linux',
       RUNNER_OS: 'Linux',
     };
     await execFile(process.execPath, [acquireScript], { env: actionEnv });
@@ -487,11 +492,12 @@ test('action entrypoints persist state and release the acquired lease in the pos
       {
         repository: 'kontourai/example',
         runId: '42',
-        runAttempt: 'unknown',
-        workflow: 'unknown',
-        workflowRef: 'unknown',
+        runAttempt: '3',
+        workflow: 'Capacity contract',
+        workflowRef:
+          'kontourai/example/.github/workflows/capacity.yml@refs/heads/test',
         job: 'test',
-        runnerName: 'unknown',
+        runnerName: 'fixture-linux',
         runnerOs: 'Linux',
       },
     );
