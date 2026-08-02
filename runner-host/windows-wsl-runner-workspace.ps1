@@ -98,14 +98,18 @@ function Assert-WslCanonicalPath {
 function Assert-WslCanonicalRootOwnedScript {
   param([Parameter(Mandatory = $true)][string]$ScriptPath)
   Assert-WslCanonicalPath -Path $ScriptPath -Description 'WSL script path'
-  $resolvedPath = (& wsl.exe --distribution $DistroName --user root --exec /usr/bin/readlink -f -- $ScriptPath | Select-Object -First 1).Trim()
-  if ($LASTEXITCODE -ne 0 -or $resolvedPath -ne $ScriptPath) {
+  $resolvedOutput = @(& wsl.exe --distribution $DistroName --user root --exec /usr/bin/readlink -f -- $ScriptPath)
+  $readlinkExitCode = $LASTEXITCODE
+  $resolvedPath = ($resolvedOutput | Select-Object -First 1).Trim()
+  if ($readlinkExitCode -ne 0 -or $resolvedPath -ne $ScriptPath) {
     throw "WSL script path is not canonical or resolves through a link: $ScriptPath"
   }
   $currentPath = $ScriptPath
   while ($true) {
-    $metadata = (& wsl.exe --distribution $DistroName --user root --exec /usr/bin/stat "--format=%U|%a|%F" -- $currentPath | Select-Object -First 1).Trim()
-    if ($LASTEXITCODE -ne 0 -or $metadata -notmatch '^(?<owner>[^|]+)\|(?<mode>[0-7]+)\|(?<kind>.+)$') {
+    $metadataOutput = @(& wsl.exe --distribution $DistroName --user root --exec /usr/bin/stat "--format=%U|%a|%F" -- $currentPath)
+    $statExitCode = $LASTEXITCODE
+    $metadata = ($metadataOutput | Select-Object -First 1).Trim()
+    if ($statExitCode -ne 0 -or $metadata -notmatch '^(?<owner>[^|]+)\|(?<mode>[0-7]+)\|(?<kind>.+)$') {
       throw "Could not verify WSL script metadata: $currentPath"
     }
     $mode = [Convert]::ToInt32($Matches.mode, 8)

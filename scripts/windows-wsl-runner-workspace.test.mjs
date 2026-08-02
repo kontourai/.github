@@ -39,6 +39,9 @@ test('Windows VHD helper is parameterized, elevated, and refuses overwrite', asy
   assert.match(script, /Assert-WslCanonicalRootOwnedScript/);
   assert.match(script, /\/usr\/bin\/readlink -f/);
   assert.match(script, /\/usr\/bin\/stat/);
+  assert.match(script, /\$readlinkExitCode = \$LASTEXITCODE[\s\S]*\$resolvedOutput \| Select-Object/);
+  assert.match(script, /\$statExitCode = \$LASTEXITCODE[\s\S]*\$metadataOutput \| Select-Object/);
+  assert.doesNotMatch(script, /wsl\.exe[^\n]+\| Select-Object[^\n]+[\s\S]{0,120}\$LASTEXITCODE/);
   assert.match(script, /root-owned and not group- or world-writable/);
   assert.match(script, /--exec/);
   assert.doesNotMatch(script, /bash -lc/);
