@@ -290,6 +290,11 @@ full history (`fetch-depth: 0`) and fails closed with a non-zero exit unless
 checkout, an empty result, an unexpected value, or the command itself
 erroring all fail the run rather than silently scanning a partial history.
 
+Self-hosted secret scans must provide capacity root and host identity. The
+reusable workflow fixes `capacity-owner-lifetime-seconds` at 6000 seconds and
+forwards it to the physical-host action, so it remains compatible with the
+shared 90-minute Station capacity manifest.
+
 ## Release-note policy
 
 Repositories that use normal merge commits use GitHub's supported `PR_TITLE/BLANK` setting pair.
