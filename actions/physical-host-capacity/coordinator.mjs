@@ -544,7 +544,16 @@ export async function recoverAbandonedRecord(config, { kind, ownerToken, now = r
 }
 
 export function actionMetadata(env = process.env) {
-  return { repository: env.GITHUB_REPOSITORY ?? 'unknown', runId: env.GITHUB_RUN_ID ?? 'unknown', job: env.GITHUB_JOB ?? 'unknown', runnerOs: env.RUNNER_OS ?? 'unknown' };
+  return {
+    repository: env.GITHUB_REPOSITORY ?? 'unknown',
+    runId: env.GITHUB_RUN_ID ?? 'unknown',
+    runAttempt: env.GITHUB_RUN_ATTEMPT ?? 'unknown',
+    workflow: env.GITHUB_WORKFLOW ?? 'unknown',
+    workflowRef: env.GITHUB_WORKFLOW_REF ?? 'unknown',
+    job: env.GITHUB_JOB ?? 'unknown',
+    runnerName: env.RUNNER_NAME ?? 'unknown',
+    runnerOs: env.RUNNER_OS ?? 'unknown',
+  };
 }
 
 export function stateName(name) {

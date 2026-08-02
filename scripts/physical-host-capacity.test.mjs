@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { access, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { access, appendFile, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +14,7 @@ import {
   provisionHost,
   releaseLease,
 } from '../actions/physical-host-capacity/coordinator.mjs';
+import { runAcquireAction } from '../actions/physical-host-capacity/acquire.mjs';
 
 const OWNER_A = '11111111-1111-4111-8111-111111111111';
 const OWNER_B = '22222222-2222-4222-8222-222222222222';
@@ -471,6 +472,29 @@ test('action entrypoints persist state and release the acquired lease in the pos
     await execFile(process.execPath, [acquireScript], { env: actionEnv });
     const outputs = Object.fromEntries((await readFile(output, 'utf8')).trim().split('\n').map((line) => line.split('=')));
     await access(outputs['lease-path']);
+    const lease = JSON.parse(await readFile(outputs['lease-path'], 'utf8'));
+    assert.deepEqual(
+      {
+        repository: lease.repository,
+        runId: lease.runId,
+        runAttempt: lease.runAttempt,
+        workflow: lease.workflow,
+        workflowRef: lease.workflowRef,
+        job: lease.job,
+        runnerName: lease.runnerName,
+        runnerOs: lease.runnerOs,
+      },
+      {
+        repository: 'kontourai/example',
+        runId: '42',
+        runAttempt: 'unknown',
+        workflow: 'unknown',
+        workflowRef: 'unknown',
+        job: 'test',
+        runnerName: 'unknown',
+        runnerOs: 'Linux',
+      },
+    );
 
     const postState = Object.fromEntries((await readFile(state, 'utf8')).trim().split('\n').map((line) => {
       const [name, ...value] = line.split('=');
@@ -487,5 +511,60 @@ test('action entrypoints persist state and release the acquired lease in the pos
       },
     });
     await assert.rejects(access(outputs['lease-path']), { code: 'ENOENT' });
+  }, { provision: false });
+});
+
+test('main action directly releases its lease when output and state command files disappear after acquisition', async () => {
+  await withRoot(async (root) => {
+    await provisionHost(config(root, { capacityUnits: 1 }));
+    const output = join(root, 'output');
+    const environment = join(root, 'environment');
+    const state = join(root, 'state');
+    await Promise.all([writeFile(output, ''), writeFile(environment, ''), writeFile(state, '')]);
+    const actionEnv = {
+      INPUT_COORDINATION_ROOT: root,
+      INPUT_HOST_ID: 'desktop-win-01',
+      INPUT_CAPACITY_UNITS: '1',
+      INPUT_LEASE_WEIGHT: '1',
+      INPUT_TIMEOUT_SECONDS: '0',
+      INPUT_POLL_INTERVAL_MS: '1',
+      INPUT_OWNER_LIFETIME_SECONDS: '60',
+      GITHUB_OUTPUT: output,
+      GITHUB_ENV: environment,
+      GITHUB_STATE: state,
+      GITHUB_REPOSITORY: 'kontourai/example',
+      GITHUB_RUN_ID: '42',
+      GITHUB_RUN_ATTEMPT: '3',
+      GITHUB_WORKFLOW: 'CI Extended',
+      GITHUB_WORKFLOW_REF: 'kontourai/example/.github/workflows/ci.yml@refs/heads/main',
+      GITHUB_JOB: 'playwright',
+      RUNNER_NAME: 'desktop-win-linux',
+      RUNNER_OS: 'Linux',
+    };
+
+    await assert.rejects(
+      runAcquireAction({
+        env: actionEnv,
+        ownerToken: OWNER_A,
+        writeOne: async (file, name, value) => {
+          if (file === output) {
+            // Simulate Actions removing its command-file directory after the
+            // lease has been published. The post step cannot read STATE_*.
+            await Promise.all([rm(output), rm(state)]);
+          }
+          await appendFile(file, `${name}=${value}\n`, 'utf8');
+        },
+        writeMany: async (file, values) => {
+          await appendFile(file, `${values.map(([name, value]) => `${name}=${value}`).join('\n')}\n`, 'utf8');
+        },
+      }),
+      (error) => error instanceof CapacityCoordinationError && /ENOENT/.test(error.message) && /Direct cleanup released the owned lease/.test(error.message),
+    );
+
+    const stateDirectory = join(root, '.kontour-physical-host-capacity');
+    assert.deepEqual(await readdir(join(stateDirectory, 'leases')), []);
+    assert.deepEqual(await readdir(join(stateDirectory, 'tickets')), []);
+    const post = await execFile(process.execPath, [releaseScript], { env: actionEnv });
+    assert.match(post.stdout, /no acquired lease to release/);
   }, { provision: false });
 });
