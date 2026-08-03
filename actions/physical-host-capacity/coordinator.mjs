@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { link, lstat, mkdir, open, readFile, readdir, rename, rm, stat, unlink } from 'node:fs/promises';
 import { basename, isAbsolute, join, resolve } from 'node:path';
 
@@ -863,7 +863,7 @@ export async function releaseLease(config, ownerToken, {
   });
 }
 
-export async function recoverAbandonedRecord(config, { kind, ownerToken, controlOwnerToken = randomUUID(), now = realClock.now, sleep = realClock.sleep } = {}) {
+export async function recoverAbandonedRecord(config, { kind, ownerToken, expectedSha256, controlOwnerToken = randomUUID(), now = realClock.now, sleep = realClock.sleep } = {}) {
   await ensureProvisioned(config);
   const location = paths(config.root);
   if (kind === 'control') {
@@ -895,6 +895,20 @@ export async function recoverAbandonedRecord(config, { kind, ownerToken, control
   const recordPath = join(directory, `${ownerToken}.json`);
   const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
   return withControlLock(config.root, { ...cleanup, ownerToken: controlOwnerToken }, async () => {
+    if (expectedSha256 !== undefined) {
+      if (!/^[a-f0-9]{64}$/.test(expectedSha256)) {
+        throw new CapacityCoordinationError('Expected recovery record digest must be a lowercase SHA-256 value.');
+      }
+      await assertRegularFile(recordPath, label);
+      const currentSha256 = createHash('sha256')
+        .update(await readFile(recordPath))
+        .digest('hex');
+      if (currentSha256 !== expectedSha256) {
+        throw new CapacityCoordinationError(
+          `${label} at ${recordPath} changed after owner verification; refusing to recover a replacement record.`,
+        );
+      }
+    }
     // The filename is the exact, UUID-validated recovery target. Do not parse
     // it here: recovery exists specifically to remove a crash-corrupted record.
     await removeRegularRecord(recordPath, label);

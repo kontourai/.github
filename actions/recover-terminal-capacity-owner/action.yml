@@ -1,0 +1,36 @@
+name: Recover terminal physical-host capacity owner
+description: Recover one exact lease or ticket after GitHub proves its recorded owner run attempt is terminal.
+
+inputs:
+  coordination-root:
+    description: OS-local path to the shared NTFS-backed coordination root.
+    required: true
+  host-id:
+    description: Provisioned physical host identity.
+    required: true
+  capacity-units:
+    description: Provisioned physical host capacity.
+    required: true
+  owner-lifetime-seconds:
+    description: Provisioned shared owner lifetime.
+    required: false
+    default: "6000"
+  recover:
+    description: Exact lease:<uuid> or ticket:<uuid> recovery target.
+    required: true
+  owner-repository:
+    description: Exact recorded owner/repository; must equal the invoking repository.
+    required: true
+  owner-run-id:
+    description: Exact recorded GitHub run ID.
+    required: true
+  owner-run-attempt:
+    description: Exact recorded GitHub run attempt.
+    required: true
+  github-token:
+    description: Token scoped to the owner repository with Actions read permission.
+    required: true
+
+runs:
+  using: node20
+  main: main.mjs
