@@ -16,6 +16,8 @@ import {
   releaseLease,
 } from '../actions/physical-host-capacity/coordinator.mjs';
 import { runAcquireAction } from '../actions/physical-host-capacity/acquire.mjs';
+import { runTerminalRecoveryAction } from '../actions/recover-terminal-capacity-owner/main.mjs';
+import { recoverTerminalCapacityOwner } from './recover-terminal-capacity-owner.mjs';
 
 const OWNER_A = '11111111-1111-4111-8111-111111111111';
 const OWNER_B = '22222222-2222-4222-8222-222222222222';
@@ -165,6 +167,236 @@ test('an orphaned lease is reclaimed only after its declared owner lifetime expi
     const acquired = await acquireLease(recoveryConfig, { ownerToken: OWNER_B, now: () => now });
     assert.equal(await releaseLease(recoveryConfig, OWNER_B), true);
   }, { provision: false });
+});
+
+function githubRunResponse({
+  status = 'completed',
+  conclusion = 'cancelled',
+  repository = 'kontourai/station',
+  runId = 30_801_602_143,
+  runAttempt = 1,
+} = {}) {
+  return new Response(
+    JSON.stringify({
+        id: runId,
+        run_attempt: runAttempt,
+        status,
+        conclusion,
+        repository: { full_name: repository },
+    }),
+    { status: 200 },
+  );
+}
+
+test('an exact terminal GitHub owner is reclaimed before its age deadline', async () => {
+  await withRoot(async (root) => {
+    const terminalConfig = config(root, {
+      capacityUnits: 3,
+      leaseWeight: 3,
+      ownerLifetimeSeconds: 6_000,
+      ownerLifetimeMs: 6_000_000,
+    });
+    await provisionHost(terminalConfig);
+    await acquireLease(terminalConfig, {
+      ownerToken: OWNER_A,
+      metadata: {
+        repository: 'kontourai/station',
+        runId: '30801602143',
+        runAttempt: '1',
+        workflow: 'CI',
+        job: 'full-regression',
+        runnerName: 'desktop-win-linux',
+      },
+    });
+
+    const result = await recoverTerminalCapacityOwner({
+      config: terminalConfig,
+      kind: 'lease',
+      ownerToken: OWNER_A,
+      repository: 'kontourai/station',
+      runId: '30801602143',
+      runAttempt: 1,
+      token: 'test-token',
+      fetchImpl: async (url) => {
+        assert.equal(
+          url,
+          'https://api.github.com/repos/kontourai/station/actions/runs/30801602143/attempts/1',
+        );
+        return githubRunResponse();
+      },
+    });
+    assert.match(result.recoveredPath, new RegExp(`${OWNER_A}\\.json$`));
+    assert.equal(result.conclusion, 'cancelled');
+
+    const next = await acquireLease(terminalConfig, { ownerToken: OWNER_B });
+    assert.equal(next.ownerToken, OWNER_B);
+    await releaseLease(terminalConfig, OWNER_B);
+  }, { provision: false });
+});
+
+test('an exact terminal GitHub owner can recover a FIFO ticket', async () => {
+  await withRoot(async (root) => {
+    const terminalConfig = config(root);
+    const ticketPath = join(
+      root,
+      '.kontour-physical-host-capacity',
+      'tickets',
+      `${OWNER_A}.json`,
+    );
+    await writeFile(
+      ticketPath,
+      JSON.stringify({
+        ownerToken: OWNER_A,
+        weight: 2,
+        sequence: 1,
+        acquiredAt: new Date().toISOString(),
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        repository: 'kontourai/station',
+        runId: '30801602143',
+        runAttempt: '1',
+      }),
+    );
+    await recoverTerminalCapacityOwner({
+      config: terminalConfig,
+      kind: 'ticket',
+      ownerToken: OWNER_A,
+      repository: 'kontourai/station',
+      runId: '30801602143',
+      runAttempt: 1,
+      token: 'test-token',
+      fetchImpl: async () => githubRunResponse(),
+    });
+    assert.equal(existsSync(ticketPath), false);
+  });
+});
+
+test('the action refuses proof for a repository outside its token scope', async () => {
+  await assert.rejects(
+    runTerminalRecoveryAction({
+      env: {
+        GITHUB_REPOSITORY: 'kontourai/.github',
+        'INPUT_OWNER-REPOSITORY': 'kontourai/station',
+      },
+    }),
+    /must equal the invoking GitHub repository/,
+  );
+});
+
+test('terminal recovery preserves live, mismatched, unavailable, and replaced owners', async () => {
+  const cases = [
+    {
+      name: 'live',
+      fetchImpl: async () => githubRunResponse({ status: 'in_progress', conclusion: null }),
+      expected: /owner run is in_progress/,
+    },
+    {
+      name: 'mismatched proof',
+      fetchImpl: async () => githubRunResponse({ repository: 'kontourai/other' }),
+      expected: /did not match/,
+    },
+    {
+      name: 'mismatched run id',
+      fetchImpl: async () => githubRunResponse({ runId: 999 }),
+      expected: /did not match/,
+    },
+    {
+      name: 'mismatched run attempt',
+      fetchImpl: async () => githubRunResponse({ runAttempt: 2 }),
+      expected: /did not match/,
+    },
+    {
+      name: 'unavailable API',
+      fetchImpl: async () => new Response('', { status: 503 }),
+      expected: /HTTP 503/,
+    },
+    {
+      name: 'oversized streamed response',
+      fetchImpl: async () =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new Uint8Array(1024 * 1024 + 1));
+              controller.close();
+            },
+          }),
+          { status: 200 },
+        ),
+      expected: /exceeds its byte contract/,
+    },
+  ];
+
+  for (const scenario of cases) {
+    await withRoot(async (root) => {
+      const terminalConfig = config(root, { capacityUnits: 3, leaseWeight: 3 });
+      await acquireLease(terminalConfig, {
+        ownerToken: OWNER_A,
+        metadata: {
+          repository: 'kontourai/station',
+          runId: '30801602143',
+          runAttempt: '1',
+        },
+      });
+      await assert.rejects(
+        recoverTerminalCapacityOwner({
+          config: terminalConfig,
+          kind: 'lease',
+          ownerToken: OWNER_A,
+          repository: 'kontourai/station',
+          runId: '30801602143',
+          runAttempt: 1,
+          token: 'test-token',
+          fetchImpl: scenario.fetchImpl,
+        }),
+        scenario.expected,
+        scenario.name,
+      );
+      await assert.rejects(
+        acquireLease(terminalConfig, { ownerToken: OWNER_B }),
+        /used=3\/3/,
+      );
+      await releaseLease(terminalConfig, OWNER_A);
+    });
+  }
+
+  await withRoot(async (root) => {
+    const terminalConfig = config(root, { capacityUnits: 3, leaseWeight: 3 });
+    const first = await acquireLease(terminalConfig, {
+      ownerToken: OWNER_A,
+      metadata: {
+        repository: 'kontourai/station',
+        runId: '30801602143',
+        runAttempt: '1',
+      },
+    });
+    await assert.rejects(
+      recoverTerminalCapacityOwner({
+        config: terminalConfig,
+        kind: 'lease',
+        ownerToken: OWNER_A,
+        repository: 'kontourai/station',
+        runId: '30801602143',
+        runAttempt: 1,
+        token: 'test-token',
+        fetchImpl: async () => githubRunResponse(),
+        beforeRecover: async ({ path }) => {
+          await unlink(path);
+          await writeFile(
+            path,
+            JSON.stringify({
+              ownerToken: OWNER_A,
+              weight: 3,
+              acquiredAt: new Date().toISOString(),
+              repository: 'kontourai/station',
+              runId: '999',
+              runAttempt: '1',
+            }),
+          );
+        },
+      }),
+      /changed after owner verification/,
+    );
+    assert.equal(existsSync(first.leasePath), true);
+  });
 });
 
 test('an orphaned FIFO head ticket is reclaimed so a later live waiter can enter', async () => {

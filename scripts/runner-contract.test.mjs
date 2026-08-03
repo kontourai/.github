@@ -7,6 +7,10 @@ import { parse } from 'yaml';
 const smokeWorkflowUrl = new URL('../.github/workflows/self-hosted-runner-smoke.yml', import.meta.url);
 const preflightActionUrl = new URL('../actions/runner-preflight/action.yml', import.meta.url);
 const capacityActionUrl = new URL('../actions/physical-host-capacity/action.yml', import.meta.url);
+const terminalRecoveryActionUrl = new URL(
+  '../actions/recover-terminal-capacity-owner/action.yml',
+  import.meta.url,
+);
 
 test('fleet smoke routes by stable capability labels instead of host name', async () => {
   const workflow = parse(await readFile(smokeWorkflowUrl, 'utf8'));
@@ -71,4 +75,23 @@ test('physical-host capacity action is a required, cancellation-safe weighted le
   assert.equal(action.runs.main, 'acquire.mjs');
   assert.equal(action.runs.post, 'release.mjs');
   assert.equal(action.runs['post-if'], 'always()');
+});
+
+test('terminal capacity recovery action requires exact owner proof inputs', async () => {
+  const action = parse(await readFile(terminalRecoveryActionUrl, 'utf8'));
+
+  for (const name of [
+    'coordination-root',
+    'host-id',
+    'capacity-units',
+    'recover',
+    'owner-repository',
+    'owner-run-id',
+    'owner-run-attempt',
+    'github-token',
+  ])
+    assert.equal(action.inputs[name].required, true, name);
+  assert.equal(action.inputs['owner-lifetime-seconds'].default, '6000');
+  assert.equal(action.runs.using, 'node20');
+  assert.equal(action.runs.main, 'main.mjs');
 });

@@ -262,6 +262,22 @@ queue-sequence directory, staging directory, or an unreviewed record. On success
 quiescence marker; on failure, inspect it before removing it when the root is
 safe to resume.
 
+When the record contains complete GitHub owner metadata and that exact run
+attempt is already terminal, a manually dispatched workflow in the **owning
+repository** may invoke `actions/recover-terminal-capacity-owner` instead of
+draining both sides of the host. Grant that workflow only `actions: read` and
+`contents: read`, pass its `${{ github.token }}`, and pin this action to a
+reviewed immutable commit. The action requires `owner-repository` to equal the
+invoking repository so the token can authoritatively read the private owner's
+run. It also requires the operator to repeat the exact run ID, attempt, and
+record UUID, then queries GitHub's exact-attempt API. A live, queued,
+mismatched, unreadable, or unavailable owner proof preserves the record. A
+successful proof revalidates the record's SHA-256 under the existing control
+transaction before deleting only that lease or ticket. It does not recover
+control locks, sequence markers, records without GitHub metadata, or records
+owned by another CI provider; those continue to require the quiesced recovery
+path above.
+
 ## Issue intake to Project v2
 
 Every kontourai repository with issues enabled should install a thin caller workflow at `.github/workflows/add-to-project.yml`. On `issues.opened`, `issues.reopened`, and `issues.closed`, the caller invokes the reusable workflow in this repository:
