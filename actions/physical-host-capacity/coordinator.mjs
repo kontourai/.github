@@ -16,6 +16,24 @@ const LEGACY_MANIFEST_SCHEMA_VERSION = 6;
 const LEGACY_RECOVERY_STRATEGY = 'explicit-quiesced-recovery-v1';
 const LEGACY_OWNER_LIFETIME_FLOOR_MS = 6_000_000;
 const CLEANUP_RETRY_MS = 5_000;
+/**
+ * Releasing a lease must be at least as patient as acquiring one was.
+ *
+ * Both operations need the control ticket, but their failures are not
+ * symmetric: an acquire that gives up is retried by the next run, while a
+ * release that gives up leaks its lease permanently — the record is never
+ * reclaimed automatically, so the host loses that weight until a human
+ * dispatches recovery. Less capacity then means more contention, which makes
+ * the next release more likely to lose the same race. Three leases leaked
+ * this way in 24 hours on one host, and one of them took half its capacity
+ * with it and timed out every job queued behind it.
+ *
+ * The release budget therefore tracks the caller's own acquire timeout,
+ * floored at the cleanup retry so a zero-timeout caller (the test config, and
+ * any fire-and-forget acquire) still gets a bounded attempt.
+ */
+const releaseControlTimeoutMs = (config) =>
+  Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs, config.timeoutMs ?? 0);
 const MAX_DIAGNOSTIC_ENTRIES = 6;
 const MAX_DIAGNOSTIC_VALUE_LENGTH = 120;
 const CONTROL_METADATA_FIELDS = ['repository', 'runId', 'runAttempt', 'workflow', 'job', 'runnerName'];
@@ -839,7 +857,7 @@ export async function releaseLease(config, ownerToken, {
 } = {}) {
   assertOwnerToken(ownerToken);
   await ensureProvisioned(config);
-  const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
+  const cleanup = { ...config, timeoutMs: releaseControlTimeoutMs(config), now, sleep };
   return withControlLock(config.root, { ...cleanup, ownerToken, metadata, linkOperation: controlLinkOperation, readOperation: controlReadOperation, controlHooks }, async () => {
       const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
       const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);

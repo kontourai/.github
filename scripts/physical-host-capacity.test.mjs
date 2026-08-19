@@ -1316,3 +1316,58 @@ test('main action directly releases its lease when output and state command file
     assert.match(post.stdout, /no acquired lease to release/);
   }, { provision: false });
 });
+
+test('a release waits out control-ticket contention instead of leaking its lease', async () => {
+  // The leak this prevents: releaseLease used a fixed ~5s control budget while
+  // acquireLease used the caller's full timeout, so a release that lost the
+  // race gave up and left its lease behind forever. Nothing reclaims a lease
+  // automatically, so the host permanently lost that weight — and the reduced
+  // capacity made the next release more likely to lose the same race.
+  //
+  // The clock is injected so the contention outlasts the OLD fixed budget in
+  // virtual time: with that budget this rejects and the lease survives, which
+  // is what makes this test discriminate rather than merely pass.
+  await withRoot(async (root) => {
+    const base = config(root, { timeoutMs: 600_000, pollIntervalMs: 1_000 });
+    const lease = await acquireLease(base, { ownerToken: OWNER_A });
+    assert.equal(lease.ownerToken, OWNER_A);
+
+    const controls = join(root, '.kontour-physical-host-capacity', 'control-tickets');
+    const active = join(controls, 'active');
+    const squatter = join(root, 'squatter-control.json');
+    await writeFile(squatter, JSON.stringify({
+      ownerToken: OWNER_B,
+      lockToken: LOCK_B,
+      repository: 'kontourai/station',
+      runId: '1',
+      runAttempt: '1',
+      workflow: 'CI',
+      job: 'fast-checks',
+      runnerName: 'desktop-win-linux-2',
+    }));
+    await link(squatter, active);
+
+    // A concurrent holder that finishes after 30 virtual seconds — well beyond
+    // the old 5s release budget, well inside the acquire timeout.
+    const HOLD_MS = 30_000;
+    let clock = 0;
+    let handedOver = false;
+    const now = () => clock;
+    const sleep = async (ms) => {
+      clock += ms;
+      if (!handedOver && clock >= HOLD_MS) {
+        handedOver = true;
+        await unlink(active);
+      }
+    };
+
+    const released = await releaseLease(base, OWNER_A, { now, sleep });
+    assert.equal(handedOver, true, 'the release should have waited for the holder to finish');
+    assert.equal(released, true);
+    assert.deepEqual(
+      await readdir(join(root, '.kontour-physical-host-capacity', 'leases')),
+      [],
+      'the lease must not survive its release',
+    );
+  });
+});
