@@ -14,7 +14,7 @@ inputs:
   owner-lifetime-seconds:
     description: Provisioned shared owner lifetime.
     required: false
-    default: "6000"
+    default: "7800"
   recover:
     description: Exact lease:<uuid> or ticket:<uuid> recovery target.
     required: true

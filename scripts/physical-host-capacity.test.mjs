@@ -193,8 +193,8 @@ test('an exact terminal GitHub owner is reclaimed before its age deadline', asyn
     const terminalConfig = config(root, {
       capacityUnits: 3,
       leaseWeight: 3,
-      ownerLifetimeSeconds: 6_000,
-      ownerLifetimeMs: 6_000_000,
+      ownerLifetimeSeconds: 7_800,
+      ownerLifetimeMs: 7_800_000,
     });
     await provisionHost(terminalConfig);
     await acquireLease(terminalConfig, {
@@ -414,7 +414,7 @@ test('an orphaned FIFO head ticket is reclaimed so a later live waiter can enter
   }, { provision: false });
 });
 
-test('a v6 root honors the 90-minute migration floor before recovering stranded records', async () => {
+test('a v6 root honors the 125-minute-plus-margin migration floor before recovering stranded records', async () => {
   await withRoot(async (root) => {
     const legacyConfig = config(root, { capacityUnits: 1, leaseWeight: 1, ownerLifetimeSeconds: 5, ownerLifetimeMs: 5_000 });
     await provisionHost(legacyConfig);
@@ -426,7 +426,7 @@ test('a v6 root honors the 90-minute migration floor before recovering stranded 
     await writeFile(join(tickets, `${OWNER_B}.json`), JSON.stringify({ ownerToken: OWNER_B, weight: 1, sequence: 1 }));
     const tooEarly = Date.now() + 5_001;
     await assert.rejects(acquireLease(legacyConfig, { ownerToken: OWNER_C, now: () => tooEarly }), /used=1\/1/);
-    const now = Date.now() + 6_000_001;
+    const now = Date.now() + 7_800_001;
     const acquired = await acquireLease(legacyConfig, { ownerToken: OWNER_C, now: () => now });
     assert.equal(acquired.ownerToken, OWNER_C);
   }, { provision: false });

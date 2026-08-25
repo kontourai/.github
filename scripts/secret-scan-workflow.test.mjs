@@ -104,7 +104,7 @@ test('self-hosted scans fail closed unless they reserve shared host capacity', a
 
   assert.match(
     workflow,
-    /runner\.environment == 'self-hosted' && \(inputs\.capacity-coordination-root == '' \|\| inputs\.capacity-host-id == '' \|\| inputs\.capacity-timeout-seconds > 600 \|\| inputs\.capacity-owner-lifetime-seconds != 6000\)/,
+    /runner\.environment == 'self-hosted' && \(inputs\.capacity-coordination-root == '' \|\| inputs\.capacity-host-id == '' \|\| inputs\.capacity-timeout-seconds > 600 \|\| inputs\.capacity-owner-lifetime-seconds != 7800\)/,
   );
   assert.match(workflow, /timeout-minutes: 20/);
   assert.match(
@@ -121,7 +121,8 @@ test('self-hosted scans fail closed unless they reserve shared host capacity', a
   ]) {
     assert.ok(workflow.includes(input), `expected capacity input: ${input}`);
   }
-  assert.match(workflow, /capacity-owner-lifetime-seconds:\s*\n\s*description:.*6000[\s\S]*?type: number\s*\n\s*default: 6000/);
+  assert.match(workflow, /capacity-owner-lifetime-seconds:\s*\n\s*description:.*125-minute[\s\S]*?type: number\s*\n\s*default: 7800/);
+  assert.doesNotMatch(workflow, /capacity-owner-lifetime-seconds != 6000/);
 });
 
 test('scan fails closed if the checkout is shallow', async () => {

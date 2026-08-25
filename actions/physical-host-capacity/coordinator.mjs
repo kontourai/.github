@@ -14,7 +14,10 @@ const MANIFEST_SCHEMA_VERSION = 7;
 const RECOVERY_STRATEGY = 'bounded-owner-deadline-v1';
 const LEGACY_MANIFEST_SCHEMA_VERSION = 6;
 const LEGACY_RECOVERY_STRATEGY = 'explicit-quiesced-recovery-v1';
-const LEGACY_OWNER_LIFETIME_FLOOR_MS = 6_000_000;
+// Station's longest permitted owner can run for 125 minutes, followed by a
+// five-minute recovery margin. A v6 record has no fixed expiry, so its mtime
+// fallback must be at least as conservative as the v7 host-wide contract.
+const LEGACY_OWNER_LIFETIME_FLOOR_MS = 7_800_000;
 const CLEANUP_RETRY_MS = 5_000;
 /**
  * Releasing a lease must be at least as patient as acquiring one was.
@@ -110,7 +113,7 @@ export function parseConfig(env = process.env) {
   const leaseWeight = positiveInteger(input(env, 'lease-weight') ?? env.PHYSICAL_HOST_CAPACITY_WEIGHT ?? '1', 'lease-weight');
   const timeoutMs = durationMilliseconds(input(env, 'timeout-seconds') ?? env.PHYSICAL_HOST_CAPACITY_TIMEOUT_SECONDS ?? '300', 'timeout-seconds', { allowZero: true }).milliseconds;
   const pollIntervalMs = positiveInteger(input(env, 'poll-interval-ms') ?? env.PHYSICAL_HOST_CAPACITY_POLL_INTERVAL_MS ?? '1000', 'poll-interval-ms');
-  const ownerLifetime = durationMilliseconds(input(env, 'owner-lifetime-seconds') ?? env.PHYSICAL_HOST_CAPACITY_OWNER_LIFETIME_SECONDS ?? '6000', 'owner-lifetime-seconds');
+  const ownerLifetime = durationMilliseconds(input(env, 'owner-lifetime-seconds') ?? env.PHYSICAL_HOST_CAPACITY_OWNER_LIFETIME_SECONDS ?? '7800', 'owner-lifetime-seconds');
 
   if (leaseWeight > capacityUnits) throw new CapacityCoordinationError(`lease-weight (${leaseWeight}) cannot exceed capacity-units (${capacityUnits}).`);
 
@@ -689,7 +692,7 @@ async function listRecords(directory, label, validate, config, now) {
     if (info.isSymbolicLink() || !info.isFile()) throw new CapacityCoordinationError(`Unexpected ${label} entry at ${path}; refusing to follow a symlink or junction.`);
     const record = validate(await readJson(path, label), path);
     // v6 did not persist an owner deadline. Its mtime fallback therefore uses
-    // the Station-wide 90-minute timeout plus margin floor, even when a caller
+    // the Station-wide 125-minute timeout plus five-minute margin floor, even when a caller
     // supplies a shorter value during migration.
     const expiry = record.expiresAt ? Date.parse(record.expiresAt) : info.mtimeMs + Math.max(config.ownerLifetimeMs, LEGACY_OWNER_LIFETIME_FLOOR_MS);
     if (expiry <= now()) {

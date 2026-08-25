@@ -119,7 +119,7 @@ jobs:
           capacity-units: '8'
           lease-weight: '5'
           timeout-seconds: '240'
-          owner-lifetime-seconds: '6000' # shared 90-minute maximum plus 10-minute margin
+          owner-lifetime-seconds: '7800' # shared 125-minute maximum plus 5-minute recovery margin
       - shell: pwsh
         run: npm test
 
@@ -137,7 +137,7 @@ jobs:
           capacity-units: '8'
           lease-weight: '3'
           timeout-seconds: '240'
-          owner-lifetime-seconds: '6000' # shared 90-minute maximum plus 10-minute margin
+          owner-lifetime-seconds: '7800' # shared 125-minute maximum plus 5-minute recovery margin
       - run: npm test
 ```
 
@@ -152,7 +152,7 @@ node scripts/provision-physical-host-capacity.mjs \
   --root /mnt/d/kontour-runner-capacity \
   --host-id desktop-win-01 \
   --capacity-units 8 \
-  --owner-lifetime-seconds 6000
+  --owner-lifetime-seconds 7800
 ```
 
 Provisioning writes an externally located `.kontour-physical-host-id` marker
@@ -179,13 +179,14 @@ for a root must use the same value.
 This is the action's liveness boundary without a GitHub token or API: expiry
 does not probe GitHub or prove a process died. It is safe only because the
 workflow contract guarantees the owner cannot still run beyond its declared job
-timeout. Do not set a lifetime below that timeout. The shared default is 6000
-seconds: Station's 90-minute maximum job timeout plus ten minutes of margin.
+timeout. Do not set a lifetime below that timeout. The shared default is 7800
+seconds: Station's 125-minute maximum job timeout plus five minutes of recovery
+margin.
 
 Roots provisioned by schema v6 are read in compatibility mode so the first
 updated participant can clear the stranded records from a killed runner. Those
 legacy records have no deadline, so their shared-file timestamp uses at least
-the 6000-second shared safety floor even if a caller supplies a shorter value.
+the 7800-second shared safety floor even if a caller supplies a shorter value.
 Drain and re-provision the root afterward to make the v7 deadline contract
 authoritative. Do not change a v7 root's shared lifetime while live records
 exist: drain it first, then re-provision every caller with the same value.
@@ -250,7 +251,7 @@ node scripts/recover-physical-host-capacity.mjs \
   --root /mnt/d/kontour-runner-capacity \
   --host-id desktop-win-01 \
   --capacity-units 8 \
-  --owner-lifetime-seconds 6000 \
+  --owner-lifetime-seconds 7800 \
   --recover lease:<owner-uuid>
 ```
 
@@ -349,9 +350,9 @@ checkout, an empty result, an unexpected value, or the command itself
 erroring all fail the run rather than silently scanning a partial history.
 
 Self-hosted secret scans must provide capacity root and host identity. The
-reusable workflow fixes `capacity-owner-lifetime-seconds` at 6000 seconds and
+reusable workflow fixes `capacity-owner-lifetime-seconds` at 7800 seconds and
 forwards it to the physical-host action, so it remains compatible with the
-shared 90-minute Station capacity manifest.
+shared 125-minute Station capacity manifest plus a five-minute recovery margin.
 
 ## Release-note policy
 
