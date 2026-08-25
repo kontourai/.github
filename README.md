@@ -159,8 +159,30 @@ Provisioning writes an externally located `.kontour-physical-host-id` marker
 and a schema-versioned `host-manifest.json`. Its host ID, capacity,
 owner lifetime, and `bounded-owner-deadline-v1` strategy are authoritative:
 every participant must match them exactly before acquire or release
-can proceed. Update those values only after draining the root and deliberately
-re-provisioning it.
+can proceed. Do not delete or edit this manifest in place. For the supported
+Station-wide schema-v7 6000-to-7800-second migration, first drain every runner
+and recover any remaining owner records, then create the fixed quiescence
+marker and run the explicit migration:
+
+```sh
+printf 'desktop-win-01\n' > /mnt/d/kontour-runner-capacity/.kontour-physical-host-quiesced
+node scripts/migrate-physical-host-owner-lifetime.mjs \
+  --root /mnt/d/kontour-runner-capacity \
+  --host-id desktop-win-01 \
+  --capacity-units 8 \
+  --old-owner-lifetime-seconds 6000 \
+  --new-owner-lifetime-seconds 7800
+```
+
+The command accepts only that exact schema-v7 host contract, requires the
+regular marker to contain exactly the host ID, and refuses leases, tickets,
+control ownership, staging residue, malformed queue-sequence state, symlinks,
+or unexpected entries. It atomically publishes the new manifest and retains
+the exact old one as
+`host-manifest.owner-lifetime-6000-to-7800.backup.json`; it consumes the
+quiescence marker on success. Re-running with a newly created marker validates
+an already-exact 7800-second manifest without changing it. For any other host
+contract change, drain the root and deliberately re-provision every caller.
 
 The action never starts a detached process. Its post step releases the lease on
 normal failure or cancellation. If GitHub removes a command file after the

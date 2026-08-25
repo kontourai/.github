@@ -62,5 +62,7 @@ test('operator and reusable-workflow documentation specify the same owner lifeti
   assert.match(readme, /owner-lifetime-seconds: '7800' # shared 125-minute maximum plus 5-minute recovery margin/);
   assert.match(readme, /The shared default is 7800\nseconds: Station's 125-minute maximum job timeout plus five minutes of recovery\nmargin/);
   assert.match(readme, /reusable workflow fixes `capacity-owner-lifetime-seconds` at 7800 seconds/);
-  assert.doesNotMatch(readme, /6000/);
+  assert.match(readme, /migrate-physical-host-owner-lifetime\.mjs/);
+  assert.match(readme, /--old-owner-lifetime-seconds 6000/);
+  assert.doesNotMatch(readme, /shared default is 6000/i);
 });
