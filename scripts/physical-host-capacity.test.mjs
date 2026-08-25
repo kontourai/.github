@@ -612,6 +612,19 @@ test('owner-lifetime migration resumes only an exact prelinked backup after inte
   }, { provision: false });
 });
 
+test('owner-lifetime migration rejects an unusable oversized queue sequence without consuming quiescence', async () => {
+  await withRoot(async (root) => {
+    const oldConfig = migrationConfig(root, 6_000);
+    await provisionHost(oldConfig);
+    await mkdir(join(root, '.kontour-physical-host-capacity', 'queue-sequences', '99999999999999999999'));
+    await quiesce(root);
+
+    await expectMigrationFailure(root, /exceeds Number\.MAX_SAFE_INTEGER/);
+    assert.equal((await readHostManifest(root)).ownerLifetimeSeconds, 6_000);
+    await access(join(root, '.kontour-physical-host-quiesced'));
+  }, { provision: false });
+});
+
 test('explicit recovery requires a distinct, regular quiescence marker and removes it after use', async () => {
   await withRoot(async (root) => {
     const recoveryConfig = config(root, { capacityUnits: 3, leaseWeight: 3 });

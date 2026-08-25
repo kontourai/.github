@@ -383,6 +383,7 @@ async function assertEmptyMigrationDirectory(path, label) {
 
 async function assertQueueSequencesAreSafe(location) {
   const entries = await readdir(location.queueSequences, { withFileTypes: true });
+  const maximumSequence = BigInt(Number.MAX_SAFE_INTEGER);
   for (const entry of entries) {
     const path = join(location.queueSequences, entry.name);
     if (!entry.isDirectory() || !/^[0-9]{20}$/.test(entry.name)) {
@@ -391,6 +392,9 @@ async function assertQueueSequencesAreSafe(location) {
     const info = await lstat(path);
     if (info.isSymbolicLink() || !info.isDirectory()) {
       throw new CapacityCoordinationError(`Queue-sequence entry at ${path} must be a real directory, not a symlink or junction.`);
+    }
+    if (BigInt(entry.name) > maximumSequence) {
+      throw new CapacityCoordinationError(`Queue-sequence entry at ${path} exceeds Number.MAX_SAFE_INTEGER; refusing migration.`);
     }
   }
 }
