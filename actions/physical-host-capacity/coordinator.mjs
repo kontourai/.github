@@ -14,7 +14,14 @@ const MANIFEST_SCHEMA_VERSION = 7;
 const RECOVERY_STRATEGY = 'bounded-owner-deadline-v1';
 const LEGACY_MANIFEST_SCHEMA_VERSION = 6;
 const LEGACY_RECOVERY_STRATEGY = 'explicit-quiesced-recovery-v1';
-const LEGACY_OWNER_LIFETIME_FLOOR_MS = 6_000_000;
+const OWNER_LIFETIME_MIGRATION_FROM_SECONDS = 6_000;
+const OWNER_LIFETIME_MIGRATION_TO_SECONDS = 7_800;
+const OWNER_LIFETIME_MIGRATION_BACKUP_FILE = 'host-manifest.owner-lifetime-6000-to-7800.backup.json';
+const QUIESCENCE_MARKER_FILE = '.kontour-physical-host-quiesced';
+// Station's longest permitted owner can run for 125 minutes, followed by a
+// five-minute recovery margin. A v6 record has no fixed expiry, so its mtime
+// fallback must be at least as conservative as the v7 host-wide contract.
+const LEGACY_OWNER_LIFETIME_FLOOR_MS = 7_800_000;
 const CLEANUP_RETRY_MS = 5_000;
 /**
  * Releasing a lease must be at least as patient as acquiring one was.
@@ -110,7 +117,7 @@ export function parseConfig(env = process.env) {
   const leaseWeight = positiveInteger(input(env, 'lease-weight') ?? env.PHYSICAL_HOST_CAPACITY_WEIGHT ?? '1', 'lease-weight');
   const timeoutMs = durationMilliseconds(input(env, 'timeout-seconds') ?? env.PHYSICAL_HOST_CAPACITY_TIMEOUT_SECONDS ?? '300', 'timeout-seconds', { allowZero: true }).milliseconds;
   const pollIntervalMs = positiveInteger(input(env, 'poll-interval-ms') ?? env.PHYSICAL_HOST_CAPACITY_POLL_INTERVAL_MS ?? '1000', 'poll-interval-ms');
-  const ownerLifetime = durationMilliseconds(input(env, 'owner-lifetime-seconds') ?? env.PHYSICAL_HOST_CAPACITY_OWNER_LIFETIME_SECONDS ?? '6000', 'owner-lifetime-seconds');
+  const ownerLifetime = durationMilliseconds(input(env, 'owner-lifetime-seconds') ?? env.PHYSICAL_HOST_CAPACITY_OWNER_LIFETIME_SECONDS ?? '7800', 'owner-lifetime-seconds');
 
   if (leaseWeight > capacityUnits) throw new CapacityCoordinationError(`lease-weight (${leaseWeight}) cannot exceed capacity-units (${capacityUnits}).`);
 
@@ -123,6 +130,7 @@ export function parseConfig(env = process.env) {
 function paths(root) {
   const state = join(root, STATE_DIRECTORY);
   return {
+    root,
     state,
     marker: join(root, HOST_MARKER_FILE),
     manifest: join(state, MANIFEST_FILE),
@@ -334,6 +342,212 @@ export async function provisionHost(config, { ownerToken = randomUUID() } = {}) 
       }
       await writeExclusive(location.manifest, JSON.stringify(manifestFor(config)));
     }
+  });
+}
+
+function assertMigrationConfigs(sourceConfig, targetConfig) {
+  if (
+    sourceConfig.ownerLifetimeSeconds !== OWNER_LIFETIME_MIGRATION_FROM_SECONDS
+    || targetConfig.ownerLifetimeSeconds !== OWNER_LIFETIME_MIGRATION_TO_SECONDS
+  ) {
+    throw new CapacityCoordinationError(
+      `This migration supports only ${OWNER_LIFETIME_MIGRATION_FROM_SECONDS} to ${OWNER_LIFETIME_MIGRATION_TO_SECONDS} owner-lifetime seconds.`,
+    );
+  }
+  for (const key of ['root', 'hostId', 'capacityUnits']) {
+    if (sourceConfig[key] !== targetConfig[key]) {
+      throw new CapacityCoordinationError(`Migration source and target ${key} must match exactly.`);
+    }
+  }
+}
+
+async function assertExactQuiescenceMarker(location, hostId) {
+  const marker = join(location.root, QUIESCENCE_MARKER_FILE);
+  await assertRegularFile(marker, 'quiescence marker');
+  if (await readFile(marker, 'utf8') !== `${hostId}\n`) {
+    throw new CapacityCoordinationError(
+      `Quiescence marker at ${marker} must contain exactly ${JSON.stringify(`${hostId}\n`)} after runners are drained.`,
+    );
+  }
+  return marker;
+}
+
+async function assertEmptyMigrationDirectory(path, label) {
+  const entries = await readdir(path, { withFileTypes: true });
+  if (entries.length > 0) {
+    throw new CapacityCoordinationError(
+      `Cannot migrate owner lifetime while ${label} contains state at ${path}; drain and recover it first.`,
+    );
+  }
+}
+
+async function assertQueueSequencesAreSafe(location) {
+  const entries = await readdir(location.queueSequences, { withFileTypes: true });
+  const maximumSequence = BigInt(Number.MAX_SAFE_INTEGER);
+  for (const entry of entries) {
+    const path = join(location.queueSequences, entry.name);
+    if (!entry.isDirectory() || !/^[0-9]{20}$/.test(entry.name)) {
+      throw new CapacityCoordinationError(`Unexpected queue-sequence entry at ${path}; refusing migration.`);
+    }
+    const info = await lstat(path);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new CapacityCoordinationError(`Queue-sequence entry at ${path} must be a real directory, not a symlink or junction.`);
+    }
+    if (BigInt(entry.name) > maximumSequence) {
+      throw new CapacityCoordinationError(`Queue-sequence entry at ${path} exceeds Number.MAX_SAFE_INTEGER; refusing migration.`);
+    }
+  }
+}
+
+async function assertMigrationControlState(location, candidatePath) {
+  const candidateName = basename(candidatePath);
+  const expected = new Set(['active', candidateName]);
+  const entries = await readdir(location.controlTickets, { withFileTypes: true });
+  if (entries.length !== expected.size || entries.some((entry) => !expected.has(entry.name))) {
+    throw new CapacityCoordinationError(
+      `Cannot migrate owner lifetime while control ownership state exists at ${location.controlTickets}; drain and recover it first.`,
+    );
+  }
+  for (const entry of entries) {
+    const path = join(location.controlTickets, entry.name);
+    if (!entry.isFile()) {
+      throw new CapacityCoordinationError(`Control ownership state at ${path} must be a regular file, not a symlink or junction.`);
+    }
+    await assertRegularFile(path, 'migration control ticket');
+  }
+}
+
+async function assertResumableMigrationBackup(location, sourceConfig, backupPath) {
+  await assertRegularFile(backupPath, 'owner-lifetime migration backup');
+  const backup = validManifest(
+    await readJson(backupPath, 'owner-lifetime migration backup'),
+    backupPath,
+  );
+  assertManifestMatches(backup, sourceConfig, backupPath);
+  const [manifestInfo, backupInfo] = await Promise.all([
+    stat(location.manifest),
+    stat(backupPath),
+  ]);
+  if (manifestInfo.dev !== backupInfo.dev || manifestInfo.ino !== backupInfo.ino) {
+    throw new CapacityCoordinationError(
+      `Owner-lifetime migration backup at ${backupPath} is not the exact original manifest inode; refusing to overwrite or roll back an ambiguous migration.`,
+    );
+  }
+}
+
+async function assertMigrationLayout(location, sourceConfig, targetConfig, candidatePath) {
+  await assertDirectory(location.root, 'coordination-root');
+  await assertDirectory(location.state, 'coordination state directory');
+  await assertDirectory(location.leases, 'lease directory');
+  await assertDirectory(location.tickets, 'ticket directory');
+  await assertDirectory(location.controlTickets, 'control-ticket directory');
+  await assertDirectory(location.queueSequences, 'queue-sequence directory');
+  await assertDirectory(location.staging, 'staging directory');
+
+  await assertRegularFile(location.marker, 'external host marker');
+  if (await readFile(location.marker, 'utf8') !== `${sourceConfig.hostId}\n`) {
+    throw new CapacityCoordinationError(`External host marker mismatch at ${location.marker}; migration cannot continue.`);
+  }
+
+  const manifest = validManifest(await readJson(location.manifest, 'host manifest'), location.manifest);
+  const backupPath = join(location.state, OWNER_LIFETIME_MIGRATION_BACKUP_FILE);
+  const stateEntries = await readdir(location.state, { withFileTypes: true });
+  const allowedStateEntries = new Set([
+    MANIFEST_FILE,
+    LEASE_DIRECTORY,
+    TICKET_DIRECTORY,
+    CONTROL_TICKET_DIRECTORY,
+    QUEUE_SEQUENCE_DIRECTORY,
+    STAGING_DIRECTORY,
+    OWNER_LIFETIME_MIGRATION_BACKUP_FILE,
+  ]);
+  for (const entry of stateEntries) {
+    if (!allowedStateEntries.has(entry.name)) {
+      throw new CapacityCoordinationError(`Unexpected coordination-state entry at ${join(location.state, entry.name)}; refusing migration.`);
+    }
+  }
+
+  await assertEmptyMigrationDirectory(location.leases, 'leases');
+  await assertEmptyMigrationDirectory(location.tickets, 'queue tickets');
+  await assertEmptyMigrationDirectory(location.staging, 'staging');
+  await assertQueueSequencesAreSafe(location);
+  await assertMigrationControlState(location, candidatePath);
+
+  if (manifest.ownerLifetimeSeconds === targetConfig.ownerLifetimeSeconds) {
+    assertManifestMatches(manifest, targetConfig, location.manifest);
+    try {
+      await assertRegularFile(backupPath, 'owner-lifetime migration backup');
+      const backup = validManifest(await readJson(backupPath, 'owner-lifetime migration backup'), backupPath);
+      assertManifestMatches(backup, sourceConfig, backupPath);
+    } catch (error) {
+      if (errorCode(error) !== 'ENOENT') throw error;
+    }
+    return { manifest, backupPath, alreadyMigrated: true };
+  }
+
+  assertManifestMatches(manifest, sourceConfig, location.manifest);
+  try {
+    await assertResumableMigrationBackup(location, sourceConfig, backupPath);
+  } catch (error) {
+    if (errorCode(error) === 'ENOENT') {
+      return { manifest, backupPath, alreadyMigrated: false, backupReady: false };
+    }
+    throw error;
+  }
+  return { manifest, backupPath, alreadyMigrated: false, backupReady: true };
+}
+
+/**
+ * Safely updates the one Station-wide schema-v7 host manifest from its retired
+ * 6000-second fixed deadline to the 7800-second deadline. The caller must
+ * have drained the host and supplied the fixed quiescence marker. It never
+ * creates, clears, or adopts capacity records.
+ */
+export async function migrateOwnerLifetime(sourceConfig, targetConfig, {
+  ownerToken = randomUUID(),
+} = {}) {
+  assertMigrationConfigs(sourceConfig, targetConfig);
+  const location = paths(sourceConfig.root);
+  await assertDirectory(location.root, 'coordination-root');
+  await assertDirectory(location.controlTickets, 'control-ticket directory');
+
+  return withControlLock(sourceConfig.root, {
+    ...sourceConfig,
+    timeoutMs: 0,
+    ownerToken,
+  }, async (_heldOwner, candidatePath) => {
+    const quiescenceMarker = await assertExactQuiescenceMarker(location, sourceConfig.hostId);
+    const state = await assertMigrationLayout(location, sourceConfig, targetConfig, candidatePath);
+    if (state.alreadyMigrated) {
+      await rm(quiescenceMarker, { force: false });
+      return { migrated: false, backupPath: state.backupPath };
+    }
+
+    const temporaryPath = join(
+      location.staging,
+      `.host-manifest-6000-to-7800-${randomUUID()}.tmp`,
+    );
+    try {
+      await writeExclusive(temporaryPath, JSON.stringify(manifestFor(targetConfig)));
+      if (!state.backupReady) {
+        await link(location.manifest, state.backupPath);
+      }
+      // A previous process can die after linking the backup but before the
+      // replacement. Resume only that exact hard-link state; a copied or
+      // substituted backup remains an ambiguous collision and fails closed.
+      await assertResumableMigrationBackup(location, sourceConfig, state.backupPath);
+      // `temporaryPath` was fully synced before this replacement. rename
+      // atomically publishes it while the hard-linked backup preserves the
+      // exact old manifest for recovery if the operation is interrupted.
+      await rename(temporaryPath, location.manifest);
+    } finally {
+      await rm(temporaryPath, { force: true });
+    }
+
+    const migratedManifest = validManifest(await readJson(location.manifest, 'host manifest'), location.manifest);
+    assertManifestMatches(migratedManifest, targetConfig, location.manifest);
+    await rm(quiescenceMarker, { force: false });
+    return { migrated: true, backupPath: state.backupPath };
   });
 }
 
@@ -608,7 +822,7 @@ async function withControlLock(root, {
       try {
         await assertActiveControlLockInstance(controlPath, publication.candidatePath, heldOwner, { readOperation, readOwner: inspectActive });
         await controlHooks?.beforeControlOperation?.(heldOwner, controlPath, publication.candidatePath);
-        return await operation();
+        return await operation(heldOwner, publication.candidatePath);
       } catch (error) {
         operationError = error;
         throw error;
@@ -689,7 +903,7 @@ async function listRecords(directory, label, validate, config, now) {
     if (info.isSymbolicLink() || !info.isFile()) throw new CapacityCoordinationError(`Unexpected ${label} entry at ${path}; refusing to follow a symlink or junction.`);
     const record = validate(await readJson(path, label), path);
     // v6 did not persist an owner deadline. Its mtime fallback therefore uses
-    // the Station-wide 90-minute timeout plus margin floor, even when a caller
+    // the Station-wide 125-minute timeout plus five-minute margin floor, even when a caller
     // supplies a shorter value during migration.
     const expiry = record.expiresAt ? Date.parse(record.expiresAt) : info.mtimeMs + Math.max(config.ownerLifetimeMs, LEGACY_OWNER_LIFETIME_FLOOR_MS);
     if (expiry <= now()) {
@@ -799,12 +1013,18 @@ export async function acquireLease(config, {
 
   try {
     await withControlLock(config.root, { ...config, timeoutMs: config.timeoutMs, now, sleep, ownerToken, metadata, linkOperation: controlLinkOperation, readOperation: controlReadOperation, controlHooks }, async () => {
+      // A manifest can change only under this same lock. Recheck after
+      // entering it so a participant that validated the former contract
+      // before a drained migration waited for control cannot publish state
+      // under that retired contract afterward.
+      await ensureProvisioned(config);
       await createTicket(config, ownerToken, now, metadata);
       ticketCreated = true;
     });
     while (true) {
       const remaining = Math.max(0, deadline - now());
       const result = await withControlLock(config.root, { ...config, timeoutMs: remaining, now, sleep, ownerToken, metadata, linkOperation: controlLinkOperation, readOperation: controlReadOperation, controlHooks }, async () => {
+        await ensureProvisioned(config);
         const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
         const leaseRecords = await listRecords(paths(config.root).leases, 'lease record', validLease, config, now);
         const ticketRecords = await listRecords(paths(config.root).tickets, 'queue ticket', validTicket, config, now);
@@ -859,6 +1079,7 @@ export async function releaseLease(config, ownerToken, {
   await ensureProvisioned(config);
   const cleanup = { ...config, timeoutMs: releaseControlTimeoutMs(config), now, sleep };
   return withControlLock(config.root, { ...cleanup, ownerToken, metadata, linkOperation: controlLinkOperation, readOperation: controlReadOperation, controlHooks }, async () => {
+      await ensureProvisioned(config);
       const leasePath = join(paths(config.root).leases, `${ownerToken}.json`);
       const ticketPath = join(paths(config.root).tickets, `${ownerToken}.json`);
       let releasedLease = false;
@@ -901,6 +1122,7 @@ export async function recoverAbandonedRecord(config, { kind, ownerToken, expecte
     const sequencePath = join(location.queueSequences, ownerToken);
     const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
     return withControlLock(config.root, { ...cleanup, ownerToken: controlOwnerToken }, async () => {
+      await ensureProvisioned(config);
       await removeRegularRecord(sequencePath, 'queue-sequence entry');
       return sequencePath;
     });
@@ -913,6 +1135,7 @@ export async function recoverAbandonedRecord(config, { kind, ownerToken, expecte
   const recordPath = join(directory, `${ownerToken}.json`);
   const cleanup = { ...config, timeoutMs: Math.max(CLEANUP_RETRY_MS, config.pollIntervalMs), now, sleep };
   return withControlLock(config.root, { ...cleanup, ownerToken: controlOwnerToken }, async () => {
+    await ensureProvisioned(config);
     if (expectedSha256 !== undefined) {
       if (!/^[a-f0-9]{64}$/.test(expectedSha256)) {
         throw new CapacityCoordinationError('Expected recovery record digest must be a lowercase SHA-256 value.');

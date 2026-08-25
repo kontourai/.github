@@ -29,6 +29,9 @@ const execFile = promisify(execFileCallback);
 const acquireScript = fileURLToPath(new URL('../actions/physical-host-capacity/acquire.mjs', import.meta.url));
 const releaseScript = fileURLToPath(new URL('../actions/physical-host-capacity/release.mjs', import.meta.url));
 const recoverScript = fileURLToPath(new URL('./recover-physical-host-capacity.mjs', import.meta.url));
+const migrateOwnerLifetimeScript = fileURLToPath(
+  new URL('./migrate-physical-host-owner-lifetime.mjs', import.meta.url),
+);
 
 async function withRoot(fn, { provision = true } = {}) {
   const root = await mkdtemp(join(tmpdir(), 'physical-host-capacity-'));
@@ -52,6 +55,46 @@ function config(root, overrides = {}) {
     ownerLifetimeMs: 60_000,
     ...overrides,
   };
+}
+
+function migrationConfig(root, ownerLifetimeSeconds) {
+  return config(root, {
+    capacityUnits: 3,
+    leaseWeight: 1,
+    ownerLifetimeSeconds,
+    ownerLifetimeMs: ownerLifetimeSeconds * 1_000,
+  });
+}
+
+function migrationArguments(root, {
+  oldOwnerLifetimeSeconds = 6_000,
+  newOwnerLifetimeSeconds = 7_800,
+} = {}) {
+  return [
+    '--root', root,
+    '--host-id', 'desktop-win-01',
+    '--capacity-units', '3',
+    '--old-owner-lifetime-seconds', String(oldOwnerLifetimeSeconds),
+    '--new-owner-lifetime-seconds', String(newOwnerLifetimeSeconds),
+  ];
+}
+
+async function quiesce(root) {
+  await writeFile(join(root, '.kontour-physical-host-quiesced'), 'desktop-win-01\n');
+}
+
+async function readHostManifest(root) {
+  return JSON.parse(await readFile(join(root, '.kontour-physical-host-capacity', 'host-manifest.json'), 'utf8'));
+}
+
+async function expectMigrationFailure(root, expression, options) {
+  await assert.rejects(
+    execFile(process.execPath, [migrateOwnerLifetimeScript, ...migrationArguments(root, options)]),
+    (error) => {
+      assert.match(error.stderr, expression);
+      return true;
+    },
+  );
 }
 
 test('configuration rejects ambiguous capacity inputs and accepts environment configuration', () => {
@@ -193,8 +236,8 @@ test('an exact terminal GitHub owner is reclaimed before its age deadline', asyn
     const terminalConfig = config(root, {
       capacityUnits: 3,
       leaseWeight: 3,
-      ownerLifetimeSeconds: 6_000,
-      ownerLifetimeMs: 6_000_000,
+      ownerLifetimeSeconds: 7_800,
+      ownerLifetimeMs: 7_800_000,
     });
     await provisionHost(terminalConfig);
     await acquireLease(terminalConfig, {
@@ -414,7 +457,7 @@ test('an orphaned FIFO head ticket is reclaimed so a later live waiter can enter
   }, { provision: false });
 });
 
-test('a v6 root honors the 90-minute migration floor before recovering stranded records', async () => {
+test('a v6 root honors the 125-minute-plus-margin migration floor before recovering stranded records', async () => {
   await withRoot(async (root) => {
     const legacyConfig = config(root, { capacityUnits: 1, leaseWeight: 1, ownerLifetimeSeconds: 5, ownerLifetimeMs: 5_000 });
     await provisionHost(legacyConfig);
@@ -426,9 +469,159 @@ test('a v6 root honors the 90-minute migration floor before recovering stranded 
     await writeFile(join(tickets, `${OWNER_B}.json`), JSON.stringify({ ownerToken: OWNER_B, weight: 1, sequence: 1 }));
     const tooEarly = Date.now() + 5_001;
     await assert.rejects(acquireLease(legacyConfig, { ownerToken: OWNER_C, now: () => tooEarly }), /used=1\/1/);
-    const now = Date.now() + 6_000_001;
+    const now = Date.now() + 7_800_001;
     const acquired = await acquireLease(legacyConfig, { ownerToken: OWNER_C, now: () => now });
     assert.equal(acquired.ownerToken, OWNER_C);
+  }, { provision: false });
+});
+
+test('the explicit quiesced migration atomically moves an exact drained schema-v7 host from 6000 to 7800 seconds', async () => {
+  await withRoot(async (root) => {
+    const oldConfig = migrationConfig(root, 6_000);
+    const newConfig = migrationConfig(root, 7_800);
+    await provisionHost(oldConfig);
+    const sequences = join(root, '.kontour-physical-host-capacity', 'queue-sequences');
+    await mkdir(join(sequences, '00000000000000000001'));
+    await quiesce(root);
+
+    const result = await execFile(process.execPath, [
+      migrateOwnerLifetimeScript,
+      ...migrationArguments(root),
+    ]);
+    assert.match(result.stdout, /Migrated physical-host owner lifetime to 7800 seconds/);
+    assert.equal((await readHostManifest(root)).ownerLifetimeSeconds, 7_800);
+    assert.equal(
+      JSON.parse(await readFile(join(root, '.kontour-physical-host-capacity', 'host-manifest.owner-lifetime-6000-to-7800.backup.json'), 'utf8')).ownerLifetimeSeconds,
+      6_000,
+    );
+    await access(join(sequences, '00000000000000000001'));
+    await assert.rejects(access(join(root, '.kontour-physical-host-quiesced')), { code: 'ENOENT' });
+
+    const acquired = await acquireLease(newConfig, { ownerToken: OWNER_A });
+    assert.equal(await releaseLease(newConfig, acquired.ownerToken), true);
+
+    const manifestBefore = await readFile(join(root, '.kontour-physical-host-capacity', 'host-manifest.json'), 'utf8');
+    const backupBefore = await readFile(join(root, '.kontour-physical-host-capacity', 'host-manifest.owner-lifetime-6000-to-7800.backup.json'), 'utf8');
+    await quiesce(root);
+    const repeated = await execFile(process.execPath, [migrateOwnerLifetimeScript, ...migrationArguments(root)]);
+    assert.match(repeated.stdout, /already 7800 seconds/);
+    assert.equal(await readFile(join(root, '.kontour-physical-host-capacity', 'host-manifest.json'), 'utf8'), manifestBefore);
+    assert.equal(await readFile(join(root, '.kontour-physical-host-capacity', 'host-manifest.owner-lifetime-6000-to-7800.backup.json'), 'utf8'), backupBefore);
+    await assert.rejects(access(join(root, '.kontour-physical-host-quiesced')), { code: 'ENOENT' });
+  }, { provision: false });
+});
+
+test('owner-lifetime migration fails closed without its exact fixed quiescence marker or contract values', async () => {
+  await withRoot(async (root) => {
+    const oldConfig = migrationConfig(root, 6_000);
+    await provisionHost(oldConfig);
+    await expectMigrationFailure(root, /quiescence marker/);
+    await quiesce(root);
+    await expectMigrationFailure(root, /supports only 6000 to 7800 owner-lifetime seconds/, {
+      oldOwnerLifetimeSeconds: 5_999,
+    });
+    await expectMigrationFailure(root, /supports only 6000 to 7800 owner-lifetime seconds/, {
+      newOwnerLifetimeSeconds: 6_000,
+    });
+    assert.equal((await readHostManifest(root)).ownerLifetimeSeconds, 6_000);
+  }, { provision: false });
+});
+
+test('owner-lifetime migration refuses every live owner-state directory', async () => {
+  const cases = [
+    {
+      name: 'lease',
+      prepare: async (root, oldConfig) => acquireLease(oldConfig, { ownerToken: OWNER_A }),
+      message: /leases contains state/,
+    },
+    {
+      name: 'queue ticket',
+      prepare: async (root) => writeFile(
+        join(root, '.kontour-physical-host-capacity', 'tickets', `${OWNER_A}.json`),
+        JSON.stringify({ ownerToken: OWNER_A, weight: 1, sequence: 1 }),
+      ),
+      message: /queue tickets contains state/,
+    },
+    {
+      name: 'control owner',
+      prepare: async (root) => publishActiveControlLock(root, OWNER_A),
+      message: /Timed out waiting for the capacity coordination control ticket/,
+    },
+    {
+      name: 'staging residue',
+      prepare: async (root) => writeFile(
+        join(root, '.kontour-physical-host-capacity', 'staging', 'partial-manifest.tmp'),
+        'partial',
+      ),
+      message: /staging contains state/,
+    },
+  ];
+
+  for (const scenario of cases) {
+    await withRoot(async (root) => {
+      const oldConfig = migrationConfig(root, 6_000);
+      await provisionHost(oldConfig);
+      await scenario.prepare(root, oldConfig);
+      await quiesce(root);
+      await expectMigrationFailure(root, scenario.message);
+      assert.equal((await readHostManifest(root)).ownerLifetimeSeconds, 6_000, scenario.name);
+    }, { provision: false });
+  }
+});
+
+test('owner-lifetime migration rejects redirected or ambiguous state without changing the manifest', async () => {
+  await withRoot(async (root) => {
+    const oldConfig = migrationConfig(root, 6_000);
+    await provisionHost(oldConfig);
+    const state = join(root, '.kontour-physical-host-capacity');
+    const leases = join(state, 'leases');
+    await rm(leases, { recursive: true });
+    await symlink(join(root, '.kontour-physical-host-id'), leases);
+    await quiesce(root);
+    await expectMigrationFailure(root, /lease directory.*real directory, not a symlink or junction/);
+    assert.equal((await readHostManifest(root)).ownerLifetimeSeconds, 6_000);
+  }, { provision: false });
+
+  await withRoot(async (root) => {
+    const oldConfig = migrationConfig(root, 6_000);
+    await provisionHost(oldConfig);
+    await writeFile(
+      join(root, '.kontour-physical-host-capacity', 'host-manifest.owner-lifetime-6000-to-7800.backup.json'),
+      JSON.stringify(await readHostManifest(root)),
+    );
+    await quiesce(root);
+    await expectMigrationFailure(root, /not the exact original manifest inode.*ambiguous migration/);
+    assert.equal((await readHostManifest(root)).ownerLifetimeSeconds, 6_000);
+  }, { provision: false });
+});
+
+test('owner-lifetime migration resumes only an exact prelinked backup after interrupted publication', async () => {
+  await withRoot(async (root) => {
+    const oldConfig = migrationConfig(root, 6_000);
+    await provisionHost(oldConfig);
+    const state = join(root, '.kontour-physical-host-capacity');
+    const manifest = join(state, 'host-manifest.json');
+    const backup = join(state, 'host-manifest.owner-lifetime-6000-to-7800.backup.json');
+    await link(manifest, backup);
+    await quiesce(root);
+
+    const result = await execFile(process.execPath, [migrateOwnerLifetimeScript, ...migrationArguments(root)]);
+    assert.match(result.stdout, /Migrated physical-host owner lifetime to 7800 seconds/);
+    assert.equal((await readHostManifest(root)).ownerLifetimeSeconds, 7_800);
+    assert.equal(JSON.parse(await readFile(backup, 'utf8')).ownerLifetimeSeconds, 6_000);
+  }, { provision: false });
+});
+
+test('owner-lifetime migration rejects an unusable oversized queue sequence without consuming quiescence', async () => {
+  await withRoot(async (root) => {
+    const oldConfig = migrationConfig(root, 6_000);
+    await provisionHost(oldConfig);
+    await mkdir(join(root, '.kontour-physical-host-capacity', 'queue-sequences', '99999999999999999999'));
+    await quiesce(root);
+
+    await expectMigrationFailure(root, /exceeds Number\.MAX_SAFE_INTEGER/);
+    assert.equal((await readHostManifest(root)).ownerLifetimeSeconds, 6_000);
+    await access(join(root, '.kontour-physical-host-quiesced'));
   }, { provision: false });
 });
 

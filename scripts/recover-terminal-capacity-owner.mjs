@@ -57,7 +57,7 @@ export function parseTerminalRecoveryArguments(argumentsList) {
       PHYSICAL_HOST_CAPACITY_TIMEOUT_SECONDS: '0',
       PHYSICAL_HOST_CAPACITY_POLL_INTERVAL_MS: '1000',
       PHYSICAL_HOST_CAPACITY_OWNER_LIFETIME_SECONDS:
-        values['owner-lifetime-seconds'] ?? '6000',
+        values['owner-lifetime-seconds'] ?? '7800',
     }),
     kind,
     ownerToken,
