@@ -590,8 +590,25 @@ test('owner-lifetime migration rejects redirected or ambiguous state without cha
       JSON.stringify(await readHostManifest(root)),
     );
     await quiesce(root);
-    await expectMigrationFailure(root, /backup already exists.*refusing to overwrite or roll back an ambiguous migration/);
+    await expectMigrationFailure(root, /not the exact original manifest inode.*ambiguous migration/);
     assert.equal((await readHostManifest(root)).ownerLifetimeSeconds, 6_000);
+  }, { provision: false });
+});
+
+test('owner-lifetime migration resumes only an exact prelinked backup after interrupted publication', async () => {
+  await withRoot(async (root) => {
+    const oldConfig = migrationConfig(root, 6_000);
+    await provisionHost(oldConfig);
+    const state = join(root, '.kontour-physical-host-capacity');
+    const manifest = join(state, 'host-manifest.json');
+    const backup = join(state, 'host-manifest.owner-lifetime-6000-to-7800.backup.json');
+    await link(manifest, backup);
+    await quiesce(root);
+
+    const result = await execFile(process.execPath, [migrateOwnerLifetimeScript, ...migrationArguments(root)]);
+    assert.match(result.stdout, /Migrated physical-host owner lifetime to 7800 seconds/);
+    assert.equal((await readHostManifest(root)).ownerLifetimeSeconds, 7_800);
+    assert.equal(JSON.parse(await readFile(backup, 'utf8')).ownerLifetimeSeconds, 6_000);
   }, { provision: false });
 });
 

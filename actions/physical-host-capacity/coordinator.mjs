@@ -413,6 +413,24 @@ async function assertMigrationControlState(location, candidatePath) {
   }
 }
 
+async function assertResumableMigrationBackup(location, sourceConfig, backupPath) {
+  await assertRegularFile(backupPath, 'owner-lifetime migration backup');
+  const backup = validManifest(
+    await readJson(backupPath, 'owner-lifetime migration backup'),
+    backupPath,
+  );
+  assertManifestMatches(backup, sourceConfig, backupPath);
+  const [manifestInfo, backupInfo] = await Promise.all([
+    stat(location.manifest),
+    stat(backupPath),
+  ]);
+  if (manifestInfo.dev !== backupInfo.dev || manifestInfo.ino !== backupInfo.ino) {
+    throw new CapacityCoordinationError(
+      `Owner-lifetime migration backup at ${backupPath} is not the exact original manifest inode; refusing to overwrite or roll back an ambiguous migration.`,
+    );
+  }
+}
+
 async function assertMigrationLayout(location, sourceConfig, targetConfig, candidatePath) {
   await assertDirectory(location.root, 'coordination-root');
   await assertDirectory(location.state, 'coordination state directory');
@@ -465,14 +483,14 @@ async function assertMigrationLayout(location, sourceConfig, targetConfig, candi
 
   assertManifestMatches(manifest, sourceConfig, location.manifest);
   try {
-    await assertRegularFile(backupPath, 'owner-lifetime migration backup');
+    await assertResumableMigrationBackup(location, sourceConfig, backupPath);
   } catch (error) {
-    if (errorCode(error) === 'ENOENT') return { manifest, backupPath, alreadyMigrated: false };
+    if (errorCode(error) === 'ENOENT') {
+      return { manifest, backupPath, alreadyMigrated: false, backupReady: false };
+    }
     throw error;
   }
-  throw new CapacityCoordinationError(
-    `Owner-lifetime migration backup already exists at ${backupPath}; refusing to overwrite or roll back an ambiguous migration.`,
-  );
+  return { manifest, backupPath, alreadyMigrated: false, backupReady: true };
 }
 
 /**
@@ -507,16 +525,13 @@ export async function migrateOwnerLifetime(sourceConfig, targetConfig, {
     );
     try {
       await writeExclusive(temporaryPath, JSON.stringify(manifestFor(targetConfig)));
-      await link(location.manifest, state.backupPath);
-      const [manifestInfo, backupInfo] = await Promise.all([
-        stat(location.manifest),
-        stat(state.backupPath),
-      ]);
-      if (manifestInfo.dev !== backupInfo.dev || manifestInfo.ino !== backupInfo.ino) {
-        throw new CapacityCoordinationError(
-          `Migration backup at ${state.backupPath} is not the exact original manifest inode; refusing replacement.`,
-        );
+      if (!state.backupReady) {
+        await link(location.manifest, state.backupPath);
       }
+      // A previous process can die after linking the backup but before the
+      // replacement. Resume only that exact hard-link state; a copied or
+      // substituted backup remains an ambiguous collision and fails closed.
+      await assertResumableMigrationBackup(location, sourceConfig, state.backupPath);
       // `temporaryPath` was fully synced before this replacement. rename
       // atomically publishes it while the hard-linked backup preserves the
       // exact old manifest for recovery if the operation is interrupted.
