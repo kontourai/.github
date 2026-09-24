@@ -376,6 +376,32 @@ reusable workflow fixes `capacity-owner-lifetime-seconds` at 7800 seconds and
 forwards it to the physical-host action, so it remains compatible with the
 shared 125-minute Station capacity manifest plus a five-minute recovery margin.
 
+## Terraform stack
+
+`terraform-stack.yml` plans one Terraform stack (a directory with its own
+backend) and applies it only on a `push` to `main` whose plan has changes and
+whose diff touched `.tf` files or `modules/` under that directory. Callers own
+triggers and path filters, pass `working-directory`, and forward secrets with
+`secrets: inherit`:
+
+```yaml
+jobs:
+  terraform:
+    # Replace the placeholder with a reviewed full commit SHA.
+    uses: kontourai/.github/.github/workflows/terraform-stack.yml@<full-commit-sha>
+    with:
+      working-directory: stacks/example
+      plan-ref: ${{ inputs.plan_ref }}
+    secrets: inherit
+```
+
+The job runs on the self-hosted fleet with the caller's Cloudflare and HCP
+Terraform secrets. A workflow-restricted runner group matches a job by the
+workflow file that defines it, which for this job is `terraform-stack.yml`, not
+the caller. Allowing `terraform-stack.yml@<sha>` therefore lets any branch of
+any caller reach the fleet, including pull-request branches; review that
+before adding the entry.
+
 ## Release-note policy
 
 Repositories that use normal merge commits use GitHub's supported `PR_TITLE/BLANK` setting pair.
