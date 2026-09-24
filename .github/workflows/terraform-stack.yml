@@ -56,6 +56,11 @@ jobs:
     # (2026-08); the private fleet's runner groups are org-visible, so this
     # light job schedules on whichever Linux runner is free.
     runs-on: [self-hosted, Linux, X64]
+    # Pull-request branches never run here: this job holds Cloudflare and HCP
+    # credentials on persistent runners, and `terraform init`/`plan` on HCL
+    # from a branch can execute arbitrary code. Plan a PR's commit with a
+    # manual dispatch from main (`plan_ref`), as before this workflow existed.
+    if: github.event_name != 'pull_request'
 
     concurrency:
       group: terraform-${{ inputs.stack-name || inputs.working-directory }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && format('plan-{0}', inputs.plan-ref) || 'normal' }}
