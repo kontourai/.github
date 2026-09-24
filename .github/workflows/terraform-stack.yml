@@ -1,0 +1,175 @@
+name: Terraform stack
+
+# Plans (and, on a push to main, applies) one Terraform stack: a directory
+# with its own backend and state. Callers own the triggers and path filters;
+# this workflow owns the job, so every stack in a repository runs the same
+# steps. Callers pass their secrets with `secrets: inherit`.
+#
+# Apply happens only on a `push` to `main`, only when the plan has changes,
+# and only when that push changed Terraform sources under the stack's
+# directory. A manual dispatch (plan-ref) or a workflow-only commit can
+# therefore never apply infrastructure.
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Stack directory relative to the repository root ('.' for the root stack)."
+        required: true
+        type: string
+      stack-name:
+        description: "Label for the plan comment and concurrency group. Defaults to working-directory."
+        required: false
+        type: string
+        default: ""
+      terraform-version:
+        description: "Terraform CLI version for hashicorp/setup-terraform."
+        required: false
+        type: string
+        default: "1.11"
+      plan-ref:
+        description: "On workflow_dispatch: repository ref or commit to plan only (never apply)."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      TF_API_TOKEN:
+        description: "HCP Terraform API token (cloud backend state)."
+        required: true
+      CLOUDFLARE_API_TOKEN:
+        required: false
+      CLOUDFLARE_ZONE_ID_IO:
+        required: false
+      CLOUDFLARE_ZONE_ID_COM:
+        required: false
+      CLOUDFLARE_ACCOUNT_ID:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  terraform:
+    name: Terraform (${{ inputs.stack-name || inputs.working-directory }})
+    # Provider-hosted runners fail at zero steps under the org billing outage
+    # (2026-08); the private fleet's runner groups are org-visible, so this
+    # light job schedules on whichever Linux runner is free.
+    runs-on: [self-hosted, Linux, X64]
+
+    concurrency:
+      group: terraform-${{ inputs.stack-name || inputs.working-directory }}-${{ github.ref }}-${{ github.event_name == 'workflow_dispatch' && format('plan-{0}', inputs.plan-ref) || 'normal' }}
+      cancel-in-progress: true
+
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    env:
+      TF_TOKEN_app_terraform_io: ${{ secrets.TF_API_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.plan-ref || github.sha }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ inputs.terraform-version }}
+          terraform_wrapper: false
+
+      - name: Terraform Format
+        run: terraform fmt -check -recursive
+
+      - name: Terraform Init
+        run: terraform init
+
+      - name: Terraform Validate
+        run: terraform validate -no-color
+
+      - name: Terraform Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -no-color -input=false -lock=false -detailed-exitcode -out=tfplan 2>&1 | tee plan.txt
+          exit_code=${PIPESTATUS[0]}
+          set -e
+
+          if [ "$exit_code" -eq 0 ]; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          elif [ "$exit_code" -eq 2 ]; then
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            exit "$exit_code"
+          fi
+        env:
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_zone_id_io: ${{ secrets.CLOUDFLARE_ZONE_ID_IO }}
+          TF_VAR_cloudflare_zone_id_com: ${{ secrets.CLOUDFLARE_ZONE_ID_COM }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          STACK_NAME: ${{ inputs.stack-name || inputs.working-directory }}
+          PLAN_PATH: ${{ inputs.working-directory }}/plan.txt
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const output = `#### \`${process.env.STACK_NAME}\` Terraform Plan 📖 \`${{ steps.plan.outcome }}\`
+
+            <details><summary>Show Plan</summary>
+
+            \`\`\`hcl
+            ${require('fs').readFileSync(process.env.PLAN_PATH, 'utf8')}
+            \`\`\`
+
+            </details>
+
+            *Pusher: @${{ github.actor }}, Action: \`${{ github.event_name }}\`*`;
+
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+
+      - name: Detect Terraform source changes
+        id: source_changes
+        if: github.event_name == 'push'
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+          STACK_DIR: ${{ inputs.working-directory }}
+        run: |
+          # Paths from git diff are repository-relative, so match .tf files
+          # and modules/ under the stack directory only. For the root stack
+          # ('.') the prefix is empty and this is the repository-wide check.
+          prefix="${STACK_DIR#./}"
+          if [ "$prefix" = "." ] || [ -z "$prefix" ]; then
+            prefix=""
+          else
+            prefix="${prefix%/}/"
+          fi
+          # Escape regex metacharacters in the directory name.
+          prefix_re=$(printf '%s' "$prefix" | sed 's/[][\.*^$+?(){}|]/\\&/g')
+
+          changed_files=$(git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA")
+          if printf '%s\n' "$changed_files" | grep -Eq "^${prefix_re}(([^/]+/)*[^/]+\.tf$|modules/)"; then
+            echo "has_terraform_source_changes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_terraform_source_changes=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && steps.plan.outputs.has_changes == 'true' && steps.source_changes.outputs.has_terraform_source_changes == 'true'
+        run: terraform apply -auto-approve -input=false tfplan
+        env:
+          TF_VAR_cloudflare_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          TF_VAR_cloudflare_zone_id_io: ${{ secrets.CLOUDFLARE_ZONE_ID_IO }}
+          TF_VAR_cloudflare_zone_id_com: ${{ secrets.CLOUDFLARE_ZONE_ID_COM }}
+          TF_VAR_cloudflare_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
