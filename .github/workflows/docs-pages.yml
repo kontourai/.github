@@ -55,6 +55,9 @@ jobs:
         run: |
           if [ -f pnpm-lock.yaml ]; then pnpm install --frozen-lockfile
           elif [ -f package-lock.json ]; then npm ci
+          else
+            echo "::error::extra-build-command needs pnpm-lock.yaml or package-lock.json to install dependencies"
+            exit 1
           fi
       - name: Run extra build
         if: ${{ inputs.extra-build-command != '' }}
@@ -63,9 +66,9 @@ jobs:
           EXTRA_BUILD_COMMAND: ${{ inputs.extra-build-command }}
         run: |
           # Snapshot docs-kit's output so the extra build can only add files.
-          before=$(cd dist-pages && find . -type f -exec sha256sum {} + | sort)
+          before=$(cd dist-pages && find . \( -type f -o -type l \) -exec sha256sum {} + | sort)
           bash -euo pipefail -c "$EXTRA_BUILD_COMMAND"
-          after=$(cd dist-pages && find . -type f -exec sha256sum {} + | sort)
+          after=$(cd dist-pages && find . \( -type f -o -type l \) -exec sha256sum {} + | sort)
           changed=$(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after"))
           if [ -n "$changed" ]; then
             echo "::error::extra-build-command changed or removed docs-kit output:"
