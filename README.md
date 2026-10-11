@@ -392,7 +392,10 @@ document's `covers` paths also updates that document. `docs-pages.yml` deploys t
 and `docs-bundle.json` to `https://kontourai.github.io/<repo>/`; set the repository's
 Pages source to GitHub Actions. The [hub](https://kontourai.github.io/) and the aggregate
 docs MCP read those bundles, so a product's docs are current there as soon as its deploy
-finishes. A product that also hosts non-docs pages (for example a live demo) passes
+finishes. A repository that gates pull requests through `pull_request_target`
+passes `with: { repository: ${{ github.event.pull_request.head.repo.full_name }}, ref: ${{ github.event.pull_request.head.sha }} }`
+to `docs-gate.yml`, so the gate checks the change rather than the base branch;
+the gate only reads files and holds no credentials or secrets. A product that also hosts non-docs pages (for example a live demo) passes
 `with: { extra-build-command: npm run build:demo }` to `docs-pages.yml`; the command
 runs after the docs build with dependencies installed and `DOCS_SITE_DIR` set, and may
 only add files. Both workflows run docs-kit from git at the commit pinned in their

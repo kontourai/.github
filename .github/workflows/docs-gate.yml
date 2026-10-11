@@ -13,6 +13,22 @@ on:
         required: false
         type: string
         default: 6945efbe0309bc46ce4efafe0fccaff9b3302603 # @kontourai/docs-kit v0.4.0
+      repository:
+        description: >-
+          Repository to check out. Empty means the triggering repository. A
+          pull_request_target caller passes the pull request's head repository.
+        required: false
+        type: string
+        default: ''
+      ref:
+        description: >-
+          Commit to check out. Empty means the triggering commit. A
+          pull_request_target caller passes the pull request's head SHA, so the
+          gate reads the change instead of the base branch. docs-kit only reads
+          the checked-out files; it never runs code from them.
+        required: false
+        type: string
+        default: ''
       advisory-freshness:
         description: Report stale documents without failing the gate.
         required: false
@@ -30,6 +46,8 @@ jobs:
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
