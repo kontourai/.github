@@ -356,6 +356,45 @@ jobs:
 
 Set `with: { install-browser: true }` only when the repository's evidence check needs Chromium. The shared job pins the supported Veritas version, retains the evidence artifact, and has a 30-minute outer timeout as defense in depth. It reports governance findings without promoting them to a required merge gate.
 
+## Product docs: gate and Pages
+
+Every product publishes gated docs with [`@kontourai/docs-kit`](https://github.com/kontourai/docs-kit).
+The repository declares its published documents and MCP topics in a root `docs-kit.json`,
+then calls two thin workflows:
+
+```yaml
+# .github/workflows/docs.yml
+on:
+  pull_request:
+  merge_group:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gate:
+    uses: kontourai/.github/.github/workflows/docs-gate.yml@main
+  pages:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: gate
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: kontourai/.github/.github/workflows/docs-pages.yml@main
+```
+
+`docs-gate.yml` checks the manifest, links and anchors, that every `docs/**/*.md` is
+published or excluded, that topics resolve, and on pull requests and merge-queue
+entries that a change to a
+document's `covers` paths also updates that document. `docs-pages.yml` deploys the site
+and `docs-bundle.json` to `https://kontourai.github.io/<repo>/`; set the repository's
+Pages source to GitHub Actions. The [hub](https://kontourai.github.io/) and the aggregate
+docs MCP read those bundles, so a product's docs are current there as soon as its deploy
+finishes. Both workflows run docs-kit from git at the commit pinned in their
+`docs-kit-ref` default; bump that pin here to upgrade every product.
+
 ## Secret scan
 
 Repositories can call the reusable `secret-scan.yml` workflow to scan complete

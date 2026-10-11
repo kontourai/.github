@@ -1,0 +1,61 @@
+name: Docs pages
+
+# Builds a product's docs site and docs-bundle.json with @kontourai/docs-kit
+# and deploys them to https://kontourai.github.io/<repo>/. The org hub and the
+# aggregate docs MCP read the bundle from there, so a deploy here is what makes
+# a product's current docs visible everywhere. The caller must grant
+# `pages: write` and `id-token: write`, and set Pages to the GitHub Actions source.
+
+on:
+  workflow_call:
+    inputs:
+      docs-kit-ref:
+        description: Commit of kontourai/docs-kit to run. Defaults to the org-wide pin.
+        required: false
+        type: string
+        default: 482fb2e691fe7686f79a9a4da8bc2247384b85c3 # @kontourai/docs-kit v0.1.0
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build docs site
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
+      - name: Build with docs-kit
+        env:
+          DOCS_KIT_REF: ${{ inputs.docs-kit-ref }}
+          BASE_URL: https://kontourai.github.io/${{ github.event.repository.name }}/
+        run: npx -y "github:kontourai/docs-kit#${DOCS_KIT_REF}" build --out dist-pages --base-url "$BASE_URL"
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist-pages
+
+  deploy:
+    name: Deploy docs site
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # One Pages deployment per repository at a time. Queued, not cancelled:
+    # cancelling an in-flight Pages deployment can leave it half-finished.
+    concurrency:
+      group: docs-pages-${{ github.repository }}
+      cancel-in-progress: false
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
