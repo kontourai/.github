@@ -44,6 +44,10 @@ jobs:
           args=(check)
           # Freshness needs a base (pull requests and merge-queue entries);
           # pushes to main check everything else.
-          if [ -n "$BASE_SHA" ]; then args+=(--base "$BASE_SHA"); fi
-          if [ "$ADVISORY" = "true" ]; then args+=(--advisory); fi
+          # --advisory only qualifies freshness, which needs a base, so both
+          # are added together; docs-kit refuses --advisory on its own.
+          if [ -n "$BASE_SHA" ]; then
+            args+=(--base "$BASE_SHA")
+            if [ "$ADVISORY" = "true" ]; then args+=(--advisory); fi
+          fi
           npx -y "github:kontourai/docs-kit#${DOCS_KIT_REF}" "${args[@]}"
