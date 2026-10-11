@@ -70,4 +70,15 @@ jobs:
             args+=(--base "$BASE_SHA")
             if [ "$ADVISORY" = "true" ]; then args+=(--advisory); fi
           fi
-          npx -y "github:kontourai/docs-kit#${DOCS_KIT_REF}" "${args[@]}"
+          # Run npx outside the checkout with npm configuration isolated: a
+          # pull_request_target caller checks out pull-request files, and an
+          # .npmrc there must not steer how docs-kit is fetched or run. docs-kit
+          # only reads the checkout through --root.
+          root="$GITHUB_WORKSPACE"
+          user_npmrc="$RUNNER_TEMP/docs-gate-user.npmrc"
+          global_npmrc="$RUNNER_TEMP/docs-gate-global.npmrc"
+          : > "$user_npmrc"
+          : > "$global_npmrc"
+          cd "$RUNNER_TEMP"
+          NPM_CONFIG_USERCONFIG="$user_npmrc" NPM_CONFIG_GLOBALCONFIG="$global_npmrc" \
+            npx -y "github:kontourai/docs-kit#${DOCS_KIT_REF}" "${args[@]}" --root "$root"
