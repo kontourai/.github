@@ -1,0 +1,48 @@
+name: Docs gate
+
+# Runs the shared @kontourai/docs-kit gate: manifest, links and anchors,
+# reachability, topics, and (on pull requests) scoped freshness against the
+# base commit. docs-kit runs from git at a pinned commit, so callers need no
+# install step and no npm token.
+
+on:
+  workflow_call:
+    inputs:
+      docs-kit-ref:
+        description: Commit of kontourai/docs-kit to run. Defaults to the org-wide pin.
+        required: false
+        type: string
+        default: 482fb2e691fe7686f79a9a4da8bc2247384b85c3 # @kontourai/docs-kit v0.1.0
+      advisory-freshness:
+        description: Report stale documents without failing the gate.
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  docs-gate:
+    name: Docs gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+      - name: Run docs-kit check
+        env:
+          DOCS_KIT_REF: ${{ inputs.docs-kit-ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ADVISORY: ${{ inputs.advisory-freshness }}
+        run: |
+          args=(check)
+          # Freshness needs a base; pushes to main check everything else.
+          if [ -n "$BASE_SHA" ]; then args+=(--base "$BASE_SHA"); fi
+          if [ "$ADVISORY" = "true" ]; then args+=(--advisory); fi
+          npx -y "github:kontourai/docs-kit#${DOCS_KIT_REF}" "${args[@]}"
