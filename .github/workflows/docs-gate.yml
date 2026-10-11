@@ -38,11 +38,12 @@ jobs:
       - name: Run docs-kit check
         env:
           DOCS_KIT_REF: ${{ inputs.docs-kit-ref }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           ADVISORY: ${{ inputs.advisory-freshness }}
         run: |
           args=(check)
-          # Freshness needs a base; pushes to main check everything else.
+          # Freshness needs a base (pull requests and merge-queue entries);
+          # pushes to main check everything else.
           if [ -n "$BASE_SHA" ]; then args+=(--base "$BASE_SHA"); fi
           if [ "$ADVISORY" = "true" ]; then args+=(--advisory); fi
           npx -y "github:kontourai/docs-kit#${DOCS_KIT_REF}" "${args[@]}"

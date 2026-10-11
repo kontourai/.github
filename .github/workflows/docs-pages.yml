@@ -45,10 +45,11 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # One Pages deployment per repository at a time; a newer main supersedes.
+    # One Pages deployment per repository at a time. Queued, not cancelled:
+    # cancelling an in-flight Pages deployment can leave it half-finished.
     concurrency:
       group: docs-pages-${{ github.repository }}
-      cancel-in-progress: true
+      cancel-in-progress: false
     permissions:
       pages: write
       id-token: write

@@ -366,6 +366,7 @@ then calls two thin workflows:
 # .github/workflows/docs.yml
 on:
   pull_request:
+  merge_group:
   push:
     branches: [main]
   workflow_dispatch:
@@ -375,7 +376,7 @@ jobs:
   gate:
     uses: kontourai/.github/.github/workflows/docs-gate.yml@main
   pages:
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     needs: gate
     permissions:
       contents: read
@@ -385,7 +386,8 @@ jobs:
 ```
 
 `docs-gate.yml` checks the manifest, links and anchors, that every `docs/**/*.md` is
-published or excluded, that topics resolve, and on pull requests that a change to a
+published or excluded, that topics resolve, and on pull requests and merge-queue
+entries that a change to a
 document's `covers` paths also updates that document. `docs-pages.yml` deploys the site
 and `docs-bundle.json` to `https://kontourai.github.io/<repo>/`; set the repository's
 Pages source to GitHub Actions. The [hub](https://kontourai.github.io/) and the aggregate
