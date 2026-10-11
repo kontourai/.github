@@ -35,6 +35,8 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
+          # docs-kit runs from git with npx; there is no lockfile to cache.
+          package-manager-cache: false
       - name: Run docs-kit check
         env:
           DOCS_KIT_REF: ${{ inputs.docs-kit-ref }}
