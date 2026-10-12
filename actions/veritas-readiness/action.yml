@@ -1,0 +1,32 @@
+name: Capture Veritas readiness
+description: Retain the actual source-bound readiness verdict and full check output.
+inputs:
+  base-sha:
+    required: true
+    description: Exact baseline commit.
+  head-sha:
+    required: true
+    description: Exact checked-out source commit.
+  require-ready:
+    required: false
+    default: 'false'
+    description: Fail the job on a failed readiness verdict; default remains advisory.
+runs:
+  using: composite
+  steps:
+    - name: Install published Veritas
+      shell: bash
+      run: |
+        veritas_package_root="$(mktemp -d "$RUNNER_TEMP/veritas-package.XXXXXX")"
+        npm install --prefix "$veritas_package_root" --no-save --package-lock=false --ignore-scripts --no-audit --no-fund @kontourai/veritas@1.7.6
+        echo "VERITAS_PACKAGE_ROOT=$veritas_package_root" >> "$GITHUB_ENV"
+    - name: Capture actual readiness
+      shell: bash
+      env:
+        BASE_SHA: ${{ inputs.base-sha }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        REQUIRE_READY: ${{ inputs.require-ready }}
+      run: |
+        # Restrict capture permissions explicitly, not the test child's umask.
+        umask 022
+        node "$GITHUB_ACTION_PATH/run.mjs"
