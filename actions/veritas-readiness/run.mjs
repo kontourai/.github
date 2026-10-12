@@ -38,11 +38,17 @@ export async function captureReadiness({ root, base, head, runId, output, requir
 }
 
 export async function main(environment = process.env) {
-  const packageRoot = environment.VERITAS_PACKAGE_ROOT;
-  const require = createRequire(path.join(packageRoot, 'package.json'));
-  const metadata = JSON.parse(await readFile(path.join(packageRoot, 'node_modules/@kontourai/veritas/package.json'), 'utf8'));
-  if (metadata.version !== VERITAS_VERSION) throw new Error('Published Veritas version mismatch');
-  const api = await import(pathToFileURL(require.resolve('@kontourai/veritas')).href);
+  let api;
+  try {
+    const packageRoot = environment.VERITAS_PACKAGE_ROOT;
+    const require = createRequire(path.join(packageRoot, 'package.json'));
+    const metadata = JSON.parse(await readFile(path.join(packageRoot, 'node_modules/@kontourai/veritas/package.json'), 'utf8'));
+    if (metadata.version !== VERITAS_VERSION) throw new Error('Published Veritas version mismatch');
+    api = await import(pathToFileURL(require.resolve('@kontourai/veritas')).href);
+  } catch (error) {
+    // Preserve a structured ERROR even when installation/import failed.
+    api = { runMergeReadiness: async () => { throw error; }, feedbackHasFailures: () => true };
+  }
   const result = await captureReadiness({ root: process.cwd(), base: environment.BASE_SHA, head: environment.HEAD_SHA, runId: `github-${environment.GITHUB_RUN_ID}-${environment.GITHUB_RUN_ATTEMPT}`, output: environment.VERITAS_OUTPUT_DIR, requireReady: environment.REQUIRE_READY === 'true' }, api);
   console.log(`Actual Veritas readiness: ${result.envelope.verdict}; source ${result.envelope.head}; exit ${result.envelope.exit_code}`);
   if (environment.GITHUB_STEP_SUMMARY) await writeFile(environment.GITHUB_STEP_SUMMARY, `Actual Veritas readiness: **${result.envelope.verdict}** (exit ${result.envelope.exit_code}).\n\nExact source: ${result.envelope.base} → ${result.envelope.head}.\n\n${result.envelope.require_ready ? 'This caller requires a ready verdict.' : 'Observe-only: this verdict does not change the caller enforcement policy.'}\n`, { flag: 'a' });
