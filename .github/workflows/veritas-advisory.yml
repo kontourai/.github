@@ -3,6 +3,11 @@ name: Veritas advisory governance
 on:
   workflow_call:
     inputs:
+      require-ready:
+        description: Require an actual ready verdict; existing callers remain advisory by default.
+        required: false
+        type: boolean
+        default: false
       install-browser:
         description: Install Chromium when repository evidence includes browser checks.
         required: false
@@ -17,10 +22,13 @@ jobs:
     name: Advisory readiness
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      VERITAS_OUTPUT_DIR: ${{ github.workspace }}/.kontourai/veritas/execution/github-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       # Callers are a mix of pnpm and npm repositories, so the installer is
       # chosen from whichever lockfile the caller actually has. pnpm is set up
       # only for pnpm callers; it reads the version from their packageManager
@@ -52,7 +60,12 @@ jobs:
       - name: Install browser evidence dependency
         if: inputs.install-browser
         run: npx playwright install --with-deps chromium
-      - name: Produce advisory Veritas readiness
+      - name: Install required command-line evidence tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq ripgrep
+      - name: Resolve exact evidence scope
+        id: scope
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
@@ -60,26 +73,20 @@ jobs:
           if [ -z "$BASE_SHA" ]; then
             BASE_SHA="$(git rev-parse HEAD^)"
           fi
-          set +e
-          npm exec --yes --package=@kontourai/veritas@1.7.6 -- veritas readiness \
-            --check evidence \
-            --run-id "github-${{ github.run_id }}" \
-            --source-ref "${{ github.event_name }}:${{ github.ref }}" \
-            --changed-from "$BASE_SHA" \
-            --changed-to "$HEAD_SHA"
-          status=$?
-          set -e
-          echo "Veritas advisory readiness exit: $status" >> "$GITHUB_STEP_SUMMARY"
-          echo "This rollout is observe-only; promotion to blocking enforcement requires a separate approval." >> "$GITHUB_STEP_SUMMARY"
-          report=".kontourai/veritas/evidence/github-${{ github.run_id }}.json"
-          if [ ! -s "$report" ]; then
-            echo "Veritas did not produce the required evidence artifact: $report" >&2
-            exit 1
-          fi
+          echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+      - name: Capture actual Veritas readiness
+        uses: kontourai/.github/actions/veritas-readiness@7c5de23333d3ae6b8745d9884c6bdb9a9ec79805
+        with:
+          base-sha: ${{ steps.scope.outputs.base }}
+          head-sha: ${{ steps.scope.outputs.head }}
+          require-ready: ${{ inputs.require-ready }}
       - name: Upload Veritas evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: veritas-readiness-${{ github.run_id }}
-          path: .kontourai/veritas/evidence/
+          path: |
+            .kontourai/veritas/evidence/
+            ${{ env.VERITAS_OUTPUT_DIR }}
           if-no-files-found: warn
