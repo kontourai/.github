@@ -8,9 +8,9 @@ export const VERITAS_VERSION = '1.7.6';
 const gitStatus = root => execFileSync('git', ['status', '--porcelain', '--untracked-files=no'], { cwd: root, encoding: 'utf8' }).trim();
 const gitHead = root => execFileSync('git', ['rev-parse', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim();
 
-export async function captureReadiness({ root, base, head, runId, output, requireReady = false }, { runMergeReadiness, feedbackHasFailures, sourceHead = gitHead, sourceStatus = gitStatus }) {
+export async function captureReadiness({ root, base, head, runId, output, requireReady = false, installExitCode = null }, { runMergeReadiness, feedbackHasFailures, sourceHead = gitHead, sourceStatus = gitStatus }) {
   await mkdir(output, { recursive: true, mode: 0o700 });
-  const envelope = { schema: 'kontour.github.veritas_execution', version: '1.0', veritas_version: VERITAS_VERSION, base, head, run_id: runId, require_ready: requireReady, source_before: null, source_after: null, verdict: 'ERROR', exit_code: 2, evidence_check_results: [] };
+  const envelope = { schema: 'kontour.github.veritas_execution', version: '1.0', veritas_version: VERITAS_VERSION, base, head, run_id: runId, require_ready: requireReady, installation_exit_code: installExitCode, source_before: null, source_after: null, verdict: 'ERROR', exit_code: 2, evidence_check_results: [] };
   try {
     if (!/^[a-f0-9]{40}$/.test(base) || !/^[a-f0-9]{40}$/.test(head)) throw new Error('Exact base and head commit SHAs required');
     if (!/^github-[0-9]+-[0-9]+$/.test(runId)) throw new Error('Bound GitHub run ID and attempt required');
@@ -37,19 +37,24 @@ export async function captureReadiness({ root, base, head, runId, output, requir
   return { envelope, jobExitCode: envelope.verdict === 'ERROR' || requireReady ? envelope.exit_code : 0 };
 }
 
+export async function loadPublishedApi(environment) {
+  if (environment.VERITAS_INSTALL_EXIT_CODE !== '0') throw new Error(`Published Veritas installation failed or is unobserved (exit ${environment.VERITAS_INSTALL_EXIT_CODE ?? 'unknown'})`);
+  const packageRoot = environment.VERITAS_PACKAGE_ROOT;
+  const require = createRequire(path.join(packageRoot, 'package.json'));
+  const metadata = JSON.parse(await readFile(path.join(packageRoot, 'node_modules/@kontourai/veritas/package.json'), 'utf8'));
+  if (metadata.version !== VERITAS_VERSION) throw new Error('Published Veritas version mismatch');
+  return import(pathToFileURL(require.resolve('@kontourai/veritas')).href);
+}
+
 export async function main(environment = process.env) {
   let api;
   try {
-    const packageRoot = environment.VERITAS_PACKAGE_ROOT;
-    const require = createRequire(path.join(packageRoot, 'package.json'));
-    const metadata = JSON.parse(await readFile(path.join(packageRoot, 'node_modules/@kontourai/veritas/package.json'), 'utf8'));
-    if (metadata.version !== VERITAS_VERSION) throw new Error('Published Veritas version mismatch');
-    api = await import(pathToFileURL(require.resolve('@kontourai/veritas')).href);
+    api = await loadPublishedApi(environment);
   } catch (error) {
     // Preserve a structured ERROR even when installation/import failed.
     api = { runMergeReadiness: async () => { throw error; }, feedbackHasFailures: () => true };
   }
-  const result = await captureReadiness({ root: process.cwd(), base: environment.BASE_SHA, head: environment.HEAD_SHA, runId: `github-${environment.GITHUB_RUN_ID}-${environment.GITHUB_RUN_ATTEMPT}`, output: environment.VERITAS_OUTPUT_DIR, requireReady: environment.REQUIRE_READY === 'true' }, api);
+  const result = await captureReadiness({ root: process.cwd(), base: environment.BASE_SHA, head: environment.HEAD_SHA, runId: `github-${environment.GITHUB_RUN_ID}-${environment.GITHUB_RUN_ATTEMPT}`, output: environment.VERITAS_OUTPUT_DIR, requireReady: environment.REQUIRE_READY === 'true', installExitCode: environment.VERITAS_INSTALL_EXIT_CODE ?? null }, api);
   console.log(`Actual Veritas readiness: ${result.envelope.verdict}; source ${result.envelope.head}; exit ${result.envelope.exit_code}`);
   if (environment.GITHUB_STEP_SUMMARY) await writeFile(environment.GITHUB_STEP_SUMMARY, `Actual Veritas readiness: **${result.envelope.verdict}** (exit ${result.envelope.exit_code}).\n\nExact source: ${result.envelope.base} → ${result.envelope.head}.\n\n${result.envelope.require_ready ? 'This caller requires a ready verdict.' : 'Observe-only: this verdict does not change the caller enforcement policy.'}\n`, { flag: 'a' });
   process.exitCode = result.jobExitCode;
