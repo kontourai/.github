@@ -76,7 +76,7 @@ jobs:
           echo "base=$BASE_SHA" >> "$GITHUB_OUTPUT"
           echo "head=$HEAD_SHA" >> "$GITHUB_OUTPUT"
       - name: Capture actual Veritas readiness
-        uses: kontourai/.github/actions/veritas-readiness@d0132e8b8939dd935492a7608d76f49d8721226b
+        uses: kontourai/.github/actions/veritas-readiness@7c5de23333d3ae6b8745d9884c6bdb9a9ec79805
         with:
           base-sha: ${{ steps.scope.outputs.base }}
           head-sha: ${{ steps.scope.outputs.head }}

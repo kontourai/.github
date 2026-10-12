@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, stat, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, stat, rm, mkdir, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
-import { captureReadiness, VERITAS_VERSION } from '../actions/veritas-readiness/run.mjs';
+import { captureReadiness, VERITAS_VERSION, loadPublishedApi } from '../actions/veritas-readiness/run.mjs';
 
 const base = 'a'.repeat(40), head = 'b'.repeat(40);
 async function fixture(t, extra = {}) {
@@ -63,4 +63,20 @@ test('reusable workflow keeps advisory default and binds the exact checkout and 
   assert.match(workflow, /sudo apt-get install -y jq ripgrep/);
   assert.match(workflow, /if: always\(\)/);
   assert.match(workflow, /\$\{\{ env.VERITAS_OUTPUT_DIR \}\}/);
+});
+
+test('a failed partial installation cannot import a package or yield a PASS', async t => {
+  const f = await fixture(t); const packageRoot = path.join(f.root, 'installed');
+  const moduleRoot = path.join(packageRoot, 'node_modules/@kontourai/veritas');
+  await mkdir(moduleRoot, { recursive: true });
+  await writeFile(path.join(packageRoot, 'package.json'), '{}');
+  await writeFile(path.join(moduleRoot, 'package.json'), JSON.stringify({ name: '@kontourai/veritas', version: VERITAS_VERSION, type: 'module', exports: './index.mjs' }));
+  await writeFile(path.join(moduleRoot, 'index.mjs'), 'export const importable = true;');
+  const env = { VERITAS_PACKAGE_ROOT: packageRoot, VERITAS_INSTALL_EXIT_CODE: '0' };
+  assert.equal((await loadPublishedApi(env)).importable, true);
+  for (const code of ['1', 'unknown', undefined]) {
+    await assert.rejects(loadPublishedApi({ ...env, VERITAS_INSTALL_EXIT_CODE: code }), /installation failed or is unobserved/);
+    const result = await captureReadiness({ ...f, installExitCode: code }, api(false, { runMergeReadiness: async () => loadPublishedApi({ ...env, VERITAS_INSTALL_EXIT_CODE: code }) }));
+    assert.equal(result.envelope.verdict, 'ERROR'); assert.equal(result.jobExitCode, 2);
+  }
 });
