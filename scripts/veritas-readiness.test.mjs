@@ -55,3 +55,12 @@ test('tracked source mutation refuses a pass even if HEAD is unchanged', async t
   const r = await captureReadiness(await fixture(t, { requireReady: true }), api(false, { sourceStatus: () => ++calls === 1 ? '' : ' M source.mjs' }));
   assert.equal(r.jobExitCode, 1); assert.equal(r.envelope.source_unchanged, false);
 });
+test('reusable workflow keeps advisory default and binds the exact checkout and evidence scope', async () => {
+  const workflow = await readFile(new URL('../.github/workflows/veritas-advisory.yml', import.meta.url), 'utf8');
+  assert.match(workflow, /require-ready:[\s\S]*?type: boolean\s+default: false/);
+  assert.match(workflow, /ref: \$\{\{ github.event.pull_request.head.sha \|\| github.sha \}\}/);
+  assert.match(workflow, /require-ready: \$\{\{ inputs.require-ready \}\}/);
+  assert.match(workflow, /sudo apt-get install -y jq ripgrep/);
+  assert.match(workflow, /if: always\(\)/);
+  assert.match(workflow, /\$\{\{ env.VERITAS_OUTPUT_DIR \}\}/);
+});
