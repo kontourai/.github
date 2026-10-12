@@ -1,11 +1,20 @@
 # Kontour AI
 
-**Show the work behind AI.** Kontour makes AI-assisted work inspectable and
-accountable: sources stay traceable, claims keep their evidence, required paths
+**Make your agents show their work.** Kontour makes AI-assisted work inspectable
+and accountable: sources stay traceable, claims keep their evidence, required paths
 advance through explicit gates, and people can recompute why work is ready.
 
-→ [kontourai.io](https://kontourai.io) tells the product story. The repositories
-below are the public implementation and documentation surfaces.
+→ [kontourai.io](https://kontourai.io) tells the product story, and
+[kontourai.github.io](https://kontourai.github.io/) indexes every product's current
+documentation. The repositories below are the public implementation and
+documentation surfaces.
+
+## Applications
+
+| Repository | Responsibility |
+| --- | --- |
+| [`station`](https://github.com/kontourai/station) | Open-source, local-first agent workspace: projects, agents, and devices in one place, with gates, evidence, and receipts beside the work ([station.kontourai.io](https://station.kontourai.io)) |
+| [`fieldwork`](https://github.com/kontourai/fieldwork) | Turns documents into reviewed, source-grounded evidence you can recheck and export as a portable trust bundle |
 
 ## Products and foundational primitives
 
@@ -16,10 +25,13 @@ below are the public implementation and documentation surfaces.
 | [`surface`](https://github.com/kontourai/surface) | Kontour's integration surface for portable claims, evidence, trust status, validation, and product-facing Hachure compatibility |
 | [`flow`](https://github.com/kontourai/flow) | Process definitions, steps, gates, evidence expectations, transitions, and explicit exceptions |
 | [`survey`](https://github.com/kontourai/survey) | Producer-side source, extraction, candidate, review, decision, and publication records |
+| [`console`](https://github.com/kontourai/console) | Suite operating plane: claim, process, proof, and queue state across the products, without owning their semantics |
 
 The **Builder Kit** and **Knowledge Kit** are first-party solutions distributed
-through Flow Agents rather than separate products. The open trust format itself
-lives independently at [`hachure-org/spec`](https://github.com/hachure-org/spec);
+through Flow Agents rather than separate products.
+[`aidlc-kit`](https://github.com/kontourai/aidlc-kit) runs the pinned AWS AI-DLC
+methodology as an independently maintained Flow Agents kit. The open trust format
+itself lives independently at [`hachure-org/spec`](https://github.com/hachure-org/spec);
 Surface is Kontour's product-facing integration layer for it.
 
 ## Building-block tools
@@ -29,15 +41,19 @@ Surface is Kontour's product-facing integration layer for it.
 | [`forage`](https://github.com/kontourai/forage) | SSRF-pinned web acquisition, provenance-bearing snapshots, and deterministic replay |
 | [`traverse`](https://github.com/kontourai/traverse) | Schema-directed, provenance-bearing extraction proposals |
 | [`lookout`](https://github.com/kontourai/lookout) | Registered-source rechecks, source drift, and deterministic proposal diffs |
-| [`bearing`](https://github.com/kontourai/bearing) | Evidence-backed model capability observations, deterministic catalogs, and request-relative ranking |
+| [`bearing`](https://github.com/kontourai/bearing) | Evidence-backed model capability observations, deterministic catalogs, and runtime-aware ranking |
 | [`datum`](https://github.com/kontourai/datum) | Provider, model, secret-reference, and role configuration resolution |
-| [`plumb`](https://github.com/kontourai/plumb) | Guardrailed operational checks and isolated escalation into repair work |
+| [`relay`](https://github.com/kontourai/relay) | Provider-neutral model invocation contracts, adapters, and conformance tools |
+| [`dispatch`](https://github.com/kontourai/dispatch) | Policy-aware model execution with routing, budgets, fallbacks, and receipts |
+| [`conduit`](https://github.com/kontourai/conduit) | Portable agent-host contracts: lifecycle projection, asset installation, and conformance evidence |
+| [`plumb`](https://github.com/kontourai/plumb) | Deployment health checks that hand failures to an agent in an isolated clone for a reviewable PR or issue |
+| [`ephemeris`](https://github.com/kontourai/ephemeris) | Time actor: deadline wake-ups that nudge Flow, plus a timezone-aware recurring-schedule core |
 | [`ui`](https://github.com/kontourai/ui) | Shared design tokens, React primitives, and web components for Kontour product interfaces |
+| [`cli`](https://github.com/kontourai/cli) | The offline-first `kontour` command that routes to installed Kontour products |
+| [`docs-kit`](https://github.com/kontourai/docs-kit) | Shared docs gate, GitHub Pages builder, and docs MCP server behind every product's documentation |
 
-[`ephemeris`](https://github.com/kontourai/ephemeris) preserves the frozen
-freshness-scheduler prototype, and
 [`kit-research`](https://github.com/kontourai/kit-research) is a third-party kit
-authoring experiment. Their READMEs state their current lifecycle and limits.
+authoring experiment. Its README states its current lifecycle and limits.
 
 ## Contribute
 
@@ -53,8 +69,8 @@ authoring experiment. Their READMEs state their current lifecycle and limits.
 
 We are looking for teams that want to:
 
-- run Flow Agents on real development work and measure whether the required path
-  improves delivery quality, cost, and continuity;
+- run Station or Flow Agents on real development work and measure whether the
+  required path improves delivery quality, cost, and continuity;
 - use Veritas to turn repository standards into evidence an agent and reviewer
   can both inspect; or
 - build a product integration through Surface while keeping the underlying
