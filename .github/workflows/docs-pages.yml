@@ -55,8 +55,8 @@ jobs:
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
       - name: Build with Corpus
         env:
-          # Org-wide pin: @kontourai/corpus 0.7.0 (builtOn verification, corpus#13).
-          CORPUS_REF: ${{ inputs.corpus-ref || inputs.docs-kit-ref || 'cc7f6e4939dcc0777c4c3e2d5222b30455013861' }}
+          # Org-wide pin: @kontourai/corpus 0.7.0 + redirects gate reads corpus.json (corpus#13, corpus#16).
+          CORPUS_REF: ${{ inputs.corpus-ref || inputs.docs-kit-ref || '340b66fc8f723c1babe35fce8240c82cd196b0db' }}
           BASE_URL: https://kontourai.github.io/${{ github.event.repository.name }}/
         run: npx -y "github:kontourai/corpus#${CORPUS_REF}" build --out dist-pages --base-url "$BASE_URL"
       # Extra build: pnpm callers read their version from packageManager.
