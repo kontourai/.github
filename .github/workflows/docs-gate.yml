@@ -67,8 +67,8 @@ jobs:
           package-manager-cache: false
       - name: Run Corpus check
         env:
-          # Org-wide pin: @kontourai/corpus 0.6.0 + Corpus rename (corpus#11).
-          CORPUS_REF: ${{ inputs.corpus-ref || inputs.docs-kit-ref || 'b978eed765a52335183386d7996fa295bbfd821f' }}
+          # Org-wide pin: @kontourai/corpus 0.7.0 (builtOn verification, corpus#13).
+          CORPUS_REF: ${{ inputs.corpus-ref || inputs.docs-kit-ref || 'cc7f6e4939dcc0777c4c3e2d5222b30455013861' }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           ADVISORY: ${{ inputs.advisory-freshness }}
         run: |
