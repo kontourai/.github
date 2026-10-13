@@ -1,18 +1,28 @@
 name: Docs gate
 
-# Runs the shared @kontourai/docs-kit gate: manifest, links and anchors,
+# Runs the shared @kontourai/corpus (formerly docs-kit) gate: manifest, links and anchors,
 # reachability, topics, and (on pull requests) scoped freshness against the
-# base commit. docs-kit runs from git at a pinned commit, so callers need no
+# base commit. Corpus runs from git at a pinned commit, so callers need no
 # install step and no npm token.
 
 on:
   workflow_call:
     inputs:
-      docs-kit-ref:
-        description: Commit of kontourai/docs-kit to run. Defaults to the org-wide pin.
+      corpus-ref:
+        description: >-
+          Commit of kontourai/corpus to run. Empty means the org-wide pin in the
+          run step below.
         required: false
         type: string
-        default: bc158849c27e55d25417c443ad6bbd0643dfdbc4 # @kontourai/docs-kit v0.6.0
+        default: ''
+      docs-kit-ref:
+        description: >-
+          Legacy name for corpus-ref, kept for callers that pin a commit from
+          before the repository was renamed from docs-kit. corpus-ref wins when
+          both are set.
+        required: false
+        type: string
+        default: ''
       repository:
         description: >-
           Repository to check out. Empty means the triggering repository. A
@@ -24,7 +34,7 @@ on:
         description: >-
           Commit to check out. Empty means the triggering commit. A
           pull_request_target caller passes the pull request's head SHA, so the
-          gate reads the change instead of the base branch. docs-kit only reads
+          gate reads the change instead of the base branch. Corpus only reads
           the checked-out files; it never runs code from them.
         required: false
         type: string
@@ -53,11 +63,12 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
-          # docs-kit runs from git with npx; there is no lockfile to cache.
+          # Corpus runs from git with npx; there is no lockfile to cache.
           package-manager-cache: false
-      - name: Run docs-kit check
+      - name: Run Corpus check
         env:
-          DOCS_KIT_REF: ${{ inputs.docs-kit-ref }}
+          # Org-wide pin: @kontourai/corpus 0.6.0 + Corpus rename (corpus#11).
+          CORPUS_REF: ${{ inputs.corpus-ref || inputs.docs-kit-ref || 'b978eed765a52335183386d7996fa295bbfd821f' }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           ADVISORY: ${{ inputs.advisory-freshness }}
         run: |
@@ -65,14 +76,14 @@ jobs:
           # Freshness needs a base (pull requests and merge-queue entries);
           # pushes to main check everything else.
           # --advisory only qualifies freshness, which needs a base, so both
-          # are added together; docs-kit refuses --advisory on its own.
+          # are added together; Corpus refuses --advisory on its own.
           if [ -n "$BASE_SHA" ]; then
             args+=(--base "$BASE_SHA")
             if [ "$ADVISORY" = "true" ]; then args+=(--advisory); fi
           fi
           # Run npx outside the checkout with npm configuration isolated: a
           # pull_request_target caller checks out pull-request files, and an
-          # .npmrc there must not steer how docs-kit is fetched or run. docs-kit
+          # .npmrc there must not steer how Corpus is fetched or run. Corpus
           # only reads the checkout through --root.
           root="$GITHUB_WORKSPACE"
           user_npmrc="$RUNNER_TEMP/docs-gate-user.npmrc"
@@ -81,4 +92,4 @@ jobs:
           : > "$global_npmrc"
           cd "$RUNNER_TEMP"
           NPM_CONFIG_USERCONFIG="$user_npmrc" NPM_CONFIG_GLOBALCONFIG="$global_npmrc" \
-            npx -y "github:kontourai/docs-kit#${DOCS_KIT_REF}" "${args[@]}" --root "$root"
+            npx -y "github:kontourai/corpus#${CORPUS_REF}" "${args[@]}" --root "$root"
