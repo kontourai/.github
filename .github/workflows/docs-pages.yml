@@ -1,6 +1,6 @@
 name: Docs pages
 
-# Builds a product's docs site and docs-bundle.json with @kontourai/docs-kit
+# Builds a product's docs site and docs-bundle.json with @kontourai/corpus (formerly docs-kit)
 # and deploys them to https://kontourai.github.io/<repo>/. The org hub and the
 # aggregate docs MCP read the bundle from there, so a deploy here is what makes
 # a product's current docs visible everywhere. The caller must grant
@@ -9,17 +9,27 @@ name: Docs pages
 on:
   workflow_call:
     inputs:
-      docs-kit-ref:
-        description: Commit of kontourai/docs-kit to run. Defaults to the org-wide pin.
+      corpus-ref:
+        description: >-
+          Commit of kontourai/corpus to run. Empty means the org-wide pin in the
+          run step below.
         required: false
         type: string
-        default: bc158849c27e55d25417c443ad6bbd0643dfdbc4 # @kontourai/docs-kit v0.6.0
+        default: ''
+      docs-kit-ref:
+        description: >-
+          Legacy name for corpus-ref, kept for callers that pin a commit from
+          before the repository was renamed from docs-kit. corpus-ref wins when
+          both are set.
+        required: false
+        type: string
+        default: ''
       extra-build-command:
         description: >-
-          Optional shell command run after the docs-kit build, with the repository's
+          Optional shell command run after the Corpus build, with the repository's
           dependencies installed and DOCS_SITE_DIR set to the site directory, to add
-          files docs-kit does not render (for example a live demo under
-          $DOCS_SITE_DIR/demo/). It may add files but must not change docs-kit's
+          files Corpus does not render (for example a live demo under
+          $DOCS_SITE_DIR/demo/). It may add files but must not change Corpus's
           output; the build fails if it does.
         required: false
         type: string
@@ -40,14 +50,15 @@ jobs:
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
-          # docs-kit runs from git with npx; there is no lockfile to cache.
+          # Corpus runs from git with npx; there is no lockfile to cache.
           package-manager-cache: false
       - uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d # v6.0.0
-      - name: Build with docs-kit
+      - name: Build with Corpus
         env:
-          DOCS_KIT_REF: ${{ inputs.docs-kit-ref }}
+          # Org-wide pin: @kontourai/corpus 0.6.0 + Corpus rename (corpus#11).
+          CORPUS_REF: ${{ inputs.corpus-ref || inputs.docs-kit-ref || 'b978eed765a52335183386d7996fa295bbfd821f' }}
           BASE_URL: https://kontourai.github.io/${{ github.event.repository.name }}/
-        run: npx -y "github:kontourai/docs-kit#${DOCS_KIT_REF}" build --out dist-pages --base-url "$BASE_URL"
+        run: npx -y "github:kontourai/corpus#${CORPUS_REF}" build --out dist-pages --base-url "$BASE_URL"
       # Extra build: pnpm callers read their version from packageManager.
       - name: Set up pnpm
         if: ${{ inputs.extra-build-command != '' && hashFiles('pnpm-lock.yaml') != '' }}
@@ -67,13 +78,13 @@ jobs:
           DOCS_SITE_DIR: dist-pages
           EXTRA_BUILD_COMMAND: ${{ inputs.extra-build-command }}
         run: |
-          # Snapshot docs-kit's output so the extra build can only add files.
+          # Snapshot Corpus's output so the extra build can only add files.
           before=$(cd dist-pages && find . \( -type f -o -type l \) -exec sha256sum {} + | sort)
           bash -euo pipefail -c "$EXTRA_BUILD_COMMAND"
           after=$(cd dist-pages && find . \( -type f -o -type l \) -exec sha256sum {} + | sort)
           changed=$(comm -23 <(printf '%s\n' "$before") <(printf '%s\n' "$after"))
           if [ -n "$changed" ]; then
-            echo "::error::extra-build-command changed or removed docs-kit output:"
+            echo "::error::extra-build-command changed or removed Corpus output:"
             printf '%s\n' "$changed"
             exit 1
           fi
