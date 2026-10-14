@@ -22,7 +22,7 @@ runs:
         echo "VERITAS_INSTALL_EXIT_CODE=unknown" >> "$GITHUB_ENV"
         node --input-type=module -e 'import fs from "node:fs"; import path from "node:path"; const root=process.env.VERITAS_OUTPUT_DIR; fs.mkdirSync(root,{recursive:true,mode:0o700}); fs.writeFileSync(path.join(root,"package-install.log"),"",{mode:0o600});'
         install_status=0
-        npm install --prefix "$veritas_package_root" --no-save --package-lock=false --ignore-scripts --no-audit --no-fund @kontourai/veritas@1.11.1 > "$VERITAS_OUTPUT_DIR/package-install.log" 2>&1 || install_status=$?
+        npm install --prefix "$veritas_package_root" --no-save --package-lock=false --ignore-scripts --no-audit --no-fund @kontourai/veritas@1.11.2 > "$VERITAS_OUTPUT_DIR/package-install.log" 2>&1 || install_status=$?
         echo "VERITAS_INSTALL_EXIT_CODE=$install_status" >> "$GITHUB_ENV"
         exit "$install_status"
     - name: Capture actual readiness

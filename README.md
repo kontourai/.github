@@ -354,7 +354,7 @@ jobs:
     uses: kontourai/.github/.github/workflows/veritas-advisory.yml@main
 ```
 
-Set `with: { install-browser: true }` only when the repository's evidence check needs Chromium. The shared job pins published Veritas 1.11.1 and checks out the exact requested head. Its 30-minute outer timeout remains defense in depth; evidence-check limits and protected scope remain owned by the repository Repo Map.
+Set `with: { install-browser: true }` only when the repository's evidence check needs Chromium. The shared job pins published Veritas 1.11.2 and checks out the exact requested head. Its 30-minute outer timeout remains defense in depth; evidence-check limits and protected scope remain owned by the repository Repo Map.
 
 The summary labels the actual readiness PASS, FAIL, or ERROR. The artifact retains the canonical report, a source-bound execution JSON with every returned check stdout/stderr, and a readable transcript. Capture files use private modes without changing the test child's normal umask. An advisory job success means reporting completed, and may include a readiness FAIL. Installation/import errors always fail the job.
 
