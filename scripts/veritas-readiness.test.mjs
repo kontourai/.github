@@ -80,3 +80,12 @@ test('a failed partial installation cannot import a package or yield a PASS', as
     assert.equal(result.envelope.verdict, 'ERROR'); assert.equal(result.jobExitCode, 2);
   }
 });
+
+test('the version installed by the action is the version run.mjs verifies and the README states', async () => {
+  const action = await readFile(new URL('../actions/veritas-readiness/action.yml', import.meta.url), 'utf8');
+  const installs = [...action.matchAll(/npm install [^\n]*?@kontourai\/veritas@(\S+)/g)].map(match => match[1]);
+  assert.deepEqual(installs, [VERITAS_VERSION]);
+  assert.match(VERITAS_VERSION, /^\d+\.\d+\.\d+$/);
+  const readme = await readFile(new URL('../README.md', import.meta.url), 'utf8');
+  assert.match(readme, new RegExp(`pins published Veritas ${VERITAS_VERSION.replaceAll('.', '\\.')}`));
+});
