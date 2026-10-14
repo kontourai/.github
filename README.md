@@ -360,6 +360,51 @@ The summary labels the actual readiness PASS, FAIL, or ERROR. The artifact retai
 
 Use `with: { require-ready: true }` when the caller needs the actual readiness verdict to determine the job result. This opt-in does not change other callers or branch protection rules. A source commit change or tracked source mutation during execution refuses a PASS.
 
+## Version set and drift check
+
+[`version-set.json`](version-set.json) is the org's tested set of `@kontourai/*`
+versions, the compatibility train. Its `packages` keys are the explicit, reviewed list
+of packages on the train; each version is that package's npm `latest` on the train
+date. `previous` keeps the train before it, and `consumers` lists the public
+repositories the org-wide report checks. The set moves only by pull request:
+
+```bash
+node scripts/version-set-refresh.mjs --train 2026.11-a [--add @kontourai/<name>]
+```
+
+The refresh reads npm `latest` for every listed package, refuses a prerelease or a
+version older than the current set, moves the current train to `previous`, and writes
+the file for review. A reviewer who wants to hold a package back edits its version
+before merging.
+
+A repository reports its drift by calling the reusable workflow:
+
+```yaml
+jobs:
+  version-set-drift:
+    uses: kontourai/.github/.github/workflows/version-set-drift.yml@main
+```
+
+The job reads only `package.json` files (the root and every non-private workspace from
+`workspaces` or `pnpm-workspace.yaml`) and `pnpm-workspace.yaml`. It runs no code from
+the caller and holds no credentials. Each `@kontourai/*` spec is classified against the
+set: `current` admits the set's version; `behind` misses it but has not fallen below the
+previous train; `stale` admits nothing as new as the previous train's version; `ahead`
+admits only newer versions; `unrecognized` is not a semver range; `untracked` names a
+package outside the set. Specs that point inside the repository (`workspace:`, `file:`,
+or a package the repository itself contains) are skipped.
+
+The workflow is advisory: it lists drift in the job summary and succeeds. It fails
+only when it cannot read a manifest or the set. The script also has two failing modes,
+which no shared workflow uses:
+
+- `--fail-on stale` fails only on `stale` specs. A consumer that was current when a
+  train landed is `behind`, not `stale`, on the next train, so advancing the set never
+  fails whoever gates next; the consumer has one train to catch up.
+- `--fail-on drift` fails on any spec that misses the set's version. Use it to audit
+  the whole org: `node scripts/version-set-drift.mjs --all --fail-on drift` clones the
+  manifests of every listed consumer and exits 0 only when all of them are on the train.
+
 ## Product docs: gate and Pages
 
 Every product publishes gated docs with [`@kontourai/corpus`](https://github.com/kontourai/corpus).

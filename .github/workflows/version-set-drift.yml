@@ -1,0 +1,72 @@
+name: Version-set drift
+
+# Reports where the caller's @kontourai/* dependency specs drift from the
+# org version set (version-set.json in this repository). Advisory: the job
+# succeeds whatever drift it finds and lists it in the job summary.
+# The check only reads package.json and pnpm-workspace.yaml from the caller's
+# checkout; it runs no code from it and holds no credentials or secrets.
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        description: >-
+          Repository to check out. Empty means the triggering repository. A
+          pull_request_target caller passes the pull request's head repository.
+        required: false
+        type: string
+        default: ''
+      ref:
+        description: >-
+          Commit to check out. Empty means the pull request head, or the
+          triggering commit.
+        required: false
+        type: string
+        default: ''
+      version-set-ref:
+        description: >-
+          Ref of kontourai/.github that supplies version-set.json and the drift
+          script. The set is advanced by pull request on main, so main is the
+          current train.
+        required: false
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Version-set drift
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out the consumer
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ inputs.repository || github.repository }}
+          ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
+          path: consumer
+          persist-credentials: false
+      - name: Check out the version set
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: kontourai/.github
+          ref: ${{ inputs.version-set-ref }}
+          path: version-set
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Install the drift check
+        working-directory: version-set
+        run: npm ci --omit=dev --ignore-scripts
+      - name: Report drift
+        env:
+          LABEL: ${{ inputs.repository || github.repository }}
+        # Advisory: no --fail-on, so drift never fails the caller. Unreadable
+        # manifests or an invalid set still fail the job (exit 2).
+        run: >-
+          node version-set/scripts/version-set-drift.mjs
+          --label "$LABEL" --markdown-summary "$GITHUB_STEP_SUMMARY" consumer
