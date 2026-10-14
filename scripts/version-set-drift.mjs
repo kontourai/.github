@@ -435,7 +435,12 @@ export function main(argv = process.argv.slice(2), { stdout = process.stdout, st
     if (error instanceof SchemaVersionError && options.failOn === 'none') {
       stderr.write(`warning: ${errorLine(error)}\n${NEWER_SCHEMA_WARNING}\n`);
       if (env.GITHUB_ACTIONS === 'true') stdout.write(`::warning title=Version-set drift skipped::${NEWER_SCHEMA_WARNING}\n`);
-      if (options.summary) appendFileSync(options.summary, `### Version-set drift skipped\n\n${NEWER_SCHEMA_WARNING}\n`);
+      try {
+        if (options.summary) appendFileSync(options.summary, `### Version-set drift skipped\n\n${NEWER_SCHEMA_WARNING}\n`);
+      } catch (writeError) {
+        stderr.write(`${errorLine(writeError)}\n`);
+        return 2;
+      }
       return 0;
     }
     stderr.write(`${errorLine(error)}\n${error instanceof InputError ? USAGE : ''}`);
@@ -468,10 +473,16 @@ export function main(argv = process.argv.slice(2), { stdout = process.stdout, st
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   }
 
-  stdout.write(options.json
-    ? `${JSON.stringify({ train: set.train, previousTrain: set.previous?.train ?? null, failOn: options.failOn, results }, null, 2)}\n`
-    : formatText(set, results, options.failOn));
-  if (options.summary) appendFileSync(options.summary, formatMarkdown(set, results, options.failOn));
+  try {
+    stdout.write(options.json
+      ? `${JSON.stringify({ train: set.train, previousTrain: set.previous?.train ?? null, failOn: options.failOn, results }, null, 2)}\n`
+      : formatText(set, results, options.failOn));
+    if (options.summary) appendFileSync(options.summary, formatMarkdown(set, results, options.failOn));
+  } catch (error) {
+    // An unwritable summary is an error (exit 2), not drift (exit 1).
+    stderr.write(`${errorLine(error)}\n`);
+    return 2;
+  }
   const failing = results.flatMap((r) => r.findings).filter((f) => FAIL_ON[options.failOn].includes(f.status));
   return failing.length > 0 ? 1 : 0;
 }

@@ -372,6 +372,39 @@ test('a directory name cannot inject a workflow command into an error', (t) => {
   assertNoWorkflowCommand(run.stdout, run.stderr);
 });
 
+// Two layers keep errors printable: each value is quoted where the message is
+// built, and main escapes the whole line it writes. These tests reach each
+// layer on its own.
+test('input errors quote paths where they are raised', (t) => {
+  const root = scratch(t);
+  writeJson(join(root, 'package.json'), { name: 'consumer', private: true, workspaces: ['packages/*'] });
+  const evil = join(root, 'packages', 'x\n::error::raised');
+  mkdirSync(evil, { recursive: true });
+  writeFileSync(join(root, 'target.json'), '{}');
+  symlinkSync(join(root, 'target.json'), join(evil, 'package.json'));
+  assert.throws(() => checkRepository(root, set({ '@kontourai/surface': '6.1.0' })), (error) => {
+    assert.doesNotMatch(error.message, /\n/u);
+    assert.match(error.message, /\\u000a::error::raised/u);
+    return true;
+  });
+});
+
+test('an unexpected error is escaped as a whole line and exits 2', (t) => {
+  const dir = scratch(t);
+  const setPath = join(dir, 'version-set.json');
+  writeJson(setPath, set({ '@kontourai/surface': '6.1.0' }));
+  const consumer = join(dir, 'consumer');
+  writeJson(join(consumer, 'package.json'), { name: 'consumer', dependencies: { '@kontourai/surface': '1.0.0' } });
+  // A directory as the summary file: appendFileSync fails with EISDIR, an fs
+  // error whose message carries the raw path.
+  const summary = join(dir, 's\n::error::unexpected');
+  mkdirSync(summary);
+  const run = drift(['--set', setPath, '--fail-on', 'stale', '--markdown-summary', summary, consumer]);
+  assert.equal(run.status, 2, run.stderr);
+  assert.match(run.stderr, /unexpected error: EISDIR.*\\u000a::error::unexpected/u);
+  assertNoWorkflowCommand(run.stderr);
+});
+
 test('a symlink loop or a non-object manifest exits 2, not 1', (t) => {
   const dir = scratch(t);
   const setPath = join(dir, 'version-set.json');
