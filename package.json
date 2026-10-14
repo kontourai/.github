@@ -6,8 +6,11 @@
     "test": "node --test scripts/*.test.mjs",
     "validate:yaml": "node scripts/validate-yaml.mjs"
   },
-  "devDependencies": {
-    "release-please": "17.10.3",
+  "dependencies": {
+    "semver": "7.8.5",
     "yaml": "2.9.0"
+  },
+  "devDependencies": {
+    "release-please": "17.10.3"
   }
 }

@@ -360,6 +360,78 @@ The summary labels the actual readiness PASS, FAIL, or ERROR. The artifact retai
 
 Use `with: { require-ready: true }` when the caller needs the actual readiness verdict to determine the job result. This opt-in does not change other callers or branch protection rules. A source commit change or tracked source mutation during execution refuses a PASS.
 
+## Version set and drift check
+
+[`version-set.json`](version-set.json) is the org's tested set of `@kontourai/*`
+versions, the compatibility train. Its `packages` keys are the explicit, reviewed list
+of packages on the train; each version is that package's npm `latest` on the train
+date. `previous` keeps the train before it, and `consumers` lists the public
+repositories the org-wide report checks. The set moves only by pull request:
+
+```bash
+node scripts/version-set-refresh.mjs --train 2026.11-a [--add @kontourai/<name>]
+```
+
+The refresh reads npm `latest` for every listed package, refuses a prerelease or a
+version older than the current set, moves the current train to `previous`, and writes
+the file for review. A reviewer who wants to hold a package back edits its version
+before merging.
+
+A repository reports its drift by calling the reusable workflow:
+
+```yaml
+jobs:
+  version-set-drift:
+    uses: kontourai/.github/.github/workflows/version-set-drift.yml@main
+```
+
+The workflow runs the drift script and lockfile from the commit of the workflow file
+the caller pinned (`job.workflow_sha`). It reads only `version-set.json` from
+`version-set-ref` (default `main`), so a caller pinned to a SHA still sees the current
+train, and a change to the script on `main` cannot break it. Additive fields in the
+set are ignored. A format change bumps `schemaVersion`. A pinned script that meets a newer
+`schemaVersion` skips the check with a warning and exits 0, so it never fails the
+caller; under `--fail-on` it exits 2, because a gate cannot be evaluated. Re-pin the
+workflow to pick up the newer reader.
+
+The job reads only `package.json` files (the root and every non-private workspace from
+`workspaces` or `pnpm-workspace.yaml`) and `pnpm-workspace.yaml`. It stays inside the
+checkout: it refuses symlinked manifests, paths that resolve outside the checkout or
+cannot be resolved, and workspace patterns with `..`. It runs no code from the caller
+and holds no credentials. Every line it prints starts with fixed text (`error: `,
+`Repository `, and so on). Paths, labels and manifest text are printed with
+non-printable characters escaped, and the job summary shows them as code spans. So a
+manifest, directory name or label cannot start a workflow command or inject Markdown.
+Each `@kontourai/*` spec is classified against the set:
+
+- `current` admits the set's version.
+- `behind` misses it but has not fallen a breaking release behind the previous train.
+- `stale` admits nothing as new as the previous train's compatibility floor, which is
+  its major (`x.0.0`), its minor for 0.x (`0.y.0`), or its patch for 0.0.x (`0.0.z`).
+- `ahead` admits only newer versions.
+- `unrecognized` is not a semver range.
+- `untracked` names a package outside the set.
+
+Specs that point inside the repository (`workspace:`, `file:`, or a package the
+repository itself contains) are skipped.
+
+The workflow is advisory: it lists drift in the job summary and succeeds. It fails
+only when it cannot read a manifest or the set. The script also has two failing modes,
+which no shared workflow uses:
+
+- `--fail-on stale` fails only on `stale` specs. It guarantees two things:
+  - A consumer that was current when a train landed is never failed by the next
+    train, so advancing the set never fails a consumer that was current.
+  - Non-breaking trains never stale an exact pin. A pin goes stale only once a
+    breaking release (a major, a 0.x minor, or a 0.0.x patch) has moved past it and a
+    further train has elapsed.
+
+  A consumer that was already behind gets no such guarantee: once a breaking release
+  is more than one train old, it fails.
+- `--fail-on drift` fails on any spec that misses the set's version. Use it to audit
+  the whole org: `node scripts/version-set-drift.mjs --all --fail-on drift` clones the
+  manifests of every listed consumer and exits 0 only when all of them are on the train.
+
 ## Product docs: gate and Pages
 
 Every product publishes gated docs with [`@kontourai/corpus`](https://github.com/kontourai/corpus).
