@@ -201,8 +201,17 @@ export function checkRepository(root, set, label = basename(resolve(root))) {
   return findings;
 }
 
+// The environment without the variables that point git at a particular
+// repository. Inside a git hook GIT_DIR names the hook's repository, and a
+// clone or checkout run with it would write there instead of the scratch dir.
+export function isolatedGitEnvironment(env = process.env) {
+  const local = execFileSync('git', ['rev-parse', '--local-env-vars'], { encoding: 'utf8', cwd: tmpdir(), env: { PATH: env.PATH } })
+    .split('\n').filter(Boolean);
+  return Object.fromEntries(Object.entries(env).filter(([key]) => !local.includes(key)));
+}
+
 function git(args, options = {}) {
-  return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], ...options });
+  return execFileSync('git', args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], env: isolatedGitEnvironment(), ...options });
 }
 
 // Shallow, sparse clone that holds only package manifests and the pnpm

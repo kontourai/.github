@@ -6,7 +6,7 @@ import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { checkRepository, classifySpec, loadVersionSet, validateVersionSet } from './version-set-drift.mjs';
+import { checkRepository, classifySpec, isolatedGitEnvironment, loadVersionSet, validateVersionSet } from './version-set-drift.mjs';
 import { main as refreshMain, refreshVersionSet } from './version-set-refresh.mjs';
 
 const DRIFT = fileURLToPath(new URL('./version-set-drift.mjs', import.meta.url));
@@ -27,8 +27,8 @@ function set(packages, previous = null, train = '2026.10-a') {
   return { schemaVersion: 1, train, date: '2026-10-14', packages, previous, consumers: ['kontourai/consumer'] };
 }
 
-function drift(args) {
-  return spawnSync(process.execPath, [DRIFT, ...args], { encoding: 'utf8' });
+function drift(args, env = process.env) {
+  return spawnSync(process.execPath, [DRIFT, ...args], { encoding: 'utf8', env });
 }
 
 test('classification: current, ahead, behind with headroom, stale below the previous train', () => {
@@ -211,11 +211,14 @@ test('--all clones each listed consumer and checks its manifests', (t) => {
   writeJson(join(source, 'package.json'), { name: 'consumer', private: true, workspaces: ['pkg'] });
   writeJson(join(source, 'pkg/package.json'), { name: 'pkg', dependencies: { '@kontourai/surface': '5.0.0' } });
   writeFileSync(join(source, 'pkg/index.js'), 'export {};\n');
-  const git = (...args) => execFileSync('git', args, { cwd: source, stdio: 'pipe' });
+  // Isolated so that, run from a git hook, these commands cannot touch the
+  // hook's repository through GIT_DIR.
+  const env = isolatedGitEnvironment();
+  const git = (...args) => execFileSync('git', args, { cwd: source, stdio: 'pipe', env });
   git('init', '--quiet');
   git('add', '.');
   git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '--quiet', '-m', 'init');
-  execFileSync('git', ['clone', '--quiet', '--bare', source, join(dir, 'remote/kontourai/consumer.git')], { stdio: 'pipe' });
+  execFileSync('git', ['clone', '--quiet', '--bare', source, join(dir, 'remote/kontourai/consumer.git')], { stdio: 'pipe', env });
   const setPath = join(dir, 'version-set.json');
   writeJson(setPath, set({ '@kontourai/surface': '6.1.0' }, { train: '2026.09-a', packages: { '@kontourai/surface': '5.0.0' } }));
 
@@ -225,6 +228,19 @@ test('--all clones each listed consumer and checks its manifests', (t) => {
   const [result] = JSON.parse(run.stdout).results;
   assert.equal(result.repository, 'kontourai/consumer');
   assert.deepEqual(result.findings.map((f) => [f.manifest, f.status]), [['pkg/package.json', 'behind']]);
+
+  // Run as a git hook runs it: GIT_DIR names another repository. The clones
+  // must still land in scratch and leave that repository untouched.
+  const decoy = join(dir, 'decoy');
+  mkdirSync(decoy);
+  execFileSync('git', ['init', '--quiet'], { cwd: decoy, env });
+  const decoyGit = join(decoy, '.git');
+  const before = readFileSync(join(decoyGit, 'config'), 'utf8');
+  run = drift(['--set', setPath, '--all', '--git-base', gitBase, '--json'], { ...process.env, GIT_DIR: decoyGit, GIT_WORK_TREE: decoy });
+  assert.equal(run.status, 0, run.stderr);
+  assert.deepEqual(JSON.parse(run.stdout).results[0].findings.map((f) => f.status), ['behind']);
+  assert.equal(readFileSync(join(decoyGit, 'config'), 'utf8'), before);
+  assert.equal(spawnSync('git', ['-C', decoy, 'status', '--porcelain'], { encoding: 'utf8', env }).stdout, '');
 
   rmSync(join(dir, 'remote'), { recursive: true });
   run = drift(['--set', setPath, '--all', '--git-base', gitBase]);
