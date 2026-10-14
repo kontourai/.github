@@ -4,6 +4,7 @@ import { access, appendFile, link, mkdir, mkdtemp, readFile, readdir, rm, symlin
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 import { promisify } from 'node:util';
 import { execFile as execFileCallback } from 'node:child_process';
 import test from 'node:test';
@@ -176,25 +177,80 @@ test('weighted capacity blocks a contender and reports active utilization', asyn
 
 test('concurrent acquisitions never exceed the weighted capacity', async () => {
   await withRoot(async (root) => {
-    const base = config(root, { capacityUnits: 3, leaseWeight: 2, timeoutMs: 1_000, pollIntervalMs: 2 });
-    const first = acquireLease(base, { ownerToken: OWNER_A });
-    const second = acquireLease(base, { ownerToken: OWNER_B });
+    // The loser must outwait the winner however slow the host is, so no
+    // ordering in this test depends on a timeout; aborting `cancellation`
+    // ends every wait instead.
+    const base = config(root, { capacityUnits: 3, leaseWeight: 2, timeoutMs: 600_000, pollIntervalMs: 2 });
     const leases = join(root, '.kontour-physical-host-capacity', 'leases');
-    let firstWinner;
-    for (let attempt = 0; attempt < 100; attempt += 1) {
-      const files = await readdir(leases);
-      if (files.length === 1) {
-        firstWinner = files[0].replace(/\.json$/, '');
-        break;
-      }
-      await new Promise((resolveSleep) => setTimeout(resolveSleep, 2));
+    const cancellation = new AbortController();
+    const sleep = (milliseconds) => delay(milliseconds, undefined, { signal: cancellation.signal });
+    const completedOperations = new Map();
+    const operationWaiters = new Set();
+    let maximumHeldWeight = 0;
+    const controlHooks = {
+      // Runs after each protected operation while its control ticket is still
+      // held, so no participant can change the lease set during the count.
+      async afterControlRetireClaim(owner) {
+        let heldWeight = 0;
+        for (const name of await readdir(leases)) {
+          heldWeight += JSON.parse(await readFile(join(leases, name), 'utf8')).weight;
+        }
+        maximumHeldWeight = Math.max(maximumHeldWeight, heldWeight);
+        completedOperations.set(owner.ownerToken, (completedOperations.get(owner.ownerToken) ?? 0) + 1);
+        for (const waiter of operationWaiters) waiter();
+      },
+    };
+    // An owner's first protected operation publishes its queue ticket; every
+    // later one is an admission check.
+    const nextAdmissionCheckBy = (ownerToken) => {
+      const target = Math.max((completedOperations.get(ownerToken) ?? 0) + 1, 2);
+      return new Promise((resolveOperation) => {
+        const waiter = () => {
+          if ((completedOperations.get(ownerToken) ?? 0) < target) return;
+          operationWaiters.delete(waiter);
+          resolveOperation();
+        };
+        operationWaiters.add(waiter);
+      });
+    };
+    const options = { sleep, controlHooks };
+    let runningContenders = 0;
+    const contenders = [OWNER_A, OWNER_B].map((ownerToken) => {
+      const contender = acquireLease(base, { ownerToken, ...options });
+      runningContenders += 1;
+      const settle = () => { runningContenders -= 1; };
+      contender.then(settle, settle);
+      return contender;
+    });
+    try {
+      const winner = await Promise.race(contenders);
+      const loserToken = winner.ownerToken === OWNER_A ? OWNER_B : OWNER_A;
+      const loser = contenders[winner.ownerToken === OWNER_A ? 1 : 0];
+
+      // While the winner holds 2 of 3 units, the loser must complete another
+      // admission check and be refused, rather than acquire.
+      await Promise.race([
+        nextAdmissionCheckBy(loserToken),
+        loser.then(() => {
+          throw new assert.AssertionError({ message: 'the second weighted contender acquired while the first still held capacity' });
+        }),
+      ]);
+      assert.equal(maximumHeldWeight, base.leaseWeight, 'held weight exceeded one weighted lease while the loser was checked');
+
+      assert.equal(await releaseLease(base, winner.ownerToken, options), true);
+      const second = await loser;
+      assert.equal(second.ownerToken, loserToken);
+      assert.equal(await releaseLease(base, second.ownerToken, options), true);
+      assert.equal(maximumHeldWeight, base.leaseWeight, 'held weight exceeded one weighted lease');
+      assert.deepEqual(await readdir(leases), []);
+    } finally {
+      // Nothing may still touch the root when withRoot removes it.
+      cancellation.abort();
+      await Promise.allSettled(contenders);
+      // Promise.race and allSettled mark a late contender rejection as
+      // handled, so a contender left running would otherwise fail silently.
+      assert.equal(runningContenders, 0, 'a capacity contender was still running when its root was about to be removed');
     }
-    assert.ok(firstWinner, 'one weighted contender should acquire before capacity is released');
-    await releaseLease(base, firstWinner);
-    const [firstLease, secondLease] = await Promise.all([first, second]);
-    assert.notEqual(firstLease.ownerToken, secondLease.ownerToken);
-    await releaseLease(base, firstLease.ownerToken);
-    await releaseLease(base, secondLease.ownerToken);
   });
 });
 
