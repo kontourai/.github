@@ -102,7 +102,7 @@ export function main(argv = process.argv.slice(2), { latest = (name) => npmLates
     return 0;
   } catch (error) {
     if (!(error instanceof InputError)) throw error;
-    stderr.write(`${safeLine(error.message)}\n`);
+    stderr.write(`error: ${safeLine(error.message)}\n`);
     return 2;
   }
 }

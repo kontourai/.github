@@ -339,7 +339,7 @@ test('manifest text cannot inject Markdown or workflow commands', (t) => {
   assert.equal(run.status, 0, run.stderr);
   assertNoWorkflowCommand(run.stdout, run.stderr);
   assert.match(run.stdout, /"\\u000a::error::injected"/u);
-  assert.match(run.stdout, /^"x\\u000a::error::label": 3 @kontourai specs/mu);
+  assert.match(run.stdout, /^Repository "x\\u000a::error::label": 3 @kontourai specs/mu);
   const text = readFileSync(summary, 'utf8');
   assertNoWorkflowCommand(text);
   // Manifest text renders as code spans: no autolink, math, emphasis or bidi.
@@ -405,6 +405,43 @@ test('an unexpected error is escaped as a whole line and exits 2', (t) => {
   assertNoWorkflowCommand(run.stderr);
 });
 
+// Plain printable :: is enough to start a workflow command when it begins a
+// line, so every line the script writes starts with fixed text. Each case
+// puts a caller-controlled value where it would otherwise lead a line.
+test('a plain ::error:: in a path, label or argument never leads an output line', (t) => {
+  const dir = scratch(t);
+  const run = (args) => spawnSync(process.execPath, [DRIFT, ...args], { encoding: 'utf8', cwd: dir });
+  writeJson(join(dir, 'version-set.json'), set({ '@kontourai/surface': '6.1.0' }));
+
+  // A workspace directory named ::error::spoof holding a symlinked manifest.
+  const consumer = join(dir, 'consumer');
+  writeJson(join(consumer, 'package.json'), { name: 'consumer', private: true, workspaces: ['*'] });
+  mkdirSync(join(consumer, '::error::spoof'));
+  writeFileSync(join(dir, 'target.json'), '{}');
+  symlinkSync(join(dir, 'target.json'), join(consumer, '::error::spoof', 'package.json'));
+  let result = run(['--set', 'version-set.json', 'consumer']);
+  assert.equal(result.status, 2, result.stdout);
+  assert.equal(result.stderr, 'error: ::error::spoof/package.json: is a symlink; refusing to follow it\n');
+
+  // A label.
+  const plain = join(dir, 'plain');
+  writeJson(join(plain, 'package.json'), { name: 'plain', dependencies: { '@kontourai/surface': '1.0.0' } });
+  result = run(['--set', 'version-set.json', '--label', '::error::x', 'plain']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /^Repository ::error::x: 1 @kontourai specs/mu);
+  assertNoWorkflowCommand(result.stdout, result.stderr);
+
+  // A checkout argument that does not exist.
+  result = run(['--set', 'version-set.json', '::error::nonexist']);
+  assert.equal(result.status, 2);
+  assert.equal(result.stderr, 'error: ::error::nonexist: no such directory\n');
+
+  // A set path that does not exist.
+  result = run(['--set', '::error::noset.json', 'plain']);
+  assert.equal(result.status, 2);
+  assert.equal(result.stderr, 'error: ::error::noset.json: cannot be read (ENOENT)\n');
+});
+
 test('a symlink loop or a non-object manifest exits 2, not 1', (t) => {
   const dir = scratch(t);
   const setPath = join(dir, 'version-set.json');
@@ -444,12 +481,16 @@ test('a newer schemaVersion warns and exits 0 in advisory mode, 2 under --fail-o
   let run = drift(['--set', setPath, '--markdown-summary', summary, consumer], { ...process.env, GITHUB_ACTIONS: 'true' });
   assert.equal(run.status, 0, run.stderr);
   assert.match(run.stderr, /schemaVersion 2 is newer than this script reads \(1\)/u);
-  assert.match(run.stdout, /^::warning title=Version-set drift skipped::/mu);
+  // Pinned literal: the annotation carries only fixed text.
+  assert.equal(run.stdout, '::warning title=Version-set drift skipped::The version set uses a newer schemaVersion '
+    + 'than this pinned drift script reads. Drift was not checked; re-pin the version-set-drift workflow to pick up '
+    + 'the newer reader.\n');
   assert.match(readFileSync(summary, 'utf8'), /Drift was not checked/u);
 
   run = drift(['--set', setPath, '--fail-on', 'stale', consumer]);
   assert.equal(run.status, 2);
-  assert.match(run.stderr, /newer than this script reads/u);
+  assert.match(run.stderr, /^error: .*newer than this script reads/u);
+  assert.doesNotMatch(run.stderr, /Usage:/u);
 
   // A malformed schemaVersion is still an error, not a newer format.
   writeJson(setPath, { schemaVersion: 'two' });

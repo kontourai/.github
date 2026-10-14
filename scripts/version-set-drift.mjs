@@ -364,7 +364,7 @@ export function formatText(set, results, failOn = 'none') {
   const lines = [describeSet(set)];
   for (const { repository, findings } of results) {
     const counts = summarize(findings);
-    lines.push(`${printable(repository)}: ${findings.length} @kontourai specs; ${STATUSES.map((s) => `${counts[s]} ${s}`).join(', ')}`);
+    lines.push(`Repository ${printable(repository)}: ${findings.length} @kontourai specs; ${STATUSES.map((s) => `${counts[s]} ${s}`).join(', ')}`);
     for (const f of findings) {
       if (f.status === 'current') continue;
       const target = f.version ? ` (set ${f.version}${f.previousVersion ? `, previous ${f.previousVersion}` : ''})` : ' (not in the set)';
@@ -416,13 +416,15 @@ export function parseArguments(argv) {
   return options;
 }
 
-const NEWER_SCHEMA_WARNING = 'The version set uses a newer schemaVersion than this pinned drift script reads. '
+export const NEWER_SCHEMA_WARNING = 'The version set uses a newer schemaVersion than this pinned drift script reads. '
   + 'Drift was not checked; re-pin the version-set-drift workflow to pick up the newer reader.';
 
 // Any error other than a recognised one still exits 2 (never 1, which means
-// drift matched), with its message made safe to print.
+// drift matched), with its message made safe to print. Every line this script
+// writes starts with fixed text; the runner reads a line that starts with ::
+// as a workflow command, and a message can start with a caller's path.
 function errorLine(error) {
-  return safeLine(error instanceof InputError ? error.message : `unexpected error: ${error?.message ?? error}`);
+  return `error: ${safeLine(error instanceof InputError ? error.message : `unexpected error: ${error?.message ?? error}`)}`;
 }
 
 export function main(argv = process.argv.slice(2), { stdout = process.stdout, stderr = process.stderr, env = process.env } = {}) {
@@ -430,10 +432,15 @@ export function main(argv = process.argv.slice(2), { stdout = process.stdout, st
   let set;
   try {
     options = parseArguments(argv);
+  } catch (error) {
+    stderr.write(`${errorLine(error)}\n${USAGE}`);
+    return 2;
+  }
+  try {
     set = loadVersionSet(options.set);
   } catch (error) {
     if (error instanceof SchemaVersionError && options.failOn === 'none') {
-      stderr.write(`warning: ${errorLine(error)}\n${NEWER_SCHEMA_WARNING}\n`);
+      stderr.write(`warning: ${safeLine(error.message)}\nwarning: ${NEWER_SCHEMA_WARNING}\n`);
       if (env.GITHUB_ACTIONS === 'true') stdout.write(`::warning title=Version-set drift skipped::${NEWER_SCHEMA_WARNING}\n`);
       try {
         if (options.summary) appendFileSync(options.summary, `### Version-set drift skipped\n\n${NEWER_SCHEMA_WARNING}\n`);
@@ -443,7 +450,7 @@ export function main(argv = process.argv.slice(2), { stdout = process.stdout, st
       }
       return 0;
     }
-    stderr.write(`${errorLine(error)}\n${error instanceof InputError ? USAGE : ''}`);
+    stderr.write(`${errorLine(error)}\n`);
     return 2;
   }
   const results = [];

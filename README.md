@@ -398,9 +398,10 @@ The job reads only `package.json` files (the root and every non-private workspac
 `workspaces` or `pnpm-workspace.yaml`) and `pnpm-workspace.yaml`. It stays inside the
 checkout: it refuses symlinked manifests, paths that resolve outside the checkout or
 cannot be resolved, and workspace patterns with `..`. It runs no code from the caller
-and holds no credentials. Paths, labels and manifest text are printed with
-non-printable characters escaped, and the job summary shows them as code spans, so a
-manifest or directory name cannot start a workflow command or inject Markdown.
+and holds no credentials. Every line it prints starts with fixed text (`error: `,
+`Repository `, and so on). Paths, labels and manifest text are printed with
+non-printable characters escaped, and the job summary shows them as code spans. So a
+manifest, directory name or label cannot start a workflow command or inject Markdown.
 Each `@kontourai/*` spec is classified against the set:
 
 - `current` admits the set's version.
