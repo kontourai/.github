@@ -362,8 +362,9 @@ Use `with: { require-ready: true }` when the caller needs the actual readiness v
 
 ## Product docs: gate and Pages
 
-Every product publishes gated docs with [`@kontourai/docs-kit`](https://github.com/kontourai/docs-kit).
-The repository declares its published documents and MCP topics in a root `docs-kit.json`,
+Every product publishes gated docs with [`@kontourai/corpus`](https://github.com/kontourai/corpus).
+The repository declares its purpose, what it is built on, its published documents and MCP topics in a root
+`corpus.json` (`schemaVersion: 2`; Corpus refuses the retired `docs-kit.json`),
 then calls two thin workflows:
 
 ```yaml
@@ -402,8 +403,10 @@ to `docs-gate.yml`, so the gate checks the change rather than the base branch;
 the gate only reads files and holds no credentials or secrets. A product that also hosts non-docs pages (for example a live demo) passes
 `with: { extra-build-command: npm run build:demo }` to `docs-pages.yml`; the command
 runs after the docs build with dependencies installed and `DOCS_SITE_DIR` set, and may
-only add files. Both workflows run docs-kit from git at the commit pinned in their
-`docs-kit-ref` default; bump that pin here to upgrade every product.
+only add files. Both workflows run Corpus from git at the commit pinned in their
+`corpus-ref` default; bump that pin here to upgrade every product. A product that declares
+a `decisions` block in `corpus.json` also gets the decisions gate (records, index freshness and,
+on pull requests, the numbered-ADR freeze) from the same job.
 
 ## Secret scan
 
