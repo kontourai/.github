@@ -708,19 +708,121 @@ test('explicit recovery requires a distinct, regular quiescence marker and remov
 
 test('durable FIFO tickets admit an older weighted waiter before a later waiter', async () => {
   await withRoot(async (root) => {
-    const fifoConfig = config(root, { capacityUnits: 1, leaseWeight: 1, timeoutMs: 5_000, pollIntervalMs: 2 });
+    // Waiters poll only when this test lets them, so the ticket order and every
+    // admission check below are fixed by the test, not by wall-clock sleeps.
+    // The timeout is long enough that no ordering depends on it; aborting
+    // `cancellation` ends every parked wait instead.
+    const fifoConfig = config(root, { capacityUnits: 1, leaseWeight: 1, timeoutMs: 600_000, pollIntervalMs: 2 });
     await provisionHost(fifoConfig);
-    await acquireLease(fifoConfig, { ownerToken: OWNER_A });
-    const older = acquireLease(fifoConfig, { ownerToken: OWNER_B });
-    await new Promise((resolveSleep) => setTimeout(resolveSleep, 15));
-    const later = acquireLease(fifoConfig, { ownerToken: OWNER_C });
-    await new Promise((resolveSleep) => setTimeout(resolveSleep, 15));
+    const state = join(root, '.kontour-physical-host-capacity');
+    const leases = join(state, 'leases');
+    const ticketSequence = async (ownerToken) => JSON.parse(await readFile(join(state, 'tickets', `${ownerToken}.json`), 'utf8')).sequence;
+    const cancellation = new AbortController();
+    const parkedWaits = new Map();
+    const parkWaiters = new Map();
+    const checkedWithCapacityFree = new Set();
+    const controlHooks = {
+      // Runs after each protected operation while its control ticket is still
+      // held, so the lease set cannot change during the read.
+      async afterControlRetireClaim(owner) {
+        if ((await readdir(leases)).length === 0) checkedWithCapacityFree.add(owner.ownerToken);
+      },
+    };
+    const parkingSleep = (ownerToken) => () => new Promise((resolveSleep, rejectSleep) => {
+      if (cancellation.signal.aborted) {
+        rejectSleep(cancellation.signal.reason);
+        return;
+      }
+      const abort = () => rejectSleep(cancellation.signal.reason);
+      cancellation.signal.addEventListener('abort', abort, { once: true });
+      parkedWaits.set(ownerToken, () => {
+        cancellation.signal.removeEventListener('abort', abort);
+        resolveSleep();
+      });
+      parkWaiters.get(ownerToken)?.();
+    });
+    // Resolves once the owner is parked between polls, which it does only
+    // after a refused admission check: no other participant runs meanwhile,
+    // so it never waits for the control ticket.
+    const parked = (ownerToken) => new Promise((resolvePark) => {
+      if (parkedWaits.has(ownerToken)) {
+        resolvePark();
+        return;
+      }
+      parkWaiters.set(ownerToken, () => {
+        parkWaiters.delete(ownerToken);
+        resolvePark();
+      });
+    });
+    // A waiter that must be refused: acquiring instead fails the test.
+    const refused = (ownerToken, contender, message) => Promise.race([
+      parked(ownerToken),
+      contender.then(() => { throw new assert.AssertionError({ message }); }),
+    ]);
+    // A waiter that must be admitted: parking again instead fails the test at
+    // once, so a coordinator that admits nobody cannot hang until the timeout.
+    const admitted = (ownerToken, contender, message) => Promise.race([
+      contender,
+      parked(ownerToken).then(() => { throw new assert.AssertionError({ message }); }),
+    ]);
+    const resume = (ownerToken) => {
+      const resolveSleep = parkedWaits.get(ownerToken);
+      assert.ok(resolveSleep, `${ownerToken} is not parked`);
+      parkedWaits.delete(ownerToken);
+      resolveSleep();
+    };
 
-    await releaseLease(fifoConfig, OWNER_A);
-    const olderLease = await older;
-    await releaseLease(fifoConfig, olderLease.ownerToken);
-    const laterLease = await later;
-    assert.equal(laterLease.ownerToken, OWNER_C);
+    let runningContenders = 0;
+    const contenders = [];
+    const contend = (ownerToken) => {
+      const contender = acquireLease(fifoConfig, { ownerToken, sleep: parkingSleep(ownerToken), controlHooks });
+      runningContenders += 1;
+      const settle = () => { runningContenders -= 1; };
+      contender.then(settle, settle);
+      contenders.push(contender);
+      return contender;
+    };
+    try {
+      const holder = await admitted(OWNER_A, contend(OWNER_A), 'the first contender was refused with every unit free');
+      assert.equal(holder.ownerToken, OWNER_A);
+
+      // Each waiter publishes its ticket, is refused while A holds the only
+      // unit, and parks. The older waiter is parked before the later one
+      // starts, so its ticket is strictly earlier.
+      const older = contend(OWNER_B);
+      await refused(OWNER_B, older, 'the older waiter acquired while A held the only unit');
+      const later = contend(OWNER_C);
+      await refused(OWNER_C, later, 'the later waiter acquired while A held the only unit');
+      assert.ok(await ticketSequence(OWNER_B) < await ticketSequence(OWNER_C), 'the older waiter should hold the earlier queue ticket');
+      assert.equal(checkedWithCapacityFree.has(OWNER_C), false);
+
+      assert.equal(await releaseLease(fifoConfig, OWNER_A), true);
+      assert.deepEqual(await readdir(leases), []);
+
+      // Capacity is free and the older waiter is still parked. The later
+      // waiter's next admission check must be refused by queue order alone.
+      resume(OWNER_C);
+      await refused(OWNER_C, later, 'the later waiter acquired ahead of the older waiter');
+      assert.ok(checkedWithCapacityFree.has(OWNER_C), 'the later waiter should complete an admission check with capacity free');
+      assert.deepEqual(await readdir(leases), []);
+
+      resume(OWNER_B);
+      const olderLease = await admitted(OWNER_B, older, 'the older waiter was refused with capacity free at the head of the queue');
+      assert.equal(olderLease.ownerToken, OWNER_B);
+      assert.equal(await releaseLease(fifoConfig, OWNER_B), true);
+      resume(OWNER_C);
+      const laterLease = await admitted(OWNER_C, later, 'the later waiter was refused with capacity free at the head of the queue');
+      assert.equal(laterLease.ownerToken, OWNER_C);
+      assert.equal(await releaseLease(fifoConfig, OWNER_C), true);
+      assert.deepEqual(await readdir(leases), []);
+    } finally {
+      // Nothing may still touch the root when withRoot removes it.
+      cancellation.abort();
+      await Promise.allSettled(contenders);
+      // allSettled marks a late contender rejection as handled, so a
+      // contender left running would otherwise fail silently.
+      assert.equal(runningContenders, 0, 'a FIFO contender was still running when its root was about to be removed');
+    }
   }, { provision: false });
 });
 
