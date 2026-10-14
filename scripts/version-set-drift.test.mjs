@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
 import { execFileSync, spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import test from 'node:test';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { checkRepository, classifySpec, isolatedGitEnvironment, loadVersionSet, validateVersionSet } from './version-set-drift.mjs';
+import { checkRepository, classifySpec, compatibilityFloor, isolatedGitEnvironment, loadVersionSet, validateVersionSet } from './version-set-drift.mjs';
 import { main as refreshMain, refreshVersionSet } from './version-set-refresh.mjs';
 
 const DRIFT = fileURLToPath(new URL('./version-set-drift.mjs', import.meta.url));
@@ -31,6 +31,12 @@ function drift(args, env = process.env) {
   return spawnSync(process.execPath, [DRIFT, ...args], { encoding: 'utf8', env });
 }
 
+test('the compatibility floor is the major, or the minor for 0.x', () => {
+  assert.equal(compatibilityFloor('6.1.2'), '6.0.0');
+  assert.equal(compatibilityFloor('0.7.1'), '0.7.0');
+  assert.equal(compatibilityFloor('0.0.3'), '0.0.3');
+});
+
 test('classification: current, ahead, behind with headroom, stale below the previous train', () => {
   assert.equal(classifySpec('^6.0.0', '6.1.0', '5.4.0'), 'current');
   assert.equal(classifySpec('^5.0.0 || ^6.0.0', '6.1.0', '5.4.0'), 'current');
@@ -42,10 +48,14 @@ test('classification: current, ahead, behind with headroom, stale below the prev
   assert.equal(classifySpec('6.0.0', '6.1.0', '5.4.0'), 'behind');
   // No previous train for the package means no floor yet.
   assert.equal(classifySpec('^1.0.0', '6.1.0', undefined), 'behind');
+  // Below the previous train's version but within its major is headroom too.
+  assert.equal(classifySpec('5.0.0', '6.1.0', '5.4.0'), 'behind');
+  // Stale means a breaking release behind the previous train (pin literal: 5.0.0).
   assert.equal(classifySpec('^4.0.0', '6.1.0', '5.4.0'), 'stale');
-  assert.equal(classifySpec('5.3.9', '6.1.0', '5.4.0'), 'stale');
-  // 0.x minors are breaking, and semver ranges already say so.
-  assert.equal(classifySpec('^0.6.0', '0.7.1', '0.7.0'), 'stale');
+  assert.equal(classifySpec('4.9.9', '6.1.0', '5.4.0'), 'stale');
+  // 0.x minors are breaking (floor 0.7.0 for previous 0.7.3).
+  assert.equal(classifySpec('0.7.0', '0.8.0', '0.7.3'), 'behind');
+  assert.equal(classifySpec('^0.6.0', '0.8.0', '0.7.3'), 'stale');
   assert.equal(classifySpec('latest', '6.1.0', '5.4.0'), 'unrecognized');
 });
 
@@ -58,19 +68,30 @@ test('the set refuses malformed trains, versions and consumers', () => {
     { ...good, packages: { '@kontourai/surface': '6.2.0-rc.1' } },
     { ...good, packages: { 'surface': '6.1.0' } },
     { ...good, previous: { train: '2026.10-a', packages: {} } },
-    { ...good, previous: { train: '2026.09-a', packages: {}, extra: true } },
     { ...good, consumers: ['other/repo'] },
     { ...good, consumers: ['kontourai/a', 'kontourai/a'] },
     { ...good, date: '14 Oct' },
-    { ...good, surprise: 1 },
   ];
   for (const candidate of bad) assert.throws(() => validateVersionSet(candidate), undefined, JSON.stringify(candidate));
 });
 
-test('the committed version set is valid and starts with no previous train', () => {
+// A pinned older script must keep reading a set that gained an additive field;
+// only a schemaVersion bump may make it refuse the file.
+test('the set ignores fields it does not know', () => {
+  const good = set({ '@kontourai/surface': '6.1.0' }, { train: '2026.09-a', packages: {}, note: 'x' });
+  assert.doesNotThrow(() => validateVersionSet({ ...good, matrix: { nightly: false } }));
+  const carried = refreshVersionSet({ ...good, matrix: { nightly: false } }, {
+    train: '2026.10-b', date: '2026-10-20', latest: () => '6.1.1',
+  });
+  assert.deepEqual(carried.matrix, { nightly: false });
+});
+
+// Deliberately asserts nothing about the train or previous: advancing the set
+// must not need a test edit.
+test('the committed version set is valid', () => {
   const committed = loadVersionSet();
-  assert.equal(committed.previous, null);
   assert.ok(Object.keys(committed.packages).length > 0);
+  assert.ok(committed.consumers.length > 0);
 });
 
 test('scans the root and published workspaces, skipping private and intra-repo packages', (t) => {
@@ -147,6 +168,44 @@ test('advancing the train never fails a consumer that was current on the previou
   assert.match(run.stdout, /Advisory: drift is reported, not enforced\./u);
 });
 
+// Station and Console pin exact versions. Patch- and minor-only trains must not
+// stale such a pin; it goes stale only once a breaking release has moved past
+// it and a further train has elapsed.
+function trainSequence(t, pin, steps) {
+  const dir = scratch(t);
+  const consumer = join(dir, 'consumer');
+  writeJson(join(consumer, 'package.json'), { name: 'consumer', dependencies: { '@kontourai/pkg': pin } });
+  const setPath = join(dir, 'version-set.json');
+  const [first, ...rest] = steps;
+  writeJson(setPath, set({ '@kontourai/pkg': first }, null, 'train-0'));
+  const statuses = [];
+  const record = () => {
+    const run = drift(['--set', setPath, '--fail-on', 'stale', '--json', consumer]);
+    assert.notEqual(run.status, 2, run.stderr);
+    statuses.push([JSON.parse(run.stdout).results[0].findings[0].status, run.status]);
+  };
+  record();
+  rest.forEach((version, index) => {
+    assert.equal(refreshMain(['--set', setPath, '--train', `train-${index + 1}`, '--date', '2026-10-14'], {
+      latest: () => version, stdout: { write() {} }, stderr: { write(m) { throw new Error(m); } },
+    }), 0);
+    record();
+  });
+  return statuses;
+}
+
+test('an exact pin survives patch trains and goes stale a train after a major passes it', (t) => {
+  assert.deepEqual(trainSequence(t, '6.1.0', ['6.1.0', '6.1.1', '6.1.2', '6.2.0', '7.0.0', '7.0.1']), [
+    ['current', 0], ['behind', 0], ['behind', 0], ['behind', 0], ['behind', 0], ['stale', 1],
+  ]);
+});
+
+test('a 0.x exact pin survives patch trains and goes stale a train after a minor passes it', (t) => {
+  assert.deepEqual(trainSequence(t, '0.7.0', ['0.7.0', '0.7.1', '0.7.2', '0.8.0', '0.8.1']), [
+    ['current', 0], ['behind', 0], ['behind', 0], ['behind', 0], ['stale', 1],
+  ]);
+});
+
 test('--fail-on drift passes a consumer on the train, ignoring packages outside the set', (t) => {
   const dir = scratch(t);
   const setPath = join(dir, 'version-set.json');
@@ -174,10 +233,11 @@ test('unreadable inputs fail with exit 2 instead of reporting success', (t) => {
   assert.equal(run.status, 2);
   assert.match(run.stderr, /no package\.json/u);
 
-  writeFileSync(join(consumer, 'package.json'), '{ not json');
+  writeFileSync(join(consumer, 'package.json'), '{ "SECRET-CONTENT');
   run = drift(['--set', setPath, consumer]);
   assert.equal(run.status, 2);
-  assert.match(run.stderr, /package\.json/u);
+  assert.match(run.stderr, /package\.json: not valid JSON/u);
+  assert.doesNotMatch(run.stderr, /SECRET/u);
 
   writeJson(join(consumer, 'package.json'), { name: 'consumer' });
   writeFileSync(setPath, '{"schemaVersion": 1}');
@@ -191,6 +251,81 @@ test('unreadable inputs fail with exit 2 instead of reporting success', (t) => {
   assert.equal(run.status, 2);
 });
 
+test('reads stay inside the checkout and parse errors echo no content', (t) => {
+  const dir = scratch(t);
+  const setPath = join(dir, 'version-set.json');
+  writeJson(setPath, set({ '@kontourai/surface': '6.1.0' }));
+  const secret = join(dir, 'secret.txt');
+  writeFileSync(secret, 'TOPSECRET-VALUE\n');
+  const outside = join(dir, 'outside');
+  writeJson(join(outside, 'package.json'), { name: 'outside', dependencies: { '@kontourai/surface': '1.0.0' } });
+  const fresh = (name, workspaces) => {
+    const root = join(dir, name);
+    writeJson(join(root, 'package.json'), { name, private: true, workspaces });
+    return root;
+  };
+  const expectRefusal = (root, pattern) => {
+    const run = drift(['--set', setPath, root]);
+    assert.equal(run.status, 2, run.stdout);
+    assert.match(run.stderr, pattern);
+    assert.doesNotMatch(run.stderr + run.stdout, /TOPSECRET/u);
+  };
+
+  let root = fresh('file-link', ['packages/*']);
+  mkdirSync(join(root, 'packages/a'), { recursive: true });
+  symlinkSync(secret, join(root, 'packages/a/package.json'));
+  expectRefusal(root, /packages\/a\/package\.json: is a symlink/u);
+
+  root = fresh('dir-link', ['packages/*']);
+  mkdirSync(join(root, 'packages'));
+  symlinkSync(outside, join(root, 'packages/a'));
+  expectRefusal(root, /packages\/a\/package\.json: resolves outside the checkout/u);
+
+  root = fresh('dotdot', ['../outside']);
+  expectRefusal(root, /workspace pattern "\.\.\/outside" leaves the checkout/u);
+
+  root = fresh('negated-dotdot', ['!../outside']);
+  expectRefusal(root, /leaves the checkout/u);
+
+  root = join(dir, 'root-link');
+  mkdirSync(root);
+  symlinkSync(secret, join(root, 'package.json'));
+  expectRefusal(root, /package\.json: is a symlink/u);
+
+  root = fresh('yaml', undefined);
+  writeFileSync(join(root, 'pnpm-workspace.yaml'), 'packages: [TOPSECRET-VALUE\n');
+  expectRefusal(root, /pnpm-workspace\.yaml: not valid YAML/u);
+});
+
+test('invalid @kontourai package names are refused', (t) => {
+  const dir = scratch(t);
+  const setPath = join(dir, 'version-set.json');
+  writeJson(setPath, set({ '@kontourai/surface': '6.1.0' }));
+  const consumer = join(dir, 'consumer');
+  writeJson(join(consumer, 'package.json'), { name: 'consumer', dependencies: { '@kontourai/x|`y`': '1.0.0' } });
+  const run = drift(['--set', setPath, consumer]);
+  assert.equal(run.status, 2);
+  assert.match(run.stderr, /names an invalid package/u);
+});
+
+test('manifest text cannot inject Markdown or workflow commands', (t) => {
+  const dir = scratch(t);
+  const setPath = join(dir, 'version-set.json');
+  writeJson(setPath, set({ '@kontourai/surface': '6.1.0' }));
+  const consumer = join(dir, 'consumer');
+  writeJson(join(consumer, 'package.json'), {
+    name: 'consumer', dependencies: { '@kontourai/surface': '1.0.0 | `x`', '@kontourai/ui': '\n::error::injected' },
+  });
+  const summary = join(dir, 'summary.md');
+  const run = drift(['--set', setPath, '--markdown-summary', summary, consumer]);
+  assert.equal(run.status, 0, run.stderr);
+  assert.doesNotMatch(run.stdout, /^::/mu);
+  assert.match(run.stdout, /"\\n::error::injected"/u);
+  const text = readFileSync(summary, 'utf8');
+  assert.match(text, /\| 1\.0\.0 \\\| \\`x\\` \|/u);
+  assert.doesNotMatch(text, /^::/mu);
+});
+
 test('writes a markdown summary when asked', (t) => {
   const dir = scratch(t);
   const setPath = join(dir, 'version-set.json');
@@ -202,7 +337,7 @@ test('writes a markdown summary when asked', (t) => {
   assert.equal(run.status, 0, run.stderr);
   const text = readFileSync(summary, 'utf8');
   assert.match(text, /\*\*kontourai\/consumer\*\*: 0 current, 1 behind/u);
-  assert.match(text, /`\^3\.0\.0 \\\|\\\| \^4\.0\.0`/u);
+  assert.match(text, /\| \^3\.0\.0 \\\|\\\| \^4\.0\.0 \|/u);
 });
 
 test('--all clones each listed consumer and checks its manifests', (t) => {

@@ -385,22 +385,41 @@ jobs:
     uses: kontourai/.github/.github/workflows/version-set-drift.yml@main
 ```
 
+The workflow runs the drift script and lockfile from the commit of the workflow file
+the caller pinned (`job.workflow_sha`). It reads only `version-set.json` from
+`version-set-ref` (default `main`), so a caller pinned to a SHA still sees the current
+train, and a change to the script on `main` cannot break it. Additive fields in the
+set are ignored. Only a `schemaVersion` bump makes an older script refuse the file.
+
 The job reads only `package.json` files (the root and every non-private workspace from
-`workspaces` or `pnpm-workspace.yaml`) and `pnpm-workspace.yaml`. It runs no code from
-the caller and holds no credentials. Each `@kontourai/*` spec is classified against the
-set: `current` admits the set's version; `behind` misses it but has not fallen below the
-previous train; `stale` admits nothing as new as the previous train's version; `ahead`
-admits only newer versions; `unrecognized` is not a semver range; `untracked` names a
-package outside the set. Specs that point inside the repository (`workspace:`, `file:`,
-or a package the repository itself contains) are skipped.
+`workspaces` or `pnpm-workspace.yaml`) and `pnpm-workspace.yaml`. It stays inside the
+checkout: it refuses symlinked manifests, paths that resolve outside the checkout, and
+workspace patterns with `..`. It runs no code from the caller and holds no credentials.
+Each `@kontourai/*` spec is classified against the set:
+
+- `current` admits the set's version.
+- `behind` misses it but has not fallen a breaking release behind the previous train.
+- `stale` admits nothing as new as the previous train's compatibility floor, which is
+  its major (`x.0.0`), or its minor (`0.y.0`) for 0.x.
+- `ahead` admits only newer versions.
+- `unrecognized` is not a semver range.
+- `untracked` names a package outside the set.
+
+Specs that point inside the repository (`workspace:`, `file:`, or a package the
+repository itself contains) are skipped.
 
 The workflow is advisory: it lists drift in the job summary and succeeds. It fails
 only when it cannot read a manifest or the set. The script also has two failing modes,
 which no shared workflow uses:
 
-- `--fail-on stale` fails only on `stale` specs. A consumer that was current when a
-  train landed is `behind`, not `stale`, on the next train, so advancing the set never
-  fails whoever gates next; the consumer has one train to catch up.
+- `--fail-on stale` fails only on `stale` specs. It guarantees two things:
+  - A consumer that was current when a train landed is never failed by the next
+    train, so advancing the set never fails a consumer that was current.
+  - Patch- and minor-only trains never stale an exact pin. A pin goes stale only once
+    a breaking release has moved past it and a further train has elapsed.
+
+  A consumer that was already behind gets no such guarantee: once a breaking release
+  is more than one train old, it fails.
 - `--fail-on drift` fails on any spec that misses the set's version. Use it to audit
   the whole org: `node scripts/version-set-drift.mjs --all --fail-on drift` clones the
   manifests of every listed consumer and exits 0 only when all of them are on the train.

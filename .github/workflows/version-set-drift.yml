@@ -25,9 +25,10 @@ on:
         default: ''
       version-set-ref:
         description: >-
-          Ref of kontourai/.github that supplies version-set.json and the drift
-          script. The set is advanced by pull request on main, so main is the
-          current train.
+          Ref of kontourai/.github that supplies version-set.json, the data
+          only. The set is advanced by pull request on main, so main is the
+          current train. The drift script and its lockfile always come from
+          the commit of this workflow file that the caller pinned.
         required: false
         type: string
         default: main
@@ -48,19 +49,35 @@ jobs:
           ref: ${{ inputs.ref || github.event.pull_request.head.sha || github.sha }}
           path: consumer
           persist-credentials: false
+      # Pin the code, float only the data. job.workflow_repository and
+      # job.workflow_sha name this reusable workflow's own repository and
+      # commit (GitHub contexts reference, "job context"), so a caller pinned
+      # to a SHA runs the script and lockfile from that SHA, and a rename or
+      # move on main cannot break it. actionlint 1.7.12 does not know these
+      # properties yet; .github/actionlint.yaml ignores exactly that message
+      # for this file.
+      - name: Check out the drift check
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: drift-check
+          persist-credentials: false
       - name: Check out the version set
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          repository: kontourai/.github
+          repository: ${{ job.workflow_repository }}
           ref: ${{ inputs.version-set-ref }}
           path: version-set
           persist-credentials: false
+          sparse-checkout: version-set.json
+          sparse-checkout-cone-mode: false
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
           node-version: 24
           package-manager-cache: false
       - name: Install the drift check
-        working-directory: version-set
+        working-directory: drift-check
         run: npm ci --omit=dev --ignore-scripts
       - name: Report drift
         env:
@@ -68,5 +85,6 @@ jobs:
         # Advisory: no --fail-on, so drift never fails the caller. Unreadable
         # manifests or an invalid set still fail the job (exit 2).
         run: >-
-          node version-set/scripts/version-set-drift.mjs
+          node drift-check/scripts/version-set-drift.mjs
+          --set version-set/version-set.json
           --label "$LABEL" --markdown-summary "$GITHUB_STEP_SUMMARY" consumer

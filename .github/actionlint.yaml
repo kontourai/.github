@@ -1,0 +1,8 @@
+# actionlint 1.7.12 (the latest release) does not yet know the job context's
+# workflow_repository and workflow_sha properties, which GitHub documents for
+# reusable workflows. Ignore exactly that message, only in the workflow that
+# uses them.
+paths:
+  .github/workflows/version-set-drift.yml:
+    ignore:
+      - 'property "workflow_(repository|sha)" is not defined in object type'

@@ -6,10 +6,12 @@
 //
 // By default the check is advisory: it exits 0 whatever it finds.
 // --fail-on stale fails only on a STALE spec, one that admits nothing as new as
-// the previous train's version. A consumer that was current when a train
-// landed is therefore never failed by the next train: it has one release cycle
-// of headroom to catch up, so advancing the set never turns whoever gates next
-// red. This is the mode a gate would use.
+// the previous train's compatibility floor (its major, or its minor for 0.x).
+// Two guarantees follow. A consumer that was current when a train landed is
+// never failed by the next train, so advancing the set never turns a current
+// consumer red. And patch- or minor-only trains never stale an exact pin: a
+// spec goes stale only once a breaking release has moved past it and a further
+// train has elapsed. This is the mode a gate would use.
 // --fail-on drift fails on any spec that does not admit the set's version
 // (behind, stale, ahead or unrecognized). It answers "is every consumer on
 // the train?" for a one-off audit and is not meant for a gate.
@@ -18,9 +20,9 @@
 // 2 the set, a manifest or the arguments could not be read.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, globSync, mkdtempSync, readFileSync, rmSync, statSync, appendFileSync } from 'node:fs';
+import { appendFileSync, globSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, join, relative, resolve } from 'node:path';
+import { basename, isAbsolute, join, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import semver from 'semver';
@@ -59,15 +61,12 @@ function validatePackages(packages, where) {
   }
 }
 
-function refuseUnknownKeys(object, allowed, where) {
-  for (const key of Object.keys(object)) {
-    if (!allowed.includes(key)) throw new InputError(`${where}: unknown key "${key}"`);
-  }
-}
-
 export function validateVersionSet(set, where = 'version set') {
   if (!set || typeof set !== 'object' || Array.isArray(set)) throw new InputError(`${where}: expected an object`);
-  refuseUnknownKeys(set, ['schemaVersion', 'train', 'date', 'packages', 'previous', 'consumers'], where);
+  // schemaVersion is the compatibility gate: a breaking change to the set's
+  // shape bumps it, and older pinned scripts refuse the file. Additive fields
+  // keep schemaVersion 1 and are ignored here, so adding one never makes an
+  // older pinned script exit 2.
   if (set.schemaVersion !== 1) throw new InputError(`${where}: schemaVersion must be 1`);
   if (typeof set.train !== 'string' || !TRAIN_ID.test(set.train)) throw new InputError(`${where}: "train" must be a train id`);
   if (typeof set.date !== 'string' || !ISO_DATE.test(set.date)) throw new InputError(`${where}: "date" must be YYYY-MM-DD`);
@@ -76,7 +75,6 @@ export function validateVersionSet(set, where = 'version set') {
     if (!set.previous || typeof set.previous !== 'object' || Array.isArray(set.previous)) {
       throw new InputError(`${where}: "previous" must be null or { train, packages }`);
     }
-    refuseUnknownKeys(set.previous, ['train', 'packages'], `${where} previous`);
     if (typeof set.previous.train !== 'string' || !TRAIN_ID.test(set.previous.train)) {
       throw new InputError(`${where}: "previous.train" must be a train id`);
     }
@@ -100,32 +98,63 @@ export function loadVersionSet(path = DEFAULT_SET_PATH) {
   let set;
   try {
     set = JSON.parse(text);
-  } catch (error) {
-    throw new InputError(`${path}: ${error.message}`);
+  } catch {
+    throw new InputError(`${path}: not valid JSON`);
   }
   return validateVersionSet(set, path);
+}
+
+// The lowest version semver-compatible with `version`: x.0.0, or 0.y.0 for
+// 0.x, where each minor is breaking (0.0.z for 0.0.x, where each patch is).
+export function compatibilityFloor(version) {
+  const { major, minor, patch } = semver.parse(version);
+  if (major > 0) return `${major}.0.0`;
+  if (minor > 0) return `0.${minor}.0`;
+  return `0.0.${patch}`;
 }
 
 // Classifies one dependency spec against the set:
 // - current: admits the set's version;
 // - ahead: admits only versions newer than the set's;
-// - stale: admits only versions older than the previous train's, so the
-//   consumer has fallen below the previous train;
+// - stale: admits only versions older than the previous train's compatibility
+//   floor, so the consumer has fallen a breaking release behind the previous
+//   train;
 // - behind: anything else that misses the set's version, including every miss
 //   for a package that has no previous train yet. This is the headroom.
 export function classifySpec(spec, version, previousVersion) {
   if (semver.validRange(spec) === null) return 'unrecognized';
   if (semver.satisfies(version, spec)) return 'current';
   if (semver.ltr(version, spec)) return 'ahead';
-  if (previousVersion !== undefined && semver.gtr(previousVersion, spec)) return 'stale';
+  if (previousVersion !== undefined && semver.gtr(compatibilityFloor(previousVersion), spec)) return 'stale';
   return 'behind';
 }
 
-function readManifest(path, root) {
+// Every read stays inside the checkout. The root is resolved once; a file
+// that is a symlink, or whose real path leaves the root (through a symlinked
+// directory, for example), is refused rather than read. Parse errors never
+// echo file content.
+function confinedFile(root, path) {
+  const absolute = join(root, path);
+  let stat;
   try {
-    return JSON.parse(readFileSync(path, 'utf8'));
-  } catch (error) {
-    throw new InputError(`${relative(root, path) || path}: ${error.message}`);
+    stat = lstatSync(absolute);
+  } catch {
+    return null;
+  }
+  if (stat.isSymbolicLink()) throw new InputError(`${path}: is a symlink; refusing to follow it`);
+  const real = realpathSync(absolute);
+  if (!real.startsWith(`${root}${sep}`)) throw new InputError(`${path}: resolves outside the checkout`);
+  if (!stat.isFile()) throw new InputError(`${path}: is not a file`);
+  return real;
+}
+
+function readManifest(root, path) {
+  const real = confinedFile(root, path);
+  if (real === null) throw new InputError(`${path}: missing`);
+  try {
+    return JSON.parse(readFileSync(real, 'utf8'));
+  } catch {
+    throw new InputError(`${path}: not valid JSON`);
   }
 }
 
@@ -134,17 +163,24 @@ function workspacePatterns(root, rootManifest) {
   const { workspaces } = rootManifest;
   if (Array.isArray(workspaces)) patterns.push(...workspaces);
   else if (workspaces && Array.isArray(workspaces.packages)) patterns.push(...workspaces.packages);
-  const pnpmWorkspace = join(root, 'pnpm-workspace.yaml');
-  if (existsSync(pnpmWorkspace)) {
+  const pnpmWorkspace = confinedFile(root, 'pnpm-workspace.yaml');
+  if (pnpmWorkspace !== null) {
     let document;
     try {
       document = parseYaml(readFileSync(pnpmWorkspace, 'utf8'));
-    } catch (error) {
-      throw new InputError(`pnpm-workspace.yaml: ${error.message}`);
+    } catch {
+      throw new InputError('pnpm-workspace.yaml: not valid YAML');
     }
     if (Array.isArray(document?.packages)) patterns.push(...document.packages);
   }
-  return patterns.filter((pattern) => typeof pattern === 'string');
+  const strings = patterns.filter((pattern) => typeof pattern === 'string');
+  for (const pattern of strings) {
+    const body = pattern.startsWith('!') ? pattern.slice(1) : pattern;
+    if (isAbsolute(body) || body.split(/[\\/]/u).includes('..')) {
+      throw new InputError(`workspace pattern ${JSON.stringify(pattern)} leaves the checkout`);
+    }
+  }
+  return strings;
 }
 
 function expandWorkspaces(root, patterns) {
@@ -161,7 +197,8 @@ function expandWorkspaces(root, patterns) {
   }
   return [...matched]
     .filter((dir) => !excluded.has(dir))
-    .filter((dir) => existsSync(join(root, dir, 'package.json')) && statSync(join(root, dir)).isDirectory())
+    .filter((dir) => statSync(join(root, dir), { throwIfNoEntry: false })?.isDirectory())
+    .filter((dir) => confinedFile(root, join(dir, 'package.json')) !== null)
     .sort();
 }
 
@@ -169,13 +206,18 @@ function expandWorkspaces(root, patterns) {
 // Private workspaces such as examples may pin old versions on purpose. Specs
 // naming a package that lives in the same repository are intra-repo links,
 // not train drift, so they are skipped like file:/workspace: specs.
-export function collectManifests(root) {
-  const rootPath = join(root, 'package.json');
-  if (!existsSync(rootPath)) throw new InputError(`${root}: no package.json`);
-  const rootManifest = readManifest(rootPath, root);
+export function collectManifests(checkout) {
+  let root;
+  try {
+    root = realpathSync(checkout);
+  } catch {
+    throw new InputError(`${checkout}: no such directory`);
+  }
+  if (confinedFile(root, 'package.json') === null) throw new InputError(`${checkout}: no package.json`);
+  const rootManifest = readManifest(root, 'package.json');
   const workspaces = expandWorkspaces(root, workspacePatterns(root, rootManifest)).map((dir) => {
     const path = join(dir, 'package.json');
-    return { path, manifest: readManifest(join(root, path), root) };
+    return { path, manifest: readManifest(root, path) };
   });
   const localNames = new Set([rootManifest.name, ...workspaces.map((w) => w.manifest.name)].filter(Boolean));
   const scanned = [{ path: 'package.json', manifest: rootManifest }, ...workspaces.filter((w) => w.manifest.private !== true)];
@@ -189,6 +231,7 @@ export function checkRepository(root, set, label = basename(resolve(root))) {
     for (const section of DEPENDENCY_SECTIONS) {
       for (const [name, spec] of Object.entries(manifest[section] ?? {})) {
         if (!name.startsWith('@kontourai/') || localNames.has(name)) continue;
+        if (!PACKAGE_NAME.test(name)) throw new InputError(`${label} ${path}: ${section} names an invalid package ${JSON.stringify(name)}`);
         if (typeof spec !== 'string') throw new InputError(`${label} ${path}: ${section}.${name} is not a string`);
         if (LOCAL_SPEC.test(spec)) continue;
         const version = set.packages[name];
@@ -237,6 +280,18 @@ function describeSet(set) {
   return `Version set ${set.train} (${set.date}); previous train: ${set.previous ? set.previous.train : 'none'}`;
 }
 
+// Printable ASCII passes through; anything else (a newline that could start a
+// workflow command, a terminal escape) is shown JSON-quoted.
+function printable(value) {
+  const text = String(value);
+  return /^[\x20-\x7e]*$/u.test(text) ? text : JSON.stringify(text);
+}
+
+// Escapes Markdown and table syntax so manifest text renders as text.
+export function markdownText(value) {
+  return printable(value).replace(/[\\`*_~[\]<>|]/gu, (ch) => `\\${ch}`);
+}
+
 export function formatText(set, results, failOn = 'none') {
   const lines = [describeSet(set)];
   for (const { repository, findings } of results) {
@@ -245,7 +300,7 @@ export function formatText(set, results, failOn = 'none') {
     for (const f of findings) {
       if (f.status === 'current') continue;
       const target = f.version ? ` (set ${f.version}${f.previousVersion ? `, previous ${f.previousVersion}` : ''})` : ' (not in the set)';
-      lines.push(`  ${f.status.toUpperCase().padEnd(12)} ${f.manifest} ${f.section} ${f.package} ${f.spec}${target}`);
+      lines.push(`  ${f.status.toUpperCase().padEnd(12)} ${printable(f.manifest)} ${f.section} ${f.package} ${printable(f.spec)}${target}`);
     }
   }
   lines.push(modeLine(failOn));
@@ -253,16 +308,15 @@ export function formatText(set, results, failOn = 'none') {
 }
 
 export function formatMarkdown(set, results, failOn = 'none') {
-  const escape = (value) => String(value).replace(/\|/gu, '\\|');
   const lines = [`### ${describeSet(set)}`, '', modeLine(failOn), ''];
   for (const { repository, findings } of results) {
     const counts = summarize(findings);
-    lines.push(`**${repository}**: ${STATUSES.map((s) => `${counts[s]} ${s}`).join(', ')}`, '');
+    lines.push(`**${markdownText(repository)}**: ${STATUSES.map((s) => `${counts[s]} ${s}`).join(', ')}`, '');
     const drift = findings.filter((f) => f.status !== 'current');
     if (drift.length === 0) continue;
     lines.push('| Status | Manifest | Section | Package | Spec | Set | Previous |', '|---|---|---|---|---|---|---|');
     for (const f of drift) {
-      lines.push(`| ${f.status} | ${escape(f.manifest)} | ${f.section} | ${f.package} | \`${escape(f.spec)}\` | ${f.version ?? 'not in set'} | ${f.previousVersion ?? '-'} |`);
+      lines.push(`| ${f.status} | ${markdownText(f.manifest)} | ${f.section} | ${markdownText(f.package)} | ${markdownText(f.spec)} | ${f.version ?? 'not in set'} | ${f.previousVersion ?? '-'} |`);
     }
     lines.push('');
   }

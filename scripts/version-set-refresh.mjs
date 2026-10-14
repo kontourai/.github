@@ -50,7 +50,10 @@ export function refreshVersionSet(current, { train, date, add = [], latest }) {
     }
     packages[name] = version;
   }
+  // Fields this script does not know are carried forward unchanged, so an
+  // additive schema field survives a refresh.
   return validateVersionSet({
+    ...current,
     schemaVersion: 1,
     train,
     date,
