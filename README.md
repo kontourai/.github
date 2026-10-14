@@ -389,18 +389,24 @@ The workflow runs the drift script and lockfile from the commit of the workflow 
 the caller pinned (`job.workflow_sha`). It reads only `version-set.json` from
 `version-set-ref` (default `main`), so a caller pinned to a SHA still sees the current
 train, and a change to the script on `main` cannot break it. Additive fields in the
-set are ignored. Only a `schemaVersion` bump makes an older script refuse the file.
+set are ignored. A format change bumps `schemaVersion`. A pinned script that meets a newer
+`schemaVersion` skips the check with a warning and exits 0, so it never fails the
+caller; under `--fail-on` it exits 2, because a gate cannot be evaluated. Re-pin the
+workflow to pick up the newer reader.
 
 The job reads only `package.json` files (the root and every non-private workspace from
 `workspaces` or `pnpm-workspace.yaml`) and `pnpm-workspace.yaml`. It stays inside the
-checkout: it refuses symlinked manifests, paths that resolve outside the checkout, and
-workspace patterns with `..`. It runs no code from the caller and holds no credentials.
+checkout: it refuses symlinked manifests, paths that resolve outside the checkout or
+cannot be resolved, and workspace patterns with `..`. It runs no code from the caller
+and holds no credentials. Paths, labels and manifest text are printed with
+non-printable characters escaped, and the job summary shows them as code spans, so a
+manifest or directory name cannot start a workflow command or inject Markdown.
 Each `@kontourai/*` spec is classified against the set:
 
 - `current` admits the set's version.
 - `behind` misses it but has not fallen a breaking release behind the previous train.
 - `stale` admits nothing as new as the previous train's compatibility floor, which is
-  its major (`x.0.0`), or its minor (`0.y.0`) for 0.x.
+  its major (`x.0.0`), its minor for 0.x (`0.y.0`), or its patch for 0.0.x (`0.0.z`).
 - `ahead` admits only newer versions.
 - `unrecognized` is not a semver range.
 - `untracked` names a package outside the set.
@@ -415,8 +421,9 @@ which no shared workflow uses:
 - `--fail-on stale` fails only on `stale` specs. It guarantees two things:
   - A consumer that was current when a train landed is never failed by the next
     train, so advancing the set never fails a consumer that was current.
-  - Patch- and minor-only trains never stale an exact pin. A pin goes stale only once
-    a breaking release has moved past it and a further train has elapsed.
+  - Non-breaking trains never stale an exact pin. A pin goes stale only once a
+    breaking release (a major, a 0.x minor, or a 0.0.x patch) has moved past it and a
+    further train has elapsed.
 
   A consumer that was already behind gets no such guarantee: once a breaking release
   is more than one train old, it fails.

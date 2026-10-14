@@ -9,15 +9,20 @@
 // the previous train's compatibility floor (its major, or its minor for 0.x).
 // Two guarantees follow. A consumer that was current when a train landed is
 // never failed by the next train, so advancing the set never turns a current
-// consumer red. And patch- or minor-only trains never stale an exact pin: a
-// spec goes stale only once a breaking release has moved past it and a further
-// train has elapsed. This is the mode a gate would use.
+// consumer red. And non-breaking trains never stale an exact pin: a spec goes
+// stale only once a breaking release (a major, a 0.x minor, or a 0.0.x patch)
+// has moved past it and a further train has elapsed. This is the mode a gate
+// would use.
 // --fail-on drift fails on any spec that does not admit the set's version
 // (behind, stale, ahead or unrecognized). It answers "is every consumer on
 // the train?" for a one-off audit and is not meant for a gate.
 //
 // Exit status: 0 reported with nothing failing, 1 a spec matched --fail-on,
-// 2 the set, a manifest or the arguments could not be read.
+// 2 the set, a manifest or the arguments could not be read, or any other
+// error. A set with a newer schemaVersion than this script reads is skipped
+// with a warning and exit 0 in advisory mode, so publishing a new format on
+// main never fails a caller pinned to an older script; with --fail-on it exits
+// 2, because a gate cannot be evaluated.
 
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, globSync, lstatSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync } from 'node:fs';
@@ -48,26 +53,55 @@ const CONSUMER = /^kontourai\/[A-Za-z0-9_.-]+$/u;
 const LOCAL_SPEC = /^(file|link|workspace|portal):/u;
 
 export class InputError extends Error {}
+// The set declares a schemaVersion newer than this script reads.
+export class SchemaVersionError extends InputError {}
+export const SCHEMA_VERSION = 1;
+
+// Printable ASCII passes through. Anything else (a newline that could start a
+// workflow command, a terminal escape, a bidi control) makes the value shown
+// quoted, with every non-printable character escaped as \uXXXX.
+export function printable(value) {
+  const text = String(value);
+  if (/^[\x20-\x7e]*$/u.test(text)) return text;
+  return `"${escapeNonPrintable(text.replace(/["\\]/gu, (ch) => `\\${ch}`))}"`;
+}
+
+function escapeNonPrintable(text) {
+  return text.replace(/[^\x20-\x7e]/gu, (ch) => {
+    const code = ch.codePointAt(0);
+    return code > 0xffff ? `\\u{${code.toString(16)}}` : `\\u${code.toString(16).padStart(4, '0')}`;
+  });
+}
+
+// A whole error line made safe to print: messages can carry fs or git text
+// that no caller sanitised.
+export function safeLine(text) {
+  return escapeNonPrintable(String(text));
+}
 
 function validatePackages(packages, where) {
   if (!packages || typeof packages !== 'object' || Array.isArray(packages)) {
     throw new InputError(`${where}: "packages" must be an object of package name to version`);
   }
   for (const [name, version] of Object.entries(packages)) {
-    if (!PACKAGE_NAME.test(name)) throw new InputError(`${where}: "${name}" is not an @kontourai package name`);
+    if (!PACKAGE_NAME.test(name)) throw new InputError(`${where}: ${printable(name)} is not an @kontourai package name`);
     if (typeof version !== 'string' || semver.valid(version) !== version || semver.prerelease(version)) {
-      throw new InputError(`${where}: ${name} must be an exact stable version, got ${JSON.stringify(version)}`);
+      throw new InputError(`${where}: ${name} must be an exact stable version, got ${printable(JSON.stringify(version))}`);
     }
   }
 }
 
-export function validateVersionSet(set, where = 'version set') {
+export function validateVersionSet(set, label = 'version set') {
+  const where = printable(label);
   if (!set || typeof set !== 'object' || Array.isArray(set)) throw new InputError(`${where}: expected an object`);
   // schemaVersion is the compatibility gate: a breaking change to the set's
   // shape bumps it, and older pinned scripts refuse the file. Additive fields
   // keep schemaVersion 1 and are ignored here, so adding one never makes an
   // older pinned script exit 2.
-  if (set.schemaVersion !== 1) throw new InputError(`${where}: schemaVersion must be 1`);
+  if (Number.isInteger(set.schemaVersion) && set.schemaVersion > SCHEMA_VERSION) {
+    throw new SchemaVersionError(`${where}: schemaVersion ${set.schemaVersion} is newer than this script reads (${SCHEMA_VERSION})`);
+  }
+  if (set.schemaVersion !== SCHEMA_VERSION) throw new InputError(`${where}: schemaVersion must be ${SCHEMA_VERSION}`);
   if (typeof set.train !== 'string' || !TRAIN_ID.test(set.train)) throw new InputError(`${where}: "train" must be a train id`);
   if (typeof set.date !== 'string' || !ISO_DATE.test(set.date)) throw new InputError(`${where}: "date" must be YYYY-MM-DD`);
   validatePackages(set.packages, where);
@@ -93,13 +127,13 @@ export function loadVersionSet(path = DEFAULT_SET_PATH) {
   try {
     text = readFileSync(path, 'utf8');
   } catch (error) {
-    throw new InputError(`${path}: ${error.message}`);
+    throw new InputError(`${printable(path)}: cannot be read (${error.code ?? 'error'})`);
   }
   let set;
   try {
     set = JSON.parse(text);
   } catch {
-    throw new InputError(`${path}: not valid JSON`);
+    throw new InputError(`${printable(path)}: not valid JSON`);
   }
   return validateVersionSet(set, path);
 }
@@ -141,21 +175,44 @@ function confinedFile(root, path) {
   } catch {
     return null;
   }
-  if (stat.isSymbolicLink()) throw new InputError(`${path}: is a symlink; refusing to follow it`);
-  const real = realpathSync(absolute);
-  if (!real.startsWith(`${root}${sep}`)) throw new InputError(`${path}: resolves outside the checkout`);
-  if (!stat.isFile()) throw new InputError(`${path}: is not a file`);
+  if (stat.isSymbolicLink()) throw new InputError(`${printable(path)}: is a symlink; refusing to follow it`);
+  const real = resolveInside(root, path);
+  if (!stat.isFile()) throw new InputError(`${printable(path)}: is not a file`);
+  return real;
+}
+
+// The real path of root/path, refused when it leaves the root or cannot be
+// resolved (a symlink loop in a parent directory, for example).
+function resolveInside(root, path) {
+  let real;
+  try {
+    real = realpathSync(join(root, path));
+  } catch (error) {
+    throw new InputError(`${printable(path)}: cannot be resolved (${error.code ?? 'error'})`);
+  }
+  if (real !== root && !real.startsWith(`${root}${sep}`)) throw new InputError(`${printable(path)}: resolves outside the checkout`);
   return real;
 }
 
 function readManifest(root, path) {
   const real = confinedFile(root, path);
-  if (real === null) throw new InputError(`${path}: missing`);
+  if (real === null) throw new InputError(`${printable(path)}: missing`);
+  let manifest;
   try {
-    return JSON.parse(readFileSync(real, 'utf8'));
+    manifest = JSON.parse(readFileSync(real, 'utf8'));
   } catch {
-    throw new InputError(`${path}: not valid JSON`);
+    throw new InputError(`${printable(path)}: not valid JSON`);
   }
+  if (!manifest || typeof manifest !== 'object' || Array.isArray(manifest)) {
+    throw new InputError(`${printable(path)}: must be a JSON object`);
+  }
+  for (const section of DEPENDENCY_SECTIONS) {
+    const value = manifest[section];
+    if (value !== undefined && (!value || typeof value !== 'object' || Array.isArray(value))) {
+      throw new InputError(`${printable(path)}: ${section} must be an object`);
+    }
+  }
+  return manifest;
 }
 
 function workspacePatterns(root, rootManifest) {
@@ -177,7 +234,7 @@ function workspacePatterns(root, rootManifest) {
   for (const pattern of strings) {
     const body = pattern.startsWith('!') ? pattern.slice(1) : pattern;
     if (isAbsolute(body) || body.split(/[\\/]/u).includes('..')) {
-      throw new InputError(`workspace pattern ${JSON.stringify(pattern)} leaves the checkout`);
+      throw new InputError(`workspace pattern ${printable(JSON.stringify(pattern))} leaves the checkout`);
     }
   }
   return strings;
@@ -197,9 +254,19 @@ function expandWorkspaces(root, patterns) {
   }
   return [...matched]
     .filter((dir) => !excluded.has(dir))
-    .filter((dir) => statSync(join(root, dir), { throwIfNoEntry: false })?.isDirectory())
+    .filter((dir) => isWorkspaceDirectory(root, dir))
     .filter((dir) => confinedFile(root, join(dir, 'package.json')) !== null)
     .sort();
+}
+
+// A matched entry is a workspace when it is a directory inside the checkout.
+// Its real path is resolved first, so a symlink loop or a link out of the
+// checkout is refused instead of throwing from stat.
+function isWorkspaceDirectory(root, dir) {
+  const stat = lstatSync(join(root, dir), { throwIfNoEntry: false });
+  if (!stat) return false;
+  const real = resolveInside(root, dir);
+  return statSync(real).isDirectory();
 }
 
 // The root manifest plus every workspace that is published (not private).
@@ -211,9 +278,9 @@ export function collectManifests(checkout) {
   try {
     root = realpathSync(checkout);
   } catch {
-    throw new InputError(`${checkout}: no such directory`);
+    throw new InputError(`${printable(checkout)}: no such directory`);
   }
-  if (confinedFile(root, 'package.json') === null) throw new InputError(`${checkout}: no package.json`);
+  if (confinedFile(root, 'package.json') === null) throw new InputError(`${printable(checkout)}: no package.json`);
   const rootManifest = readManifest(root, 'package.json');
   const workspaces = expandWorkspaces(root, workspacePatterns(root, rootManifest)).map((dir) => {
     const path = join(dir, 'package.json');
@@ -231,8 +298,8 @@ export function checkRepository(root, set, label = basename(resolve(root))) {
     for (const section of DEPENDENCY_SECTIONS) {
       for (const [name, spec] of Object.entries(manifest[section] ?? {})) {
         if (!name.startsWith('@kontourai/') || localNames.has(name)) continue;
-        if (!PACKAGE_NAME.test(name)) throw new InputError(`${label} ${path}: ${section} names an invalid package ${JSON.stringify(name)}`);
-        if (typeof spec !== 'string') throw new InputError(`${label} ${path}: ${section}.${name} is not a string`);
+        if (!PACKAGE_NAME.test(name)) throw new InputError(`${printable(label)} ${printable(path)}: ${section} names an invalid package ${printable(JSON.stringify(name))}`);
+        if (typeof spec !== 'string') throw new InputError(`${printable(label)} ${printable(path)}: ${section}.${name} is not a string`);
         if (LOCAL_SPEC.test(spec)) continue;
         const version = set.packages[name];
         const previousVersion = set.previous?.packages[name];
@@ -280,23 +347,24 @@ function describeSet(set) {
   return `Version set ${set.train} (${set.date}); previous train: ${set.previous ? set.previous.train : 'none'}`;
 }
 
-// Printable ASCII passes through; anything else (a newline that could start a
-// workflow command, a terminal escape) is shown JSON-quoted.
-function printable(value) {
-  const text = String(value);
-  return /^[\x20-\x7e]*$/u.test(text) ? text : JSON.stringify(text);
-}
-
-// Escapes Markdown and table syntax so manifest text renders as text.
-export function markdownText(value) {
-  return printable(value).replace(/[\\`*_~[\]<>|]/gu, (ch) => `\\${ch}`);
+// Manifest text for the Markdown summary, rendered as a code span: no
+// emphasis, links, autolinks (https://, www.) or $ math apply inside one.
+// printable() leaves only ASCII, so no bidi control survives; the fence is
+// longer than any backtick run in the value; and | is escaped, which GFM
+// honours inside a code span in a table cell.
+export function markdownCode(value) {
+  const text = printable(value).replace(/\|/gu, '\\|');
+  const longest = Math.max(0, ...[...text.matchAll(/`+/gu)].map((m) => m[0].length));
+  const fence = '`'.repeat(longest + 1);
+  const pad = text.startsWith('`') || text.endsWith('`') || text === '' ? ' ' : '';
+  return `${fence}${pad}${text}${pad}${fence}`;
 }
 
 export function formatText(set, results, failOn = 'none') {
   const lines = [describeSet(set)];
   for (const { repository, findings } of results) {
     const counts = summarize(findings);
-    lines.push(`${repository}: ${findings.length} @kontourai specs; ${STATUSES.map((s) => `${counts[s]} ${s}`).join(', ')}`);
+    lines.push(`${printable(repository)}: ${findings.length} @kontourai specs; ${STATUSES.map((s) => `${counts[s]} ${s}`).join(', ')}`);
     for (const f of findings) {
       if (f.status === 'current') continue;
       const target = f.version ? ` (set ${f.version}${f.previousVersion ? `, previous ${f.previousVersion}` : ''})` : ' (not in the set)';
@@ -311,12 +379,12 @@ export function formatMarkdown(set, results, failOn = 'none') {
   const lines = [`### ${describeSet(set)}`, '', modeLine(failOn), ''];
   for (const { repository, findings } of results) {
     const counts = summarize(findings);
-    lines.push(`**${markdownText(repository)}**: ${STATUSES.map((s) => `${counts[s]} ${s}`).join(', ')}`, '');
+    lines.push(`${markdownCode(repository)}: ${STATUSES.map((s) => `${counts[s]} ${s}`).join(', ')}`, '');
     const drift = findings.filter((f) => f.status !== 'current');
     if (drift.length === 0) continue;
     lines.push('| Status | Manifest | Section | Package | Spec | Set | Previous |', '|---|---|---|---|---|---|---|');
     for (const f of drift) {
-      lines.push(`| ${f.status} | ${markdownText(f.manifest)} | ${f.section} | ${markdownText(f.package)} | ${markdownText(f.spec)} | ${f.version ?? 'not in set'} | ${f.previousVersion ?? '-'} |`);
+      lines.push(`| ${f.status} | ${markdownCode(f.manifest)} | ${f.section} | ${markdownCode(f.package)} | ${markdownCode(f.spec)} | ${f.version ?? 'not in set'} | ${f.previousVersion ?? '-'} |`);
     }
     lines.push('');
   }
@@ -334,12 +402,12 @@ export function parseArguments(argv) {
     const arg = argv[i];
     if (arg in valueFlags) {
       const value = argv[i + 1];
-      if (value === undefined || value.startsWith('--')) throw new InputError(`${arg} needs a value`);
+      if (value === undefined || value.startsWith('--')) throw new InputError(`${printable(arg)} needs a value`);
       options[valueFlags[arg]] = value;
       i += 1;
     } else if (arg === '--json') options.json = true;
     else if (arg === '--all') options.all = true;
-    else if (arg.startsWith('--')) throw new InputError(`unknown option ${arg}`);
+    else if (arg.startsWith('--')) throw new InputError(`unknown option ${printable(arg)}`);
     else options.dirs.push(arg);
   }
   if (!Object.hasOwn(FAIL_ON, options.failOn)) throw new InputError(`--fail-on must be one of ${Object.keys(FAIL_ON).join(', ')}`);
@@ -348,15 +416,29 @@ export function parseArguments(argv) {
   return options;
 }
 
-export function main(argv = process.argv.slice(2), { stdout = process.stdout, stderr = process.stderr } = {}) {
+const NEWER_SCHEMA_WARNING = 'The version set uses a newer schemaVersion than this pinned drift script reads. '
+  + 'Drift was not checked; re-pin the version-set-drift workflow to pick up the newer reader.';
+
+// Any error other than a recognised one still exits 2 (never 1, which means
+// drift matched), with its message made safe to print.
+function errorLine(error) {
+  return safeLine(error instanceof InputError ? error.message : `unexpected error: ${error?.message ?? error}`);
+}
+
+export function main(argv = process.argv.slice(2), { stdout = process.stdout, stderr = process.stderr, env = process.env } = {}) {
   let options;
   let set;
   try {
     options = parseArguments(argv);
     set = loadVersionSet(options.set);
   } catch (error) {
-    if (!(error instanceof InputError)) throw error;
-    stderr.write(`${error.message}\n${USAGE}`);
+    if (error instanceof SchemaVersionError && options.failOn === 'none') {
+      stderr.write(`warning: ${errorLine(error)}\n${NEWER_SCHEMA_WARNING}\n`);
+      if (env.GITHUB_ACTIONS === 'true') stdout.write(`::warning title=Version-set drift skipped::${NEWER_SCHEMA_WARNING}\n`);
+      if (options.summary) appendFileSync(options.summary, `### Version-set drift skipped\n\n${NEWER_SCHEMA_WARNING}\n`);
+      return 0;
+    }
+    stderr.write(`${errorLine(error)}\n${error instanceof InputError ? USAGE : ''}`);
     return 2;
   }
   const results = [];
@@ -369,7 +451,7 @@ export function main(argv = process.argv.slice(2), { stdout = process.stdout, st
         try {
           cloneManifests(repository, destination, options.gitBase);
         } catch (error) {
-          throw new InputError(`${repository}: clone failed: ${(error.stderr || error.message).toString().trim()}`);
+          throw new InputError(`${repository}: clone failed: ${safeLine((error.stderr || error.message).toString().trim())}`);
         }
         results.push({ repository, findings: checkRepository(destination, set, repository) });
       }
@@ -380,8 +462,7 @@ export function main(argv = process.argv.slice(2), { stdout = process.stdout, st
       }
     }
   } catch (error) {
-    if (!(error instanceof InputError)) throw error;
-    stderr.write(`${error.message}\n`);
+    stderr.write(`${errorLine(error)}\n`);
     return 2;
   } finally {
     if (scratch) rmSync(scratch, { recursive: true, force: true });

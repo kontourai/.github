@@ -206,6 +206,12 @@ test('a 0.x exact pin survives patch trains and goes stale a train after a minor
   ]);
 });
 
+test('a 0.0.x exact pin goes stale a train after a patch passes it', (t) => {
+  assert.deepEqual(trainSequence(t, '0.0.3', ['0.0.3', '0.0.4', '0.0.5']), [
+    ['current', 0], ['behind', 0], ['stale', 1],
+  ]);
+});
+
 test('--fail-on drift passes a consumer on the train, ignoring packages outside the set', (t) => {
   const dir = scratch(t);
   const setPath = join(dir, 'version-set.json');
@@ -280,7 +286,7 @@ test('reads stay inside the checkout and parse errors echo no content', (t) => {
   root = fresh('dir-link', ['packages/*']);
   mkdirSync(join(root, 'packages'));
   symlinkSync(outside, join(root, 'packages/a'));
-  expectRefusal(root, /packages\/a\/package\.json: resolves outside the checkout/u);
+  expectRefusal(root, /packages\/a: resolves outside the checkout/u);
 
   root = fresh('dotdot', ['../outside']);
   expectRefusal(root, /workspace pattern "\.\.\/outside" leaves the checkout/u);
@@ -309,22 +315,113 @@ test('invalid @kontourai package names are refused', (t) => {
   assert.match(run.stderr, /names an invalid package/u);
 });
 
+// No line of output may start a workflow command, whatever a manifest, a
+// directory name or a label contains.
+function assertNoWorkflowCommand(...outputs) {
+  for (const output of outputs) assert.doesNotMatch(output, /^\s*::/mu, output);
+}
+
 test('manifest text cannot inject Markdown or workflow commands', (t) => {
   const dir = scratch(t);
   const setPath = join(dir, 'version-set.json');
   writeJson(setPath, set({ '@kontourai/surface': '6.1.0' }));
   const consumer = join(dir, 'consumer');
   writeJson(join(consumer, 'package.json'), {
-    name: 'consumer', dependencies: { '@kontourai/surface': '1.0.0 | `x`', '@kontourai/ui': '\n::error::injected' },
+    name: 'consumer',
+    dependencies: {
+      '@kontourai/surface': '1.0.0 | `x`',
+      '@kontourai/ui': '\n::error::injected',
+      '@kontourai/flow': 'https://evil.example www.evil.example $x^2$ \u202edlrow',
+    },
   });
   const summary = join(dir, 'summary.md');
-  const run = drift(['--set', setPath, '--markdown-summary', summary, consumer]);
+  const run = drift(['--set', setPath, '--markdown-summary', summary, '--label', 'x\n::error::label', consumer]);
   assert.equal(run.status, 0, run.stderr);
-  assert.doesNotMatch(run.stdout, /^::/mu);
-  assert.match(run.stdout, /"\\n::error::injected"/u);
+  assertNoWorkflowCommand(run.stdout, run.stderr);
+  assert.match(run.stdout, /"\\u000a::error::injected"/u);
+  assert.match(run.stdout, /^"x\\u000a::error::label": 3 @kontourai specs/mu);
   const text = readFileSync(summary, 'utf8');
-  assert.match(text, /\| 1\.0\.0 \\\| \\`x\\` \|/u);
-  assert.doesNotMatch(text, /^::/mu);
+  assertNoWorkflowCommand(text);
+  // Manifest text renders as code spans: no autolink, math, emphasis or bidi.
+  assert.match(text, /\| `` 1\.0\.0 \\\| `x` `` \|/u);
+  assert.match(text, /\| `"https:\/\/evil\.example www\.evil\.example \$x\^2\$ \\u202edlrow"` \|/u);
+  assert.doesNotMatch(text, /\u202e/u);
+});
+
+test('a directory name cannot inject a workflow command into an error', (t) => {
+  const dir = scratch(t);
+  const setPath = join(dir, 'version-set.json');
+  writeJson(setPath, set({ '@kontourai/surface': '6.1.0' }));
+  const consumer = join(dir, 'consumer');
+  writeJson(join(consumer, 'package.json'), { name: 'consumer', private: true, workspaces: ['packages/*'] });
+  const evil = join(consumer, 'packages', 'x\n::error title=spoof::injected');
+  mkdirSync(evil, { recursive: true });
+  writeFileSync(join(dir, 'target.json'), '{}');
+  symlinkSync(join(dir, 'target.json'), join(evil, 'package.json'));
+  let run = drift(['--set', setPath, consumer]);
+  assert.equal(run.status, 2, run.stdout);
+  assert.match(run.stderr, /\\u000a::error title=spoof::injected\/package\.json"?: is a symlink/u);
+  assertNoWorkflowCommand(run.stdout, run.stderr);
+
+  // The checkout path itself, in the no-package.json error.
+  const bare = join(dir, 'y\n::error::bare');
+  mkdirSync(bare);
+  run = drift(['--set', setPath, bare]);
+  assert.equal(run.status, 2);
+  assert.match(run.stderr, /no package\.json/u);
+  assertNoWorkflowCommand(run.stdout, run.stderr);
+});
+
+test('a symlink loop or a non-object manifest exits 2, not 1', (t) => {
+  const dir = scratch(t);
+  const setPath = join(dir, 'version-set.json');
+  writeJson(setPath, set({ '@kontourai/surface': '6.1.0' }));
+  const loop = join(dir, 'loop');
+  writeJson(join(loop, 'package.json'), { name: 'loop', private: true, workspaces: ['packages/*'] });
+  mkdirSync(join(loop, 'packages'));
+  symlinkSync('loop', join(loop, 'packages/loop'));
+  let run = drift(['--set', setPath, '--fail-on', 'stale', loop]);
+  assert.equal(run.status, 2, run.stdout + run.stderr);
+  assert.match(run.stderr, /packages\/loop: cannot be resolved \(ELOOP\)/u);
+
+  for (const [name, content, message] of [
+    ['null', 'null', /package\.json: must be a JSON object/u],
+    ['array', '[]', /package\.json: must be a JSON object/u],
+    ['section', '{"dependencies": null}', /package\.json: dependencies must be an object/u],
+  ]) {
+    const root = join(dir, name);
+    mkdirSync(root);
+    writeFileSync(join(root, 'package.json'), content);
+    run = drift(['--set', setPath, '--fail-on', 'stale', root]);
+    assert.equal(run.status, 2, `${name}: ${run.stdout}${run.stderr}`);
+    assert.match(run.stderr, message);
+  }
+});
+
+// A format change bumps schemaVersion on main. Callers pinned to an older
+// script must not go red in advisory mode; a gate cannot be evaluated, so it
+// refuses.
+test('a newer schemaVersion warns and exits 0 in advisory mode, 2 under --fail-on', (t) => {
+  const dir = scratch(t);
+  const setPath = join(dir, 'version-set.json');
+  writeJson(setPath, { schemaVersion: 2, trains: [] });
+  const consumer = join(dir, 'consumer');
+  writeJson(join(consumer, 'package.json'), { name: 'consumer', dependencies: { '@kontourai/surface': '1.0.0' } });
+  const summary = join(dir, 'summary.md');
+  let run = drift(['--set', setPath, '--markdown-summary', summary, consumer], { ...process.env, GITHUB_ACTIONS: 'true' });
+  assert.equal(run.status, 0, run.stderr);
+  assert.match(run.stderr, /schemaVersion 2 is newer than this script reads \(1\)/u);
+  assert.match(run.stdout, /^::warning title=Version-set drift skipped::/mu);
+  assert.match(readFileSync(summary, 'utf8'), /Drift was not checked/u);
+
+  run = drift(['--set', setPath, '--fail-on', 'stale', consumer]);
+  assert.equal(run.status, 2);
+  assert.match(run.stderr, /newer than this script reads/u);
+
+  // A malformed schemaVersion is still an error, not a newer format.
+  writeJson(setPath, { schemaVersion: 'two' });
+  run = drift(['--set', setPath, consumer]);
+  assert.equal(run.status, 2);
 });
 
 test('writes a markdown summary when asked', (t) => {
@@ -337,8 +434,8 @@ test('writes a markdown summary when asked', (t) => {
   const run = drift(['--set', setPath, '--markdown-summary', summary, '--label', 'kontourai/consumer', consumer]);
   assert.equal(run.status, 0, run.stderr);
   const text = readFileSync(summary, 'utf8');
-  assert.match(text, /\*\*kontourai\/consumer\*\*: 0 current, 1 behind/u);
-  assert.match(text, /\| \^3\.0\.0 \\\|\\\| \^4\.0\.0 \|/u);
+  assert.match(text, /`kontourai\/consumer`: 0 current, 1 behind/u);
+  assert.match(text, /\| `\^3\.0\.0 \\\|\\\| \^4\.0\.0` \|/u);
 });
 
 test('--all clones each listed consumer and checks its manifests', (t) => {
