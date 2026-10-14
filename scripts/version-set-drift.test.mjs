@@ -233,7 +233,8 @@ test('unreadable inputs fail with exit 2 instead of reporting success', (t) => {
   assert.equal(run.status, 2);
   assert.match(run.stderr, /no package\.json/u);
 
-  writeFileSync(join(consumer, 'package.json'), '{ "SECRET-CONTENT');
+  // Node's JSON.parse message quotes input like this ("Unexpected token 'S', \"SECRET...").
+  writeFileSync(join(consumer, 'package.json'), 'SECRET-CONTENT');
   run = drift(['--set', setPath, consumer]);
   assert.equal(run.status, 2);
   assert.match(run.stderr, /package\.json: not valid JSON/u);
