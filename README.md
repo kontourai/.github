@@ -476,7 +476,11 @@ the gate only reads files and holds no credentials or secrets. A product that al
 `with: { extra-build-command: npm run build:demo }` to `docs-pages.yml`; the command
 runs after the docs build with dependencies installed and `DOCS_SITE_DIR` set, and may
 only add files. Both workflows run Corpus from git at the commit pinned in their
-`corpus-ref` default; bump that pin here to upgrade every product. A product that declares
+`corpus-ref` default. The current pin is Corpus commit
+`b8ecf4cd4c6482bb804cdeea617ebe2d9b78ab05`, which keeps long inline text within
+narrow pages while code blocks and wide tables scroll locally. Updating the
+shared default upgrades callers that omit both override inputs on their next
+run; callers with an explicit pin need their own reviewed update. A product that declares
 a `decisions` block in `corpus.json` also gets the decisions gate (records, index freshness and,
 on pull requests, the numbered-ADR freeze) from the same job.
 

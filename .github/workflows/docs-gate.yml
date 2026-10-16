@@ -67,8 +67,8 @@ jobs:
           package-manager-cache: false
       - name: Run Corpus check
         env:
-          # Org-wide pin: @kontourai/corpus with v1 manifests refused and the decisions gate (corpus#20, corpus#21).
-          CORPUS_REF: ${{ inputs.corpus-ref || inputs.docs-kit-ref || '08c62ccd72880ff4bd4c378ae252ad437b4b4fb5' }}
+          # Org-wide pin: Corpus 0.7 with decision/redirect checks and narrow-page wrapping (corpus#37).
+          CORPUS_REF: ${{ inputs.corpus-ref || inputs.docs-kit-ref || 'b8ecf4cd4c6482bb804cdeea617ebe2d9b78ab05' }}
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           ADVISORY: ${{ inputs.advisory-freshness }}
         run: |
