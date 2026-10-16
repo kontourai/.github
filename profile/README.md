@@ -5,8 +5,8 @@ and accountable: sources stay traceable, claims keep their evidence, required pa
 advance through explicit gates, and people can recompute why work is ready.
 
 → [kontourai.io](https://kontourai.io) tells the product story, and
-[kontourai.github.io](https://kontourai.github.io/) indexes every product's current
-documentation. The repositories below are the public implementation and
+[kontourai.github.io](https://kontourai.github.io/) indexes current documentation for
+its listed products. The repositories below are the public implementation and
 documentation surfaces.
 
 ## Applications
@@ -50,7 +50,8 @@ Surface is Kontour's product-facing integration layer for it.
 | [`ephemeris`](https://github.com/kontourai/ephemeris) | Time actor: deadline wake-ups that nudge Flow, plus a timezone-aware recurring-schedule core |
 | [`ui`](https://github.com/kontourai/ui) | Shared design tokens, React primitives, and web components for Kontour product interfaces |
 | [`cli`](https://github.com/kontourai/cli) | The offline-first `kontour` command that routes to installed Kontour products |
-| [`docs-kit`](https://github.com/kontourai/docs-kit) | Shared docs gate, GitHub Pages builder, and docs MCP server behind every product's documentation |
+| [`thread`](https://github.com/kontourai/thread) | Portable conversation schema and Ferry transcript conversion, with adapter-specific fidelity limits ([documentation](https://github.com/kontourai/thread/blob/main/docs/README.md)) |
+| [`corpus`](https://github.com/kontourai/corpus) | Source-bound documentation checking, GitHub Pages publishing, and docs MCP retrieval |
 
 [`kit-research`](https://github.com/kontourai/kit-research) is a third-party kit
 authoring experiment. Its README states its current lifecycle and limits.
