@@ -69,7 +69,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     const { values } = parseArgs({ options: { repo: { type: 'string' }, head: { type: 'string' }, context: { type: 'string' }, apply: { type: 'boolean' } }, strict: true });
     console.log(JSON.stringify(await enforceDocumentation(values), null, 2));
   } catch (error) {
-    console.error(JSON.stringify({ status: 'not-enforced', error: error.message }));
+    console.error(JSON.stringify({ status: 'NOT_VERIFIED', error: error.message }));
     process.exitCode = 2;
   }
 }

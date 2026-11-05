@@ -514,7 +514,9 @@ justified no-prose-change decision; they do not prove the decision true. A
 required job with no coverage mappings still cannot establish source review.
 Repositories using a separate stronger review ledger can retain that owner.
 
-GitHub plan or permission failures remain `not-enforced`. Do not change a
+GitHub plan or permission failures remain `NOT_VERIFIED`. A response lost after
+a write also remains unverified; inspect GitHub rather than assuming no change.
+Do not change a
 private repository's visibility or weaken another protection to work around a
 403. Record the blocker and keep the workflow checks active.
 
