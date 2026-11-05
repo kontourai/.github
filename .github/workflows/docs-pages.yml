@@ -56,7 +56,7 @@ jobs:
       - name: Build with Corpus
         env:
           # Shared pin: Corpus remote content checks and source-bound local documentation reviews.
-          CORPUS_REF: ${{ inputs.corpus-ref || inputs.docs-kit-ref || '39bd16db3e31523f5678e2cb4ec1e5af955e4e6d' }}
+          CORPUS_REF: ${{ inputs.corpus-ref || inputs.docs-kit-ref || 'b127e35a818b532369843731b3c64792baade83e' }}
           BASE_URL: https://kontourai.github.io/${{ github.event.repository.name }}/
         run: npx -y "github:kontourai/corpus#${CORPUS_REF}" build --out dist-pages --base-url "$BASE_URL"
       # Extra build: pnpm callers read their version from packageManager.

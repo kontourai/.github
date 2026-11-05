@@ -480,7 +480,7 @@ the gate only reads files and holds no credentials or secrets. A product that al
 runs after the docs build with dependencies installed and `DOCS_SITE_DIR` set, and may
 only add files. Both workflows run Corpus from git at the commit pinned in their
 `corpus-ref` default. The current pin is Corpus commit
-`39bd16db3e31523f5678e2cb4ec1e5af955e4e6d`, which keeps long inline text within
+`b127e35a818b532369843731b3c64792baade83e`, which keeps long inline text within
 narrow pages while code blocks and wide tables scroll locally. Updating the
 shared default upgrades callers that omit both override inputs on their next
 run; callers with an explicit pin need their own reviewed update. A product that declares
