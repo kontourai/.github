@@ -465,11 +465,14 @@ jobs:
 `docs-gate.yml` checks the manifest, links and anchors, that every `docs/**/*.md` is
 published or excluded, that topics resolve, and on pull requests and merge-queue
 entries that a change to a
-document's `covers` paths also updates that document. `docs-pages.yml` deploys the site
+document's `covers` paths updates that document or adds a new local review
+whose input/output byte bindings match the candidate. A no-copy-change review
+uses `corpus-content.json`, includes every changed covered source and the
+covering document, and records a concrete note and limits. `docs-pages.yml` deploys the site
 and `docs-bundle.json` to `https://kontourai.github.io/<repo>/`; set the repository's
 Pages source to GitHub Actions. The [hub](https://kontourai.github.io/) and the aggregate
-docs MCP read those bundles, so a product's docs are current there as soon as its deploy
-finishes. A repository that gates pull requests through `pull_request_target`
+docs MCP read those bundles after deployment. Their source revision identifies
+the captured documentation; it does not establish prose or runtime correctness. A repository that gates pull requests through `pull_request_target`
 passes `with: { repository: ${{ github.event.pull_request.head.repo.full_name }}, ref: ${{ github.event.pull_request.head.sha }} }`
 to `docs-gate.yml`, so the gate checks the change rather than the base branch;
 the gate only reads files and holds no credentials or secrets. A product that also hosts non-docs pages (for example a live demo) passes
@@ -477,12 +480,45 @@ the gate only reads files and holds no credentials or secrets. A product that al
 runs after the docs build with dependencies installed and `DOCS_SITE_DIR` set, and may
 only add files. Both workflows run Corpus from git at the commit pinned in their
 `corpus-ref` default. The current pin is Corpus commit
-`b8ecf4cd4c6482bb804cdeea617ebe2d9b78ab05`, which keeps long inline text within
+`b127e35a818b532369843731b3c64792baade83e`, which keeps long inline text within
 narrow pages while code blocks and wide tables scroll locally. Updating the
 shared default upgrades callers that omit both override inputs on their next
 run; callers with an explicit pin need their own reviewed update. A product that declares
 a `decisions` block in `corpus.json` also gets the decisions gate (records, index freshness and,
 on pull requests, the numbered-ADR freeze) from the same job.
+
+## Require documentation checks for merge
+
+A reusable workflow only runs a check. GitHub must separately require that
+check for the default branch. `scripts/documentation-enforcement.mjs` prepares
+or adds a dedicated repository ruleset for an observed GitHub Actions context:
+
+```sh
+GH_TOKEN="$(gh auth token)" node scripts/documentation-enforcement.mjs \
+  --repo example/product --head <full-default-branch-sha> \
+  --context 'gate / Docs gate'
+```
+
+This command is read-only by default. Inspect its proposed rule, then repeat
+with `--apply` to add it. Applying requires verified repository-admin standing,
+a successful latest check at the exact default-branch head, and a second head
+read before mutation. The new rule applies to the default branch, binds the
+observed GitHub Actions integration, and has no bypass actors. It does not
+replace branch protection, remove required checks, or alter other rulesets.
+An existing rule with different settings is refused for explicit reconciliation.
+The script verifies that existing rule IDs remain after creation.
+
+Add meaningful `covers` paths before requiring freshness, keep the shared gate
+strict, and run negative controls before promotion. Byte reviews permit a
+justified no-prose-change decision; they do not prove the decision true. A
+required job with no coverage mappings still cannot establish source review.
+Repositories using a separate stronger review ledger can retain that owner.
+
+GitHub plan or permission failures remain `NOT_VERIFIED`. A response lost after
+a write also remains unverified; inspect GitHub rather than assuming no change.
+Do not change a
+private repository's visibility or weaken another protection to work around a
+403. Record the blocker and keep the workflow checks active.
 
 ## Secret scan
 
